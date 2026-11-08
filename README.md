@@ -8,6 +8,12 @@
 > * Firmware source: [`firmware/`](firmware/) (based on v0.6f3; builds with pico-sdk 2.2.0)
 > * Host tool: [`host/ataboy`](host/ataboy), a single Python file with no dependencies (Linux)
 > * Protocol reference: [`docs/API.md`](docs/API.md)
+> * Setup menu guide: [`docs/HELP.txt`](docs/HELP.txt)
+> * Hardware: [`hardware/pcb/`](hardware/pcb/) (KiCad) and [`hardware/case/`](hardware/case/) (FreeCAD + STL)
+> * Tests and tools: [`tests/`](tests/), [`tools/`](tools/) (hardware regression, hands-free flashing from WSL)
+>
+> Stock firmware binaries and older source releases are in the
+> [upstream repository](https://github.com/redruM0381/ATAboy).
 >
 > ```
 > ataboy detect --mount                 # probe, IDENTIFY, pick geometry, mount
@@ -29,7 +35,7 @@ If you don't want to build your own, the hardware can be purchased here:  https:
 
 -----------------------------------------------------------------------------------
 
-![image](https://github.com/redruM0381/ATAboy/blob/main/logo.png)
+![image](docs/images/logo.png)
 
 
 ATAboy is designed for retro computing enthusiasts, data recovery experts, and archivists.  Read and write the oldest of IDE hard drives, without the need for an "in-between" vintage computer!
@@ -71,7 +77,7 @@ To get started, you will also need:
 
 ---
 
-![image](https://github.com/redruM0381/ATAboy/blob/main/putty.png)
+![image](docs/images/putty.png)
 
 You can save the current ATAboy settings, geometry, etc to EEPROM, which will be restored the next time the device is booted.  (This allows auto-mounting also.)
 
@@ -128,27 +134,8 @@ The open source licenses do not grant rights to use these trademarks.
 
 ## Firmware
 Licensed under GNU GPLv3.
-See /firmware/LICENSE.
+See [LICENSE](LICENSE).
 
 ## Hardware
 Licensed under CERN-OHL-W v2.
-See /PCB/LICENSE.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+See [hardware/pcb/LICENSE](hardware/pcb/LICENSE).
