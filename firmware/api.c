@@ -994,7 +994,7 @@ static int32_t run_op(const uint8_t *cdb, uint8_t *buf, uint32_t cap) {
         if (be32(&a[4]) != 0x424F4F54u || a[0] > 2) return reply_msg(buf, cap, R_BAD_ARG, "bad reboot magic/mode");  // "BOOT"
         reboot_mode = a[0];
         reboot_at_ms = now_ms() + 200;    // let the reply and CSW go out first
-        return reply_msg(buf, cap, R_OK, a[0] ? "rebooting to BOOTSEL" : "rebooting");
+        return reply_msg(buf, cap, R_OK, a[0] == 1 ? "rebooting to BOOTSEL" : a[0] == 2 ? "fault test: HardFault, then watchdog reboot" : "rebooting");
     default:
         return reply_msg(buf, cap, R_BAD_SUBOP, "unknown sub-op");
     }
