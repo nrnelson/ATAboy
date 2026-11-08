@@ -24,7 +24,7 @@
 // is 30 s by default; the margin covers the one drive command that may still
 // be running when the budget runs out (8-sector chunks: up to 8 x the
 // per-sector timeout, about 8 s at the default 1 s).
-#define MSC_RW_BUDGET_MS        20000u
+#define MSC_RW_BUDGET_MS        10000u
 
 // A continuation chunk follows the previous one as soon as USB has moved the
 // data (milliseconds).  A gap longer than this means the command was ended in

@@ -279,8 +279,11 @@ up to `read_timeout_ms`, so the host tool raises it to at least
 `detect` / `mount` (the timeout may come from flash or the serial menu). It
 never lowers a larger value. Linux splits large reads into READ(10)s of up to
 240 sectors (30 chunks), so the firmware also caps each READ(10)/WRITE(10) with
-a 20 s time budget (see *Mass-storage behaviour*): one host command takes at
-most 20 s plus the chunk that is running when the budget runs out.
+a 10 s time budget (see *Mass-storage behaviour*): one host command takes at
+most 10 s plus the chunk that is running when the budget runs out (and its
+recovery reset, if it timed out). With the default 1 s read timeout that stays
+inside Linux's 30 s; if you raise `read_timeout_ms`, raise the kernel timeout
+too (`ataboy config` does it when run as root).
 The serial menu also freezes during a long wait, because both share core 0's
 USB task.
 
@@ -654,7 +657,7 @@ Every pass-through command is classified (`firmware/ata_policy.c`):
   a time) asks the drive again. Earlier firmware discarded the whole 8-sector
   chunk.
 - **Time budget.** All drive work for one READ(10) or WRITE(10) shares a
-  budget of 20 s from its first chunk (`MSC_RW_BUDGET_MS` in
+  budget of 10 s from its first chunk (`MSC_RW_BUDGET_MS` in
   `firmware/msc_rw.h`, a build-time constant). Once it is used up no further
   drive command is started: the sectors read so far are transferred and the
   command fails at the first sector not tried, so a slow drive can't hold one
@@ -668,7 +671,11 @@ Every pass-through command is classified (`firmware/ata_policy.c`):
   Writes use MEDIUM ERROR 0Ch/00h; Linux re-sends those, which is harmless for
   a write. STATUS `stats.budget_stops` counts these stops. The first drive
   command of a host command is never refused, so every command makes
-  progress.
+  progress. Why not a retryable sense (ABORTED COMMAND): Linux would re-send
+  the *whole* command, re-reading the slow area that used up the budget up to
+  five times; with 11h it keeps what was delivered and fails only the untried
+  rest. The cost: a plain `dd`/filesystem read sees EIO for sectors that were
+  never tried (ddrescue and `ataboy image` simply read them again).
 - Mount (and a write-protect change while mounted) raises UNIT ATTENTION
   28h/00h, delivered on the next TEST UNIT READY. TinyUSB answers most
   standard opcodes itself, so TUR is where the host's disk driver learns
@@ -700,10 +707,14 @@ flag bit3). After SRST the firmware:
 
 The full 31 s wait (and up to about 62 s with the fallback) applies to an
 explicit RESET op or the menu. A reset that runs *inside* another USB command,
-after a timeout, bus fault or leftover data, and resets asked for through SAT
-pass-through, wait at most 5 s per stage (`IDE_RECOVERY_WAIT_MS`), so the reset
-alone stays well inside the host's 30 s SCSI timeout; a drive that needs longer
-reads as `not_ready` on the next command and catches up. USB is blocked while
+after a timeout, bus fault or leftover data, is SRST only with at most a 5 s
+wait (`IDE_RECOVERY_WAIT_MS`), no RESET-line fallback; resets asked for through
+SAT pass-through wait at most 5 s per stage (recalibrate included). Either way
+the reset alone stays well inside the host's 30 s SCSI timeout. A drive that
+needs longer reads as `not_ready` on the next command; in CHS mode any reset
+that didn't complete makes the next command re-send 91h first, so a drive that
+comes back later on its default translation is never addressed with the wrong
+geometry. USB is blocked while
 a reset runs; the host tool allows 90 s for RESET. `STATUS.bus.resets` counts soft
 resets, soft resets that failed, hardware resets (fallback or RESET mode 1;
 the DETECT probe's own reset isn't counted), hardware resets that failed and

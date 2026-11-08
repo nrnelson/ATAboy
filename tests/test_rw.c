@@ -238,23 +238,23 @@ static void test_budget(void) {
     reset();
     bool f;
     // 240 sectors (Linux's usual max) at 1 s a sector: 30 chunks of 8 s each.
-    // The first chunk always runs; no chunk starts after 20 s.
+    // The first chunk always runs; no chunk starts after 10 s.
     ms_per_sector = 1000;
     uint32_t t0 = now_ms;
     memset(data, 0xEE, sizeof(data));
     static uint8_t big[240 * 512];
     uint32_t n = scsi_read(100, 240 * 512, 512, big, &f);
-    CHECK(f && n == 24 * 512);          // chunks at 0, 8 and 16 s ran; the one at 24 s did not
-    CHECK(read_cmds == 3);
-    CHECK(sense.budget && sense.key == 3 && sense.asc == 0x11 && sense.ascq == 0x11 && sense.info == 124);
+    CHECK(f && n == 16 * 512);          // chunks at 0 and 8 s ran; the one at 16 s did not
+    CHECK(read_cmds == 2);
+    CHECK(sense.budget && sense.key == 3 && sense.asc == 0x11 && sense.ascq == 0x11 && sense.info == 116);
     CHECK(drive_stats.budget_stops == 1);
-    CHECK(now_ms - t0 == 24000);
-    uint32_t v; memcpy(&v, big + 23 * 512, 4);
-    CHECK(v == 123);
+    CHECK(now_ms - t0 == 16000);
+    uint32_t v; memcpy(&v, big + 15 * 512, 4);
+    CHECK(v == 115);
 
     // the next command (the host reading the rest) gets a fresh budget
     read_cmds = 0;
-    n = scsi_read(124, 16 * 512, 512, NULL, &f);
+    n = scsi_read(116, 16 * 512, 512, NULL, &f);
     CHECK(!f && n == 16 * 512 && read_cmds == 2);
 
     // a fast drive never meets the budget
@@ -266,7 +266,7 @@ static void test_budget(void) {
     // a pending bad-sector failure is reported even after the budget ran out
     reset();
     bad[103] = 1;
-    ms_per_sector = 6000;               // 3 good sectors + the bad one: 24 s in one chunk
+    ms_per_sector = 6000;               // 3 good sectors + the bad one: 24 s in one chunk (> budget)
     uint8_t buf[EP];
     CHECK(msc_rw_read(0, 100, 0, buf, EP) == 3 * 512);
     CHECK(msc_rw_read(0, 103, 0, buf, EP) == -1);
@@ -279,8 +279,8 @@ static void test_budget(void) {
     ms_per_sector = 1000;
     memset(big, 0x11, sizeof(big));
     n = scsi_write(0, 240 * 512, big, &f);
-    CHECK(f && write_cmds == 3);
-    CHECK(sense.budget && sense.asc == 0x0C && sense.info == 24);
+    CHECK(f && write_cmds == 2);
+    CHECK(sense.budget && sense.asc == 0x0C && sense.info == 16);
 }
 
 int main(void) {

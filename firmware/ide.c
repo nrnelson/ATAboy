@@ -339,7 +339,7 @@ static bool hard_reset(uint32_t wait_ms) {
         wr(6, dev_base);
         wr(7, 0x10);
         rd_alt();
-        wait_ready(10000, true, NULL);
+        wait_ready(wait_ms < 10000u ? wait_ms : 10000u, true, NULL);
         ok = restore_geometry();
     }
     if (!ok) ide_health.hw_reset_failures++;
@@ -351,7 +351,7 @@ static bool hard_reset(uint32_t wait_ms) {
 // PARAMETERS.  Wait (bounded) for the configured device, restore the CHS
 // geometry and check it was accepted; if the drive doesn't come back, one
 // hardware reset.  Returns IDE_RST_*.
-static int soft_reset(uint32_t wait_ms) {
+static int soft_reset(uint32_t wait_ms, bool hw_fallback) {
     uint32_t t0 = time_us_32();
     uint8_t st;
     ide_health.soft_resets++;
@@ -366,8 +366,11 @@ static int soft_reset(uint32_t wait_ms) {
     int r = IDE_RST_OK;
     if (!ok) {
         ide_health.soft_reset_failures++;
-        r = hard_reset(wait_ms) ? IDE_RST_HW : IDE_RST_FAILED;
+        r = (hw_fallback && hard_reset(wait_ms)) ? IDE_RST_HW : IDE_RST_FAILED;
     }
+    // A drive that wasn't back in time may come up later on its default
+    // translation: make sure the next command re-sends 91h first.
+    if (r == IDE_RST_FAILED) need_reinit = chs_active() && geo_accepted;
     ide_health.last_reset = (int8_t)r;
     ide_health.last_reset_ms = (time_us_32() - t0) / 1000u;
     return r;
@@ -442,6 +445,7 @@ bool ide_reset_drive_wait(uint32_t wait_ms) {
     ide_lock();
     uint32_t t0 = time_us_32();
     bool ok = hard_reset(wait_ms);
+    if (!ok) need_reinit = chs_active() && geo_accepted;
     ide_health.last_reset = ok ? IDE_RST_HW : IDE_RST_FAILED;
     ide_health.last_reset_ms = (time_us_32() - t0) / 1000u;
     ide_unlock();
@@ -452,7 +456,7 @@ int ide_soft_reset(void) { return ide_soft_reset_wait(IDE_RESET_WAIT_MS); }
 
 int ide_soft_reset_wait(uint32_t wait_ms) {
     ide_lock();
-    int r = soft_reset(wait_ms);
+    int r = soft_reset(wait_ms, true);
     ide_unlock();
     return r;
 }
@@ -703,11 +707,12 @@ int ide_exec(ide_cmd_t *c) {
     }
 
     if ((res == IDE_TIMEOUT || res == IDE_BUS_FAULT || leftover) && !(c->flags & IDE_F_NO_RECOVER)) {
-        // Inside a USB command: a short wait, so the host's SCSI timeout
-        // (30 s on Linux) isn't blown by the reset alone.  A drive that needs
-        // longer shows as not ready on the next command and catches up;
+        // Inside a USB command: SRST with a short wait and no RESET-line
+        // fallback, so the host's SCSI timeout (30 s on Linux) isn't blown by
+        // the reset alone.  A drive that needs longer reads as not ready on
+        // the next command, which re-sends 91h first in CHS mode (need_reinit);
         // an explicit RESET (API/menu) waits the full IDE_RESET_WAIT_MS.
-        int rr = soft_reset(IDE_RECOVERY_WAIT_MS);
+        int rr = soft_reset(IDE_RECOVERY_WAIT_MS, false);
         c->recovered = true;
         if (rr == IDE_RST_HW) c->events |= IDE_EV_HW_RESET;
         else if (rr == IDE_RST_FAILED) c->events |= IDE_EV_HW_RESET | IDE_EV_RESET_FAILED;
