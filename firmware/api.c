@@ -1,8 +1,12 @@
-// ATAboy automation API — vendor SCSI command 0xC0.
+// ATAboy automation API — vendor SCSI command 0xC0, or the same requests on
+// the "ATAboy API" serial port (api_serial.c).
 //
 // Every request is a 16-byte CDB: C0 <op> 'A' 'B' <12 bytes of arguments>,
 // data-in.  Every reply starts with a 16-byte header followed by either a
 // JSON document (state, config, logs) or a binary block (sector data).
+// With 'A' 'X' instead the reply header is 32 bytes (boot id, state counter,
+// request id) and state-changing ops take a run-once request id in CDB
+// bytes 12-15.
 // Device-level outcomes are reported in-band (header result code + body);
 // CHECK CONDITION is only used for malformed CDBs.  See docs/API.md.
 
@@ -13,13 +17,17 @@
 #include "sense.h"
 #include "version.h"
 #include "ide_pio.h"
+#include "crc32.h"
+#include "rid_cache.h"
 #include "tusb.h"
 #include "pico/time.h"
 #include "pico/bootrom.h"
 #include "pico/unique_id.h"
+#include "pico/rand.h"
 #include "hardware/watchdog.h"
 #include "hardware/flash.h"
 #include <string.h>
+#include <stddef.h>
 
 // Sub-operations
 #define OP_INFO          0x00
@@ -56,6 +64,7 @@
 #define KEY_DEVICE        9
 
 #define HDR_LEN     16
+#define EXT_HDR_LEN 32           // 'A' 'X' requests: HDR_LEN + boot id, state counter, request id
 #define RES_LEN     32           // binary ATA result block
 #define CT_NONE     0
 #define CT_JSON     1
@@ -83,7 +92,47 @@ bool api_take_arm(void) {
     return a;
 }
 
+// ---------------------------------------------------------------------------
+//  Boot id and state counter (extended reply header)
+// ---------------------------------------------------------------------------
+
+static uint32_t boot_id;          // random per power-up: a host sees a reboot as a new id
+static uint32_t state_counter;    // bumped whenever the state fingerprint changes
+static uint32_t state_fp;
+static uint32_t state_polled_ms;
+
+// Everything a host would consider "state": mount, write protect and the other
+// settings, geometry, the identified drive, and drive.api_gen (bumped by every
+// API op that changes something, even when it ends where it started).  The
+// menu's cursor positions at the start of config_t are left out.
+static uint32_t state_fingerprint(void) {
+    const size_t from = offsetof(config_t, drive_write_protected);
+    uint32_t c = crc32_update(0, (const uint8_t *)&config + from, sizeof(config_t) - from);
+    uint8_t flags[4] = {is_mounted, drive.present, drive.identified, drive.forced};
+    uint32_t gen = drive.api_gen;
+    c = crc32_update(c, flags, sizeof(flags));
+    c = crc32_update(c, &gen, sizeof(gen));
+    c = crc32_update(c, drive.model, sizeof(drive.model));
+    return crc32_update(c, drive.serial, sizeof(drive.serial));
+}
+
+// Changes made by the menu (core 1) or auto-mount are caught by comparing the
+// fingerprint here and every ~10 ms from the main loop; a change undone within
+// one long USB command can be missed.
+static uint32_t api_state_counter(void) {
+    uint32_t fp = state_fingerprint();
+    if (fp != state_fp) { state_fp = fp; state_counter++; }
+    return state_counter;
+}
+
+void api_init(void) {
+    do boot_id = get_rand_32(); while (boot_id == 0);
+    state_fp = state_fingerprint();
+}
+
 void api_poll(void) {
+    uint32_t t = now_ms();
+    if (t - state_polled_ms >= 10) { state_polled_ms = t; api_state_counter(); }
     if (reboot_mode < 0 || (int32_t)(now_ms() - reboot_at_ms) < 0) return;
     if (reboot_mode == 1) reset_usb_boot(0, 0);   // BOOTSEL: UF2 drive + PICOBOOT
     watchdog_reboot(0, 0, 0);
@@ -104,6 +153,7 @@ static uint32_t be32(const uint8_t *p) {
 }
 
 static const char *result_name(int r) {
+    if (r == R_ID_CONFLICT) return "request_id_conflict";
     static const char *const names[] = {
         "ok", "bad_subop", "bad_arg", "no_drive", "not_mounted", "write_protected",
         "not_armed", "ata_error", "timeout", "not_ready", "bus_fault", "no_geometry",
@@ -370,6 +420,18 @@ static uint32_t put_result(uint8_t *p, const ide_cmd_t *c, uint32_t lba, uint32_
 //  Sub-operation handlers
 // ---------------------------------------------------------------------------
 
+static bool op_takes_rid(uint8_t op);
+
+// INFO fields for the extended header and request ids.
+static void json_ext_info(json_t *j) {
+    j_uint(j, "boot_id", boot_id);
+    j_uint(j, "state_counter", api_state_counter());
+    j_arr(j, "rid_ops");
+    for (int op = 0; op < 256; op++) if (op_takes_rid((uint8_t)op)) j_uint(j, NULL, (uint64_t)op);
+    j_end(j);
+    j_uint(j, "rid_cache", RID_CACHE_ENTRIES);
+}
+
 static int32_t op_info(uint8_t *buf, uint32_t cap) {
     char board_id[2 * PICO_UNIQUE_BOARD_ID_SIZE_BYTES + 1];
     pico_get_unique_board_id_string(board_id, sizeof(board_id));
@@ -405,7 +467,9 @@ static int32_t op_info(uint8_t *buf, uint32_t cap) {
     j_str(&j, NULL, "read_long"); j_str(&j, NULL, "verify"); j_str(&j, NULL, "bootsel");
     j_str(&j, NULL, "persistent_timeouts"); j_str(&j, NULL, "no_retry_reads");
     j_str(&j, NULL, "corrupt_sector");
+    j_str(&j, NULL, "ext_header"); j_str(&j, NULL, "request_id");
     j_end(&j);
+    json_ext_info(&j);
     j_end(&j);
     return finish_json(buf, R_OK, &j);
 }
@@ -744,15 +808,8 @@ static int32_t op_log(uint8_t *buf, uint32_t cap, const uint8_t *a) {
 //  Dispatcher
 // ---------------------------------------------------------------------------
 
-int32_t api_handle(uint8_t lun, const uint8_t *cdb, uint8_t *buf, uint32_t cap) {
-    if (cdb[2] != 'A' || cdb[3] != 'B') {
-        sense_set(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00);   // not an ATAboy API CDB
-        return -1;
-    }
-    if (cap < 256) {
-        sense_set(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00);   // allocation length too small
-        return -1;
-    }
+// Execute one request with the basic 16-byte reply header.
+static int32_t run_op(const uint8_t *cdb, uint8_t *buf, uint32_t cap) {
     cur_op = cdb[1];
     const uint8_t *a = &cdb[4];
     drive_stats.api_cmds++;
@@ -809,4 +866,84 @@ int32_t api_handle(uint8_t lun, const uint8_t *cdb, uint8_t *buf, uint32_t cap) 
     default:
         return reply_msg(buf, cap, R_BAD_SUBOP, "unknown sub-op");
     }
+}
+
+// Ops that change state take a run-once request id (CDB bytes 12-15) in an
+// extended request; their arguments never use those bytes.  INFO lists them
+// as "rid_ops".
+static bool op_takes_rid(uint8_t op) {
+    switch (op) {
+    case OP_CONFIG_SET: case OP_CONFIG_SAVE: case OP_CONFIG_DEFAULTS:
+    case OP_DETECT: case OP_GEOMETRY: case OP_MOUNT: case OP_UNMOUNT: case OP_RESET:
+    case OP_CORRUPT: case OP_LOG_CLEAR: case OP_ARM: case OP_REBOOT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+#define XF_REPLAYED  0x01        // stored reply to an earlier request with this id; not run again
+#define XF_RID       0x02        // the request id was taken (op is in rid_ops)
+
+// Turn a basic reply built at buf + HDR_LEN into an extended one at buf.
+static int32_t wrap_ext(uint8_t *buf, int32_t n, uint32_t rid, uint8_t xflags) {
+    memcpy(buf, buf + HDR_LEN, HDR_LEN);
+    buf[13] = EXT_HDR_LEN;
+    put_be32(&buf[16], boot_id);
+    put_be32(&buf[20], api_state_counter());
+    put_be32(&buf[24], rid);
+    buf[28] = xflags;
+    buf[29] = buf[30] = buf[31] = 0;
+    return n + HDR_LEN;
+}
+
+int32_t api_dispatch(const uint8_t *cdb, uint8_t *buf, uint32_t cap, uint8_t sense[3]) {
+    bool ext = cdb[3] == 'X';
+    if (cdb[2] != 'A' || (cdb[3] != 'B' && !ext) || cap < 256) {
+        // not an ATAboy API CDB, or allocation length too small
+        sense[0] = SCSI_SENSE_ILLEGAL_REQUEST; sense[1] = 0x24; sense[2] = 0x00;
+        return -1;
+    }
+    if (!ext) return run_op(cdb, buf, cap);
+
+    uint8_t req[16];
+    memcpy(req, cdb, 16);
+    uint32_t rid = 0;
+    uint8_t xflags = 0;
+    if (op_takes_rid(cdb[1])) {
+        rid = be32(&cdb[12]);
+        memset(&req[12], 0, 4);            // the op never sees the id
+        xflags = XF_RID;
+    }
+    const uint8_t *stored;
+    uint32_t stored_len;
+    switch (rid_lookup(rid, cdb, &stored, &stored_len)) {
+    case RID_HIT:
+        cur_op = cdb[1];
+        if (stored_len > cap)
+            return wrap_ext(buf, reply_msg(buf + HDR_LEN, cap - HDR_LEN, R_ALLOC_TOO_SMALL,
+                                           "stored reply is larger than the allocation"), rid, xflags);
+        memcpy(buf, stored, stored_len);
+        put_be32(&buf[8], now_ms());
+        buf[12] = hdr_flags();
+        put_be32(&buf[20], api_state_counter());
+        buf[28] |= XF_REPLAYED;
+        return (int32_t)stored_len;
+    case RID_CONFLICT:
+        cur_op = cdb[1];
+        return wrap_ext(buf, reply_msg(buf + HDR_LEN, cap - HDR_LEN, R_ID_CONFLICT,
+                                       "request id already used for a different request"), rid, xflags);
+    default:
+        break;
+    }
+    int32_t n = wrap_ext(buf, run_op(req, buf + HDR_LEN, cap - HDR_LEN), rid, xflags);
+    if (rid) rid_store(rid, cdb, buf, (uint32_t)n);
+    return n;
+}
+
+int32_t api_handle(uint8_t lun, const uint8_t *cdb, uint8_t *buf, uint32_t cap) {
+    uint8_t sense[3];
+    int32_t n = api_dispatch(cdb, buf, cap, sense);
+    if (n < 0) sense_set(lun, sense[0], sense[1], sense[2]);
+    return n;
 }

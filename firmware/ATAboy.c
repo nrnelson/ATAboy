@@ -81,6 +81,8 @@ int main(void) {
     queue_init(&cdc_tx_queue, sizeof(char), CDC_TX_QUEUE_SIZE);
     queue_init(&cdc_rx_queue, sizeof(char), CDC_RX_QUEUE_SIZE);
 
+    api_init();     // boot id, state counter: before the first API request
+
     // Init TinyUSB
     tusb_init();
 

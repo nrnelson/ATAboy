@@ -32,7 +32,7 @@ jobs:
       - name: Host unit tests
         run: |
           cc -Wall -Wextra -Werror -I firmware -o "$RUNNER_TEMP/test_host" \
-            tests/test_host.c firmware/ata_policy.c firmware/json.c
+            tests/test_host.c firmware/ata_policy.c firmware/json.c firmware/crc32.c firmware/rid_cache.c
           "$RUNNER_TEMP/test_host"
 
       - name: Host tool

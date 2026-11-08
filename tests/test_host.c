@@ -1,10 +1,14 @@
 // Host-side unit tests for the hardware-independent firmware modules:
-// the pass-through safety classifier and the JSON writer.
-//   cc -I firmware -o /tmp/t tests/test_host.c firmware/ata_policy.c firmware/json.c && /tmp/t
+// the pass-through safety classifier, the JSON writer, CRC-32, the run-once
+// request-id cache.
+//   cc -I firmware -o /tmp/t tests/test_host.c firmware/ata_policy.c firmware/json.c
+//      firmware/crc32.c firmware/rid_cache.c && /tmp/t
 #include <stdio.h>
 #include <string.h>
 #include "ata_policy.h"
 #include "json.h"
+#include "crc32.h"
+#include "rid_cache.h"
 
 static int failures = 0;
 #define CHECK(cond) do { if (!(cond)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); failures++; } } while (0)
@@ -84,9 +88,44 @@ static void test_json(void) {
     CHECK(strcmp(ata_status_bits(0x00, sb), "") == 0);
 }
 
+static void test_crc32(void) {
+    CHECK(crc32_update(0, "123456789", 9) == 0xCBF43926u);     // the standard check value
+    CHECK(crc32_update(0, "", 0) == 0);
+    uint32_t c = crc32_update(0, "1234", 4);
+    CHECK(crc32_update(c, "56789", 5) == 0xCBF43926u);          // incremental == one shot
+}
+
+static void test_rid_cache(void) {
+    uint8_t a[16] = {0xC0, 0x12, 'A', 'X', 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x22, 0x33, 0x44};
+    uint8_t b[16];
+    memcpy(b, a, 16);
+    b[4] = 1;                                                   // same id, different request
+    const uint8_t *r;
+    uint32_t n;
+    rid_clear();
+    CHECK(rid_lookup(0x11223344, a, &r, &n) == RID_MISS);
+    CHECK(rid_store(0x11223344, a, (const uint8_t *)"reply-a", 7));
+    CHECK(rid_lookup(0x11223344, a, &r, &n) == RID_HIT && n == 7 && memcmp(r, "reply-a", 7) == 0);
+    CHECK(rid_lookup(0x11223344, b, &r, &n) == RID_CONFLICT);
+    CHECK(rid_lookup(0, a, &r, &n) == RID_MISS);                // id 0 = none, never cached
+    CHECK(!rid_store(0, a, (const uint8_t *)"x", 1));
+    static uint8_t big[RID_REPLY_MAX + 1];
+    CHECK(!rid_store(5, a, big, sizeof(big)));                  // too long to keep
+    CHECK(rid_store(6, a, big, RID_REPLY_MAX));
+    // the oldest entry goes first
+    for (uint32_t id = 100; id < 100 + RID_CACHE_ENTRIES; id++) CHECK(rid_store(id, a, (const uint8_t *)"z", 1));
+    CHECK(rid_lookup(0x11223344, a, &r, &n) == RID_MISS);
+    CHECK(rid_lookup(100, a, &r, &n) == RID_HIT);
+    CHECK(rid_lookup(100 + RID_CACHE_ENTRIES - 1, a, &r, &n) == RID_HIT);
+    rid_clear();
+    CHECK(rid_lookup(100, a, &r, &n) == RID_MISS);
+}
+
 int main(void) {
     test_policy();
     test_json();
+    test_crc32();
+    test_rid_cache();
     if (failures) { printf("%d failure(s)\n", failures); return 1; }
     printf("all host tests passed\n");
     return 0;
