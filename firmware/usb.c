@@ -10,6 +10,8 @@
 #include "sat.h"
 #include "version.h"
 #include "usbbuf.h"
+#include "msc_rw.h"
+#include "pico/time.h"
 #include <string.h>
 
 // ---------------------------------------------------------------------------
@@ -34,9 +36,10 @@ bool usbbuf_has_host_data(const uint8_t *buf) {
     return memcmp(buf, poison_magic, 12) != 0 || memcmp(buf + 12, &poison_seq, 4) != 0;
 }
 
-void tud_msc_scsi_complete_cb(uint8_t lun, uint8_t const scsi_cmd[16]) { (void)lun; (void)scsi_cmd; usbbuf_poison(); }
-void tud_msc_read10_complete_cb(uint8_t lun)  { (void)lun; usbbuf_poison(); }
-void tud_msc_write10_complete_cb(uint8_t lun) { (void)lun; usbbuf_poison(); }
+// The complete callbacks run after the CSW of every command, passed or failed.
+void tud_msc_scsi_complete_cb(uint8_t lun, uint8_t const scsi_cmd[16]) { (void)lun; (void)scsi_cmd; usbbuf_poison(); msc_rw_end(); }
+void tud_msc_read10_complete_cb(uint8_t lun)  { (void)lun; usbbuf_poison(); msc_rw_end(); }
+void tud_msc_write10_complete_cb(uint8_t lun) { (void)lun; usbbuf_poison(); msc_rw_end(); }
 
 // TinyUSB passes the host's transfer length as 'bufsize' even when it is
 // larger than the class buffer, so cap it before touching the buffer.
@@ -96,108 +99,38 @@ bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition,
     return true;
 }
 
-static int32_t media_fail(uint8_t lun) {
-    const errlog_entry_t *e = drive_last_failure();
-    if (e) sense_set_media(lun, e);
-    else   sense_set(lun, SCSI_SENSE_MEDIUM_ERROR, 0x11, 0x00);
+static int32_t not_present(uint8_t lun) {
+    // Staged through sense.c like every other failure: TinyUSB overwrites its
+    // own copy with NOT READY / MEDIUM NOT PRESENT when a READ10/WRITE10
+    // callback fails, and the host's REQUEST SENSE gets the staged sense.
+    sense_set(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);
+    msc_rw_end();
     return -1;
 }
 
+uint32_t msc_rw_now_ms(void) { return to_ms_since_boot(get_absolute_time()); }
+
 // ---------------------------------------------------------------------------
-//  READ10 — block transfer with partial first/last sector handling
+//  READ10 / WRITE10 (data path in msc_rw.c)
 // ---------------------------------------------------------------------------
 
 int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
                           void *buffer, uint32_t bufsize) {
     usbbuf_note((uint8_t *)buffer);
-    if (!is_mounted) return -1;
-
-    uint64_t max = drive_total_sectors();
-    if (max == 0) return -1;
-
-    uint32_t remaining = bufsize;
-    uint8_t *ptr = (uint8_t *)buffer;
-    uint32_t cur_lba = lba;
-
-    // Partial first sector (non-zero offset)
-    if (offset && remaining > 0 && cur_lba < max) {
-        uint8_t temp[512];
-        if (drive_read(cur_lba, 1, temp) < 0) return media_fail(lun);
-        uint32_t n = 512 - offset;
-        if (n > remaining) n = remaining;
-        memcpy(ptr, temp + offset, n);
-        ptr += n; remaining -= n; cur_lba++;
-    }
-
-    // Aligned middle sectors — single ATA command
-    uint32_t aligned = remaining / 512;
-    if (aligned > 0 && cur_lba < max) {
-        if (cur_lba + aligned > max) aligned = (uint32_t)(max - cur_lba);
-        if (drive_read(cur_lba, aligned, ptr) < 0) return media_fail(lun);
-        ptr += aligned * 512; remaining -= aligned * 512; cur_lba += aligned;
-    }
-
-    // Partial last sector
-    if (remaining > 0 && cur_lba < max) {
-        uint8_t temp[512];
-        if (drive_read(cur_lba, 1, temp) < 0) return media_fail(lun);
-        memcpy(ptr, temp, remaining);
-        ptr += remaining; remaining = 0;
-    }
-
-    if (remaining > 0) memset(ptr, 0, remaining);
-    return (int32_t)bufsize;
+    if (!is_mounted) return not_present(lun);
+    return msc_rw_read(lun, lba, offset, (uint8_t *)buffer, bufsize);
 }
-
-// ---------------------------------------------------------------------------
-//  WRITE10 — block transfer with partial first/last read-modify-write
-// ---------------------------------------------------------------------------
 
 int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
                            uint8_t *buffer, uint32_t bufsize) {
     usbbuf_note(buffer);
-    if (!is_mounted) return -1;
+    if (!is_mounted) return not_present(lun);
     if (config.drive_write_protected) {
         sense_set(lun, SCSI_SENSE_DATA_PROTECT, 0x27, 0x00);
+        msc_rw_end();
         return -1;
     }
-
-    uint64_t max = drive_total_sectors();
-    if (max == 0) return -1;
-
-    uint32_t remaining = bufsize;
-    uint8_t *ptr = buffer;
-    uint32_t cur_lba = lba;
-
-    // Partial first sector — read-modify-write
-    if (offset && remaining > 0 && cur_lba < max) {
-        uint8_t temp[512];
-        if (drive_read(cur_lba, 1, temp) < 0) return media_fail(lun);
-        uint32_t n = 512 - offset;
-        if (n > remaining) n = remaining;
-        memcpy(temp + offset, ptr, n);
-        if (drive_write(cur_lba, 1, temp) < 0) return media_fail(lun);
-        ptr += n; remaining -= n; cur_lba++;
-    }
-
-    // Aligned middle sectors — single ATA command
-    uint32_t aligned = remaining / 512;
-    if (aligned > 0 && cur_lba < max) {
-        if (cur_lba + aligned > max) aligned = (uint32_t)(max - cur_lba);
-        if (drive_write(cur_lba, aligned, ptr) < 0) return media_fail(lun);
-        ptr += aligned * 512; remaining -= aligned * 512; cur_lba += aligned;
-    }
-
-    // Partial last sector — read-modify-write
-    if (remaining > 0 && cur_lba < max) {
-        uint8_t temp[512];
-        if (drive_read(cur_lba, 1, temp) < 0) return media_fail(lun);
-        memcpy(temp, ptr, remaining);
-        if (drive_write(cur_lba, 1, temp) < 0) return media_fail(lun);
-        remaining = 0;
-    }
-
-    return (int32_t)bufsize;
+    return msc_rw_write(lun, lba, offset, buffer, bufsize);
 }
 
 // ---------------------------------------------------------------------------

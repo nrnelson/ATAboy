@@ -14,6 +14,7 @@
 #include "version.h"
 #include "ide_pio.h"
 #include "fault.h"
+#include "sector_hash.h"
 #include "tusb.h"
 #include "pico/time.h"
 #include "pico/bootrom.h"
@@ -40,6 +41,7 @@
 #define OP_READ_LONG     0x23
 #define OP_VERIFY        0x24
 #define OP_CORRUPT       0x25
+#define OP_HASHES        0x26
 #define OP_LOG           0x30
 #define OP_LOG_CLEAR     0x31
 #define OP_ARM           0x40
@@ -330,6 +332,7 @@ static void json_status_body(json_t *j) {
     j_uint(j, "passthru_errors", drive_stats.passthru_errors);
     j_uint(j, "passthru_blocked", drive_stats.passthru_blocked);
     j_uint(j, "api_cmds", drive_stats.api_cmds);
+    j_uint(j, "budget_stops", drive_stats.budget_stops);
     j_end(j);
 
     j_obj(j, "errors");
@@ -433,7 +436,7 @@ static int32_t op_info(uint8_t *buf, uint32_t cap) {
     j_uint(&j, "reset", OP_RESET);         j_uint(&j, "identify", OP_IDENTIFY);
     j_uint(&j, "taskfile", OP_TASKFILE);   j_uint(&j, "read", OP_READ);
     j_uint(&j, "read_long", OP_READ_LONG); j_uint(&j, "verify", OP_VERIFY);
-    j_uint(&j, "corrupt", OP_CORRUPT);
+    j_uint(&j, "corrupt", OP_CORRUPT);    j_uint(&j, "hashes", OP_HASHES);
     j_uint(&j, "log", OP_LOG);             j_uint(&j, "log_clear", OP_LOG_CLEAR);
     j_uint(&j, "arm", OP_ARM);             j_uint(&j, "reboot", OP_REBOOT);
     j_end(&j);
@@ -443,6 +446,7 @@ static int32_t op_info(uint8_t *buf, uint32_t cap) {
     j_str(&j, NULL, "read_long"); j_str(&j, NULL, "verify"); j_str(&j, NULL, "bootsel");
     j_str(&j, NULL, "persistent_timeouts"); j_str(&j, NULL, "no_retry_reads");
     j_str(&j, NULL, "corrupt_sector"); j_str(&j, NULL, "last_fault");
+    if (hash_enabled()) j_str(&j, NULL, "sector_hashes");
     j_end(&j);
     j_end(&j);
     return finish_json(buf, R_OK, &j);
@@ -601,6 +605,8 @@ static int32_t op_read(uint8_t *buf, uint32_t cap, const uint8_t *a) {
     drive_stats.read_sectors += c.done;
     if (r != IDE_OK) drive_stats.read_errors++;
     drive_record(LOGOP_READ_DIAG, &c, lba, count);
+    hash_sectors(lba, c.buf, c.done, HASH_SRC_API, 0);
+    if (c.err_data) hash_sectors(lba + c.done, c.buf + c.done * 512, 1, HASH_SRC_API, HASH_F_ERR_DATA);
 
     put_result(buf + HDR_LEN, &c, lba, count, false);
     uint32_t nblk = c.done + (c.err_data ? 1 : 0);
@@ -752,6 +758,12 @@ static int32_t op_corrupt(uint8_t *buf, uint32_t cap, const uint8_t *a) {
     return finish(buf, drive_result_from_ide(r), CT_BINARY, RES_LEN);
 }
 
+// HASHES: binary page of the per-sector SHA-256 ring (sector_hash.h).
+static int32_t op_hashes(uint8_t *buf, uint32_t cap, const uint8_t *a) {
+    if (a[4] & 1) hash_clear();
+    return finish(buf, R_OK, CT_BINARY, hash_page(buf + HDR_LEN, cap - HDR_LEN, be32(&a[0])));
+}
+
 static int32_t op_log(uint8_t *buf, uint32_t cap, const uint8_t *a) {
     uint32_t start = be32(&a[0]);
     uint32_t n = drive_log_count();
@@ -828,6 +840,7 @@ int32_t api_handle(uint8_t lun, const uint8_t *cdb, uint8_t *buf, uint32_t cap) 
     case OP_READ_LONG:  return op_read_long(buf, cap, a);
     case OP_VERIFY:     return op_verify(buf, cap, a);
     case OP_CORRUPT:    return op_corrupt(buf, cap, a);
+    case OP_HASHES:     return op_hashes(buf, cap, a);
     case OP_LOG:        return op_log(buf, cap, a);
     case OP_LOG_CLEAR:
         if (a[0] & 1) drive_log_clear();

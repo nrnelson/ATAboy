@@ -64,6 +64,34 @@ void sense_set_media(uint8_t lun, const errlog_entry_t *e) {
     tud_msc_set_sense(lun, key, asc, ascq);
 }
 
+// The budget stops a command only after every drive command in it worked, so
+// the sector at 'lba' was never tried.  Reads get MEDIUM ERROR 11h/11h (READ
+// ERROR - LOSS OF STREAMING: the data could not be delivered in time): ASC 11h
+// keeps Linux from re-sending the whole command, it completes the sectors
+// before INFORMATION and fails the rest, and a new command for the remainder
+// gets a fresh budget.  Writes get 0Ch/00h like any failed write; Linux
+// retries those, which is harmless for a write.  Byte 15 bit1 marks the
+// budget stop; the ATA fields are zero because no ATA command failed.
+void sense_set_budget(uint8_t lun, bool write, uint32_t lba, uint32_t elapsed_ms) {
+    uint32_t ms = elapsed_ms > 0xFFFF ? 0xFFFF : elapsed_ms;
+    uint8_t asc = write ? 0x0C : 0x11, ascq = write ? 0x00 : 0x11;
+    memset(pend, 0, sizeof(pend));
+    pend[0]  = 0xF0;                        // VALID | current, fixed format
+    pend[2]  = SCSI_SENSE_MEDIUM_ERROR;
+    pend[3]  = (uint8_t)(lba >> 24);        // INFORMATION = first sector not transferred
+    pend[4]  = (uint8_t)(lba >> 16);
+    pend[5]  = (uint8_t)(lba >> 8);
+    pend[6]  = (uint8_t)lba;
+    pend[7]  = SENSE_LEN - 8;
+    pend[10] = (uint8_t)(ms >> 8);          // time spent on the command so far
+    pend[11] = (uint8_t)ms;
+    pend[12] = asc;
+    pend[13] = ascq;
+    pend[15] = 0x02;                        // budget stop
+    pend_valid = true;
+    tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, asc, ascq);
+}
+
 void sense_set_ata(uint8_t lun, uint8_t key, uint8_t asc, uint8_t ascq, const ide_cmd_t *c) {
     memset(pend, 0, sizeof(pend));
     pend[0] = 0x72;                         // current, descriptor format

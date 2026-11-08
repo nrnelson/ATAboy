@@ -1,5 +1,6 @@
 #include "drive.h"
 #include "config.h"
+#include "sector_hash.h"
 #include "pico/time.h"
 #include <string.h>
 
@@ -271,15 +272,16 @@ void drive_stats_clear(void) { memset(&drive_stats, 0, sizeof(drive_stats)); ide
 
 // An LBA the configured geometry can't express: log it so the sense data
 // describes this failure rather than an older one.
-static int32_t address_fail(uint8_t op, uint32_t lba, uint32_t count) {
+static int address_fail(uint8_t op, uint32_t lba, uint32_t count) {
     ide_cmd_t c = {0};
     c.result = IDE_PROTOCOL;
     drive_record(op, &c, lba, count);
     return -1;
 }
 
-int32_t drive_read(uint32_t lba, uint32_t count, uint8_t *buf) {
+int drive_read(uint32_t lba, uint32_t count, uint8_t *buf, uint32_t *done) {
     ide_cmd_t c = {0};
+    *done = 0;
     if (!ide_cmd_address(&c, lba, count, true)) return address_fail(LOGOP_READ, lba, count);
     c.command = c.ext ? 0x24 : (config.no_retry ? 0x21 : 0x20);
     c.proto = IDE_PROTO_PIO_IN;
@@ -292,11 +294,14 @@ int32_t drive_read(uint32_t lba, uint32_t count, uint8_t *buf) {
     drive_stats.read_sectors += c.done;
     if (r != IDE_OK) drive_stats.read_errors++;
     drive_record(LOGOP_READ, &c, lba, count);
-    return r == IDE_OK ? (int32_t)(count * 512) : -1;
+    *done = c.done < count ? c.done : count;
+    hash_sectors(lba, buf, *done, HASH_SRC_USB, 0);
+    return r == IDE_OK ? 0 : -1;
 }
 
-int32_t drive_write(uint32_t lba, uint32_t count, const uint8_t *buf) {
+int drive_write(uint32_t lba, uint32_t count, const uint8_t *buf, uint32_t *done) {
     ide_cmd_t c = {0};
+    *done = 0;
     if (!ide_cmd_address(&c, lba, count, true)) return address_fail(LOGOP_WRITE, lba, count);
     c.command = c.ext ? 0x34 : 0x30;
     c.proto = IDE_PROTO_PIO_OUT;
@@ -309,5 +314,6 @@ int32_t drive_write(uint32_t lba, uint32_t count, const uint8_t *buf) {
     drive_stats.write_sectors += c.done;
     if (r != IDE_OK) drive_stats.write_errors++;
     drive_record(LOGOP_WRITE, &c, lba, count);
-    return r == IDE_OK ? (int32_t)(count * 512) : -1;
+    *done = c.done < count ? c.done : count;
+    return r == IDE_OK ? 0 : -1;
 }

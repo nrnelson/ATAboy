@@ -30,6 +30,7 @@ ataboy -j read 19969 --through-error --out sector.bin
 ataboy readlong 19969 --vote 5 --image disk.img
 ataboy verify 0 336260              # drive-internal READ VERIFY scan, lists bad LBAs
 ataboy log                          # every failed command with ATA status/error/registers
+ataboy hashes --compare disk.img    # SHA-256 of recently read sectors vs. what the host saved
 ataboy image disk.img               # resumable imager with a ddrescue-compatible mapfile
 ataboy rescue disk.img disk.img.map # retry just the failed sectors, patch image + map
 ataboy whatfile disk.img --from-map disk.img.map  # which files/dirs/FAT the bad sectors hit
@@ -137,6 +138,7 @@ before parsing.
 | 22 | READ | [4-7] LBA · [8-9] count (1..`max_read_sectors`) · [10] flags: bit0 no retry (0x21), bit1 read-through-error · [12-15] per-sector timeout ms (0 = config) | binary: result block + data |
 | 23 | READ_LONG | [4-7] LBA · [8] ECC bytes (0 = auto) · [10] flags: bit0 no retry (0x23) · [12-15] timeout ms | binary: result block + 512 data + ECC bytes |
 | 25 | CORRUPT | [4-7] LBA · [8] data bits to flip (1..255) · [9] ECC bytes (0 = auto) | binary result block (of the WRITE LONG). **Destructive test helper**: READ LONG, flip bits, WRITE LONG with the old ECC; needs write protect off and an ARM |
+| 26 | HASHES | [4-7] first sequence number (0 = oldest retained) · [8] bit0 clear the ring first | binary: SHA-256 of recently read sectors (below) |
 | 24 | VERIFY | [4-7] LBA · [8-11] count · [12-15] per-command timeout ms | binary: result block (no data) |
 | 30 | LOG | [4-7] start index (0 = oldest retained) | JSON page of the error log |
 | 31 | LOG_CLEAR | [4] bit0 clear log, bit1 reset statistics | JSON |
@@ -164,7 +166,8 @@ before parsing.
              "ecc_len_effective": 4, "no_retry": false, "device": "master"},
   "stats": {"read_cmds": 1200, "read_sectors": 9600, "read_errors": 3, "write_cmds": 0,
             "write_sectors": 0, "write_errors": 0, "timeouts": 0, "recoveries": 0,
-            "passthru_cmds": 4, "passthru_errors": 0, "passthru_blocked": 0, "api_cmds": 17},
+            "passthru_cmds": 4, "passthru_errors": 0, "passthru_blocked": 0, "api_cmds": 17,
+            "budget_stops": 0},
   "errors": {"total": 3, "retained": 3, "last": { "...": "log entry, see LOG" }}
 }
 ```
@@ -197,7 +200,10 @@ command is outstanding. The Linux SCSI timeout for `/dev/sdX`
 up to `read_timeout_ms`, so the host tool raises it to at least
 8 × `read_timeout_ms` + 30 s whenever the timeout is set and on every
 `detect` / `mount` (the timeout may come from flash or the serial menu). It
-never lowers a larger value.
+never lowers a larger value. Linux splits large reads into READ(10)s of up to
+240 sectors (30 chunks), so the firmware also caps each READ(10)/WRITE(10) with
+a 20 s time budget (see *Mass-storage behaviour*): one host command takes at
+most 20 s plus the chunk that is running when the budget runs out.
 The serial menu also freezes during a long wait, because both share core 0's
 USB task.
 
@@ -237,6 +243,53 @@ failing LBA is the real one. No data
 crosses USB, so scanning is limited by the drive, not the 12 Mbit/s link. One
 request stops at the first error or after about 10 s (flag bit6, *partial*);
 continue from `lba + done`.
+
+### HASHES
+
+Every 512-byte sector the drive delivers on the USB-disk read path and to API
+READ (including a read-through-error block, flagged) is hashed with SHA-256
+by the RP2350's hardware SHA-256 block right after the drive command, before
+it goes to USB. The firmware keeps the last 1024 records in RAM (not saved;
+they start again at sequence 1 after a reboot or a clear). Compare them with
+the data the host received to rule out corruption between the drive and the
+host, or keep them as a record of what the drive delivered. READ LONG,
+pass-through and the serial menu are not hashed.
+
+Hashing costs about 10 µs a sector against roughly 1 ms per sector for the
+whole USB read at full speed (the header's busy time divided by the record
+count gives the measured figure), so it is always on. A known-answer test runs
+before first use; if the hardware gives a wrong digest, hashing stays off
+(header flag bit0 clear, INFO lists no `sector_hashes` feature).
+
+Reply payload: a 32-byte header, big-endian, then as many whole records as fit
+in the allocation (92 in 4 KiB). Page with `next` until it passes `newest`.
+
+| Byte | Meaning |
+|---|---|
+| 0-3 | `newest`: sequence number of the newest record (= sectors hashed since boot/clear; 0 = none) |
+| 4-7 | oldest retained sequence number (0 = none) |
+| 8-11 | `next`: sequence number to ask for next |
+| 12-13 | records in this reply |
+| 14-15 | record length (44) |
+| 16-17 | ring capacity (1024) |
+| 18 | flags: bit0 hashing active |
+| 19 | reserved |
+| 20-27 | µs spent hashing since boot/clear (64-bit) |
+| 28-31 | reserved |
+
+Record (44 bytes):
+
+| Byte | Meaning |
+|---|---|
+| 0-3 | sequence number |
+| 4-7 | LBA |
+| 8 | source: 1 USB disk READ(10), 2 API READ |
+| 9 | flags: bit0 data returned with ERR (read-through-error), not a good read |
+| 10-11 | reserved |
+| 12-43 | SHA-256 of the 512 data bytes |
+
+A sector that failed is not hashed (there is no data), and a USB-disk read
+that stops at a bad sector hashes only the sectors before it.
 
 ### LOG
 
@@ -315,13 +368,52 @@ Every pass-through command is classified (`firmware/ata_policy.c`):
 
 - READ10 failures return real sense instead of TinyUSB's "medium not present":
   fixed format, INFORMATION = failing LBA, bytes 8-9 = ATA status/error,
-  10-11 = elapsed ms, 14 = ATA command, 15 bit0 = timed out, 18 = engine
+  10-11 = elapsed ms, 14 = ATA command, 15 bit0 = timed out, bit1 = stopped
+  by the time budget (below), 18 = engine
   result, 19 = bit0 registers valid / bit1 SRST, 20-21 = sectors done.
   The key is always MEDIUM ERROR with ASC 11h (UNC, timeout as 11h/01h,
   not ready, bus fault, ABRT), 13h (AMNF) or 14h (IDNF): those are the only
   codes the Linux SCSI layer completes without retrying. Anything else, even
   HARDWARE ERROR on USB storage, makes Linux re-read a sector the drive has
   just spent seconds failing on. Failed writes use 03/0C/00.
+- READ(10) and WRITE(10) are served in whole 512-byte sectors only. A CBW
+  whose data length is not 512 × the CDB's block count (TinyUSB derives the
+  block size from it) fails with ILLEGAL REQUEST 24h/00h instead of being
+  served as partial sectors.
+- Only real sectors are returned. A READ(10) or WRITE(10) that starts at or
+  beyond the end of the configured geometry fails with ILLEGAL REQUEST 21h/00h
+  (LBA out of range); one that straddles the end transfers the sectors before
+  the end and then fails the same way (the CSW residue counts the rest).
+  Earlier firmware zero-filled reads past the end and silently dropped writes
+  there, both reported as success. That matters when the geometry is smaller
+  than the drive (e.g. NORMAL CHS on a larger LBA drive) and a tool sizes its
+  reads from the drive's real capacity.
+- A READ(10) that runs into a bad sector returns the good sectors before it,
+  then fails with the MEDIUM ERROR sense above (INFORMATION = the bad LBA, CSW
+  residue = everything from the bad sector on). The firmware reads a chunk of
+  up to 8 sectors with one drive command; when that command fails part way it
+  hands the good sectors to USB and fails the rest of the SCSI command at the
+  bad sector from the remembered failure, without sending the drive that
+  sector again. So each host command costs the drive at most one attempt per
+  bad sector; a new command (e.g. the host reading the remainder one sector at
+  a time) asks the drive again. Earlier firmware discarded the whole 8-sector
+  chunk.
+- **Time budget.** All drive work for one READ(10) or WRITE(10) shares a
+  budget of 20 s from its first chunk (`MSC_RW_BUDGET_MS` in
+  `firmware/msc_rw.h`, a build-time constant). Once it is used up no further
+  drive command is started: the sectors read so far are transferred and the
+  command fails at the first sector not tried, so a slow drive can't hold one
+  USB command past Linux's 30 s SCSI timeout (which would reset the device and
+  lose the good data). The sense is fixed format with VALID set, INFORMATION
+  = that sector, bytes 10-11 = ms spent on the command, byte 15 bit1 set, and
+  the ATA fields (8-9, 14, 18-21) zero because no ATA command failed. Reads
+  use MEDIUM ERROR 11h/11h (*read error, loss of streaming*): with ASC 11h
+  Linux keeps the sectors before INFORMATION and doesn't re-send the command,
+  and the next read of the remainder is a new command with a fresh budget.
+  Writes use MEDIUM ERROR 0Ch/00h; Linux re-sends those, which is harmless for
+  a write. STATUS `stats.budget_stops` counts these stops. The first drive
+  command of a host command is never refused, so every command makes
+  progress.
 - Mount (and a write-protect change while mounted) raises UNIT ATTENTION
   28h/00h, delivered on the next TEST UNIT READY. TinyUSB answers most
   standard opcodes itself, so TUR is where the host's disk driver learns
