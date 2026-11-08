@@ -6,6 +6,7 @@
 #include "pico/stdlib.h"
 #include "pico/time.h"
 #include "pico/sync.h"
+#include "pico/platform.h"
 #include <string.h>
 
 static uint8_t dev_base = 0xA0;   // 0xA0 = master, 0xB0 = slave
@@ -16,6 +17,16 @@ static bool sent_armed;        // sentinel written and read back after the last 
 static bool sent_unsupported;  // drive didn't keep it: no check until ide_set_geometry()
 static bool need_reinit;       // CHS geometry known lost: 91h before the next command
 static bool geo_accepted;      // the drive accepted 91h for the configured geometry
+
+// While an API request from the serial port runs on core 0, TinyUSB isn't
+// serviced, so the host's 30 s SCSI timer may run on a queued TEST UNIT READY
+// or READ(10).  ide_set_link_cap() bounds every wait on that core meanwhile.
+static uint32_t link_cap_ms;
+void ide_set_link_cap(uint32_t ms) { link_cap_ms = ms; }
+uint32_t ide_link_cap(void) { return link_cap_ms; }
+static uint32_t capped(uint32_t ms, uint32_t cap) {
+    return (link_cap_ms && get_core_num() == 0 && ms > cap) ? cap : ms;
+}
 
 // CHS addressing with a usable geometry: the drive needs INITIALIZE DEVICE
 // PARAMETERS to translate our addresses.
@@ -279,6 +290,7 @@ uint8_t ide_chs_check_state(void) {
 // Bounded by budget_ms (ATA allows a device 31 s).  Polls once a ms; the
 // caller holds the lock, so USB is blocked for as long as the drive needs.
 static bool wait_after_reset(uint32_t budget_ms, uint8_t *st_out) {
+    budget_ms = capped(budget_ms, IDE_RECOVERY_WAIT_MS);
     uint32_t t0 = time_us_32();
     uint32_t limit = budget_ms * 1000u;
     bool need_drdy = !chs_active();
@@ -490,7 +502,7 @@ uint8_t ide_probe_devices(uint8_t only) {
         // Device present — wait for BSY to clear (not DRDY; some older
         // drives won't assert DRDY until after INITIALIZE DRIVE PARAMETERS)
         dev_base = addrs[i];
-        if (!wait_ready(10000, false, &st)) continue;
+        if (!wait_ready(capped(10000, link_cap_ms), false, &st)) continue;
 
         // Recalibrate (required by some pre-ATA drives)
         wr(6, addrs[i]);
@@ -551,7 +563,7 @@ int ide_exec(ide_cmd_t *c) {
     c->done = 0;
     c->elapsed_us = 0;
 
-    uint32_t limit_us = (c->timeout_ms ? c->timeout_ms : 1000) * 1000u;
+    uint32_t limit_us = capped(c->timeout_ms ? c->timeout_ms : 1000, link_cap_ms) * 1000u;
     uint8_t st = 0;
     int res = IDE_OK;
     bool leftover = false;
@@ -562,7 +574,7 @@ int ide_exec(ide_cmd_t *c) {
     // Select the device and wait until it can take a command.  In CHS mode
     // with an accepted geometry only BSY is waited on at first: a drive that
     // reset itself may hold DRDY off until it gets 91h again.
-    uint32_t ready_ms = c->ready_ms ? c->ready_ms : 5000;
+    uint32_t ready_ms = capped(c->ready_ms ? c->ready_ms : 5000, link_cap_ms);
     bool want_drdy = c->flags & IDE_F_NEED_DRDY;
     bool chs = chs_active();
     wr(6, dh);

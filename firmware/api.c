@@ -808,12 +808,14 @@ static int32_t op_verify(uint8_t *buf, uint32_t cap, const uint8_t *a) {
     if ((uint64_t)lba + count > drive_total_sectors()) return reply_msg(buf, cap, R_BAD_ARG, "beyond end of drive");
 
     uint32_t t0 = time_us_32();
+    // over the serial port each request must end well inside 30 s (ide.h)
+    uint32_t verify_budget_us = ide_link_cap() ? VERIFY_BUDGET_US / 2 : VERIFY_BUDGET_US;
     uint32_t done = 0;
     ide_cmd_t c = {0};
     int r = IDE_OK;
     bool partial = false;
     while (done < count) {
-        if (time_us_32() - t0 > VERIFY_BUDGET_US) { partial = true; break; }
+        if (time_us_32() - t0 > verify_budget_us) { partial = true; break; }
         uint32_t n = count - done;
         if (n > 256) n = 256;
         r = verify_chunk(&c, lba + done, n, tmo);
@@ -832,7 +834,7 @@ static int32_t op_verify(uint8_t *buf, uint32_t cap, const uint8_t *a) {
         uint32_t end = done + n;
         r = IDE_OK;
         while (done < end) {
-            if (time_us_32() - t0 > VERIFY_BUDGET_US) { partial = true; break; }
+            if (time_us_32() - t0 > verify_budget_us) { partial = true; break; }
             r = verify_chunk(&c, lba + done, 1, tmo);
             if (r != IDE_OK) break;
             done++;

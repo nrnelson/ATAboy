@@ -9,6 +9,7 @@
 // response has been handed to TinyUSB.
 
 #include "api_serial.h"
+#include "ide.h"
 #include "apiframe.h"
 #include "api.h"
 #include "usbbuf.h"
@@ -66,7 +67,11 @@ static void execute(const af_event_t *ev) {
     uint32_t cap = ev->alloc ? ev->alloc : AF_MAX_BODY;
     if (cap > AF_MAX_BODY) cap = AF_MAX_BODY;
     uint8_t sense[3];
+    // TinyUSB isn't serviced while this runs: keep every wait short enough
+    // that a host command queued meanwhile can't hit its 30 s timeout.
+    ide_set_link_cap(IDE_SERIAL_CAP_MS);
     int32_t n = api_dispatch(ev->cdb, frame + AF_HDR_LEN, cap, sense);
+    ide_set_link_cap(0);
     if (n < 0) {
         memcpy(frame + AF_HDR_LEN, sense, 3);
         respond(ev->tag, AF_ST_CHECK, 3);

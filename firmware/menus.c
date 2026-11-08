@@ -930,7 +930,9 @@ static void try_auto_mount(void) {
     sleep_ms(5000);
 
     ide_select_device(config.dev_base);
-    ide_reset_drive();
+    // 10 s, not the full 31 s: the IDE lock is held throughout, and an API
+    // request arriving meanwhile would stall USB until it is released.
+    ide_reset_drive_wait(10000);
 
     // Poll drive ready
     uint32_t start = to_ms_since_boot(get_absolute_time());

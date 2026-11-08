@@ -496,6 +496,16 @@ second CDC ACM serial port, **"ATAboy API"**, with its own IAD (endpoints
 on firmware with the API port, so hosts don't reuse a descriptor layout
 cached for the old firmware. The baud rate and line settings are ignored.
 
+**Time limits on this port.** A request on the API port runs in core 0's main
+loop, and TinyUSB isn't serviced until it finishes. The host's mass-storage
+driver keeps polling the disk (TEST UNIT READY, and READ(10) while mounted)
+with a 30 s timeout, so while a serial request runs every IDE wait on core 0 is
+capped: drive command timeouts, ready waits and probe waits at 8 s
+(`IDE_SERIAL_CAP_MS`), reset stages at 5 s, and VERIFY's per-request budget is
+5 s instead of 10 s. A `timeout` argument above 8 s is silently capped on this
+port; for long single-sector retries (READ with a 15-30 s timeout on a dying
+drive) use the SCSI path. Moving serial requests off core 0 is planned.
+
 The port carries exactly the requests of the 0xC0 vendor command and returns
 exactly the bytes the SCSI path returns, framed with a length and a CRC:
 

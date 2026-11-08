@@ -85,6 +85,13 @@ uint8_t ide_seek_read_one(uint32_t target, bool lba);
 // then the RESET-line fallback), to stay inside the host's SCSI timeout.
 #define IDE_RECOVERY_WAIT_MS 5000u
 
+// Bound every IDE wait on core 0 (command timeouts, ready waits, probe waits
+// to ms; reset stages to IDE_RECOVERY_WAIT_MS) while ms != 0.  Used around API
+// requests from the serial port, which block TinyUSB until they finish.
+void     ide_set_link_cap(uint32_t ms);
+uint32_t ide_link_cap(void);
+#define  IDE_SERIAL_CAP_MS 8000u
+
 #define IDE_RST_OK      0   // SRST: drive back (and geometry accepted)
 #define IDE_RST_HW      1   // SRST failed, the RESET line brought it back (or explicit hard reset ok)
 #define IDE_RST_FAILED -1   // drive not back even after the RESET line
