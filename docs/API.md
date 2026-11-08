@@ -30,6 +30,7 @@ ataboy -j read 19969 --through-error --out sector.bin
 ataboy readlong 19969 --vote 5 --image disk.img
 ataboy verify 0 336260              # drive-internal READ VERIFY scan, lists bad LBAs
 ataboy log                          # every failed command with ATA status/error/registers
+ataboy hashes --compare disk.img    # SHA-256 of recently read sectors vs. what the host saved
 ataboy image disk.img               # resumable imager with a ddrescue-compatible mapfile
 ataboy rescue disk.img disk.img.map # retry just the failed sectors, patch image + map
 ataboy whatfile disk.img --from-map disk.img.map  # which files/dirs/FAT the bad sectors hit

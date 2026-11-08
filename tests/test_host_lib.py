@@ -9,6 +9,7 @@ result block + data).  No hardware, no root.
     python3 tests/test_host_lib.py
 """
 
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -76,6 +77,9 @@ class FakeDevice:
         self.calls = []              # (op, args) of every API call
         self.readlong_count = {}
         self.raise_on = None         # callable(op, args) -> exception to raise, or None
+        self.hash_records = []       # (seq, lba, source, flags, digest) of every sector read
+        self.hash_newest = 0
+        self.hash_capacity = 1024
 
     # -- transport ------------------------------------------------------------
 
@@ -190,6 +194,8 @@ class FakeDevice:
             return self.op_read_long(op, a)
         if op == 0x24:
             return self.op_verify(op, a)
+        if op == 0x26:
+            return self.op_hashes(op, a, alloc)
         if op == 0x30:
             start, = struct.unpack(">I", a[:4])
             page = self.log[start:start + 5]
@@ -213,6 +219,7 @@ class FakeDevice:
             mode = self.fails(s, no_retry)
             if mode is None:
                 data += sector(s)
+                self.hash_sector(s, sector(s))
                 continue
             if mode == TIMEOUT:
                 res, ide, st, er, tfv, err_data = R["timeout"], IDE["timeout"], 0x80, 0, False, False
@@ -223,11 +230,33 @@ class FakeDevice:
                 fail = self.fail_lba_override.get(s, s)
                 if err_data:
                     data += bytes(b ^ 0xFF for b in sector(s))     # the drive's best effort
+                    self.hash_sector(s, bytes(b ^ 0xFF for b in sector(s)), flags=1)
             self.record("read_diag", cmd, lba, count, i, res, fail, st, er, tfv, err_data)
             blk = self.result_block(lba, count, i, cmd, ide, st, er, err_data, tfv, fail)
             return self.reply(op, res, ab.CT_BINARY, blk + data)
         blk = self.result_block(lba, count, count, cmd, 0)
         return self.reply(op, 0, ab.CT_BINARY, blk + data)
+
+    def hash_sector(self, lba, data, source=2, flags=0):
+        self.hash_newest += 1
+        self.hash_records.append((self.hash_newest, lba, source, flags, hashlib.sha256(data).digest()))
+        del self.hash_records[:-self.hash_capacity]
+
+    def op_hashes(self, op, a, alloc):
+        """HASHES (0x26): 32-byte header + 44-byte records, as docs/API.md."""
+        start, flags = struct.unpack(">IB", a[:5])
+        if flags & 1:
+            self.hash_records, self.hash_newest = [], 0
+        oldest = self.hash_records[0][0] if self.hash_records else 0
+        start = max(start, oldest)
+        fit = (alloc - 16 - 32) // 44
+        recs = [r for r in self.hash_records if r[0] >= start][:fit]
+        nxt = recs[-1][0] + 1 if recs else (start if start > self.hash_newest else self.hash_newest + 1)
+        body = b"".join(struct.pack(">IIBBxx32s", *r) for r in recs)
+        busy = 10 * self.hash_newest
+        hdr = struct.pack(">IIIHHHBxQ4x", self.hash_newest, oldest, nxt, len(recs), 44,
+                          self.hash_capacity, 1, busy)
+        return self.reply(op, 0, ab.CT_BINARY, hdr + body)
 
     def op_read_long(self, op, a):
         lba, ecc, flags, tmo = struct.unpack(">IBxBxI", a)
@@ -811,6 +840,76 @@ class TestMisc(HostTestCase):
             self.dev.image(self.path("x.img"))
         self.assertEqual(cm.exception.reply.result_name, "not_mounted")
 
+
+
+class TestHashes(HostTestCase):
+    def test_records_match_data(self):
+        self.dev.read(10, 4)
+        j = self.dev.hashes()
+        self.assertTrue(j["active"])
+        self.assertEqual(j["newest"], 4)
+        self.assertEqual([x["lba"] for x in j["records"]], [10, 11, 12, 13])
+        self.assertEqual([x["seq"] for x in j["records"]], [1, 2, 3, 4])
+        for x in j["records"]:
+            self.assertEqual(x["sha256"], hashlib.sha256(sector(x["lba"])).hexdigest())
+            self.assertEqual(x["source"], "api_read")
+            self.assertFalse(x["err_data"])
+        self.assertEqual(j["us_per_sector"], 10.0)
+
+    def test_paging_and_filters(self):
+        for lba in range(0, 300, 7):
+            self.dev.read(lba, 7)               # 301 records: several 92-record pages
+        j = self.dev.hashes()
+        self.assertEqual(len(j["records"]), 301)
+        self.assertEqual([x["seq"] for x in j["records"]], list(range(1, 302)))
+        pages = sum(1 for op, _ in self.fake.calls if op == ab.OPS["hashes"])
+        self.assertEqual(pages, 4)
+        self.assertEqual(len(self.dev.hashes(since=290)["records"]), 12)
+        only = self.dev.hashes(lba=20, count=3)["records"]
+        self.assertEqual([x["lba"] for x in only], [20, 21, 22])
+
+    def test_ring_wraps(self):
+        self.fake.hash_capacity = 50
+        for lba in range(0, 70, 7):
+            self.dev.read(lba, 7)
+        j = self.dev.hashes()
+        self.assertEqual(j["newest"], 70)
+        self.assertEqual(j["oldest"], 21)
+        self.assertEqual(j["records"][0]["lba"], 20)
+
+    def test_err_data_flag_and_clear(self):
+        self.fake.bad[5] = UNC
+        self.dev.read(3, 4, through_error=True)
+        recs = self.dev.hashes()["records"]
+        self.assertEqual([(x["lba"], x["err_data"]) for x in recs], [(3, False), (4, False), (5, True)])
+        j = self.dev.hashes(clear=True)
+        self.assertTrue(j["cleared"])
+        self.assertEqual(self.dev.hashes()["newest"], 0)
+
+    def test_compare_with_image(self):
+        self.dev.read(0, 6)
+        img = self.blank_image("d.img", 5)
+        with open(img, "r+b") as f:
+            for lba in range(5):
+                f.seek(lba * 512)
+                f.write(sector(lba) if lba != 2 else bytes(512))
+        ok, bad, missing = self.dev.compare_hashes(self.dev.hashes()["records"], img)
+        self.assertEqual(ok, 4)
+        self.assertEqual([x["lba"] for x in bad], [2])
+        self.assertEqual([x["lba"] for x in missing], [5])
+
+    def test_cli(self):
+        self.dev.read(1, 2)                             # (sector 0 is all zeros)
+        args = ab.build_parser().parse_args(["hashes", "-j", "--compare", self.blank_image("z.img", 3)])
+        import io
+        import contextlib
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = ab.cmd_hashes(args, self.dev)
+        self.assertEqual(rc, ab.EXIT_DEVICE)            # zeros in the image differ
+        j = json.loads(out.getvalue())
+        self.assertEqual(j["compare"]["match"], 0)
+        self.assertEqual(len(j["compare"]["differ"]), 2)
 
 
 class EmptyReplyTest(HostTestCase):

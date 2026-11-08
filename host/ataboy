@@ -32,6 +32,7 @@ import ctypes
 import errno
 import fcntl
 import glob
+import hashlib
 import json
 import os
 import struct
@@ -218,7 +219,8 @@ OPS = {
     "info": 0x00, "status": 0x01, "config_get": 0x02, "config_set": 0x03,
     "config_save": 0x04, "config_defaults": 0x05, "detect": 0x10, "geometry": 0x11,
     "mount": 0x12, "unmount": 0x13, "reset": 0x14, "identify": 0x20, "taskfile": 0x21,
-    "read": 0x22, "read_long": 0x23, "verify": 0x24, "corrupt": 0x25, "log": 0x30, "log_clear": 0x31,
+    "read": 0x22, "read_long": 0x23, "verify": 0x24, "corrupt": 0x25, "hashes": 0x26,
+    "log": 0x30, "log_clear": 0x31,
     "arm": 0x40, "reboot": 0x41,
 }
 
@@ -233,6 +235,10 @@ CONFIG_KEYS = {
 }
 
 GEOMETRY_MODES = {"auto": 0, "normal": 1, "large": 2, "lba": 3, "manual": 4, "keep": 5}
+
+HASH_HDR = struct.Struct(">IIIHHHBxQ4x")     # HASHES reply header (32 bytes)
+HASH_REC = struct.Struct(">IIBBxx32s")        # one record (44 bytes)
+HASH_SOURCES = {1: "usb", 2: "api_read"}
 
 MSC_CHUNK_SECTORS = 8          # one USB-disk READ(10) chunk: the firmware's 4 KiB MSC buffer
 LBA28_LIMIT = 1 << 28          # READ LONG (0x22/0x23) has no 48-bit form
@@ -633,6 +639,64 @@ class ATAboy:
                 break
             start = j["next"]
         return {"total": total, "retained": len(entries), "entries": entries}
+
+    def _hashes_page(self, start, clear=False):
+        r = self.call("hashes", struct.pack(">IB", start, 1 if clear else 0))
+        if r.ctype != CT_BINARY:
+            raise ApiError(r)
+        if len(r.payload) < HASH_HDR.size:
+            raise TransportError("short HASHES reply (%d bytes)" % len(r.payload))
+        newest, oldest, nxt, n, rec_len, cap, flags, busy_us = HASH_HDR.unpack_from(r.payload)
+        if rec_len < HASH_REC.size or len(r.payload) < HASH_HDR.size + n * rec_len:
+            raise TransportError("malformed HASHES reply")
+        recs = []
+        for i in range(n):
+            seq, lba, src, fl, digest = HASH_REC.unpack_from(r.payload, HASH_HDR.size + i * rec_len)
+            recs.append({"seq": seq, "lba": lba, "source": HASH_SOURCES.get(src, "source_%d" % src),
+                         "err_data": bool(fl & 1), "sha256": digest.hex()})
+        head = {"newest": newest, "oldest": oldest, "capacity": cap, "active": bool(flags & 1),
+                "busy_us": busy_us,
+                "us_per_sector": round(busy_us / newest, 2) if newest else None}
+        return head, nxt, recs
+
+    def hashes(self, since=0, clear=False, lba=None, count=1):
+        """SHA-256 of recently read sectors (the device keeps the last ~1024).
+        Pages from sequence number 'since' (0 = oldest retained) to the newest.
+        clear=True empties the ring instead and returns no records.  With 'lba',
+        only records for lba..lba+count-1 are returned."""
+        if clear:
+            head, _, _ = self._hashes_page(0, clear=True)
+            head["records"] = []
+            head["cleared"] = True
+            return head
+        records, start = [], since
+        while True:
+            head, nxt, recs = self._hashes_page(start)
+            records += recs
+            if not recs or nxt > head["newest"] or nxt <= start:
+                break
+            start = nxt
+        if lba is not None:
+            records = [x for x in records if lba <= x["lba"] < lba + count]
+        head["records"] = records
+        return head
+
+    @staticmethod
+    def compare_hashes(records, image):
+        """Check hash records against an image file (sector LBA at offset
+        LBA*512).  Returns (matched, mismatched records, records past its end)."""
+        ok, bad, missing = 0, [], []
+        with open(image, "rb") as f:
+            for x in records:
+                f.seek(x["lba"] * 512)
+                data = f.read(512)
+                if len(data) < 512:
+                    missing.append(x)
+                elif hashlib.sha256(data).hexdigest() == x["sha256"]:
+                    ok += 1
+                else:
+                    bad.append(x)
+        return ok, bad, missing
 
     def clear(self, log=True, stats=False):
         return self._json("log_clear", bytes([(1 if log else 0) | (2 if stats else 0)]))
@@ -1957,6 +2021,33 @@ def cmd_log(args, dev):
     return EXIT_OK
 
 
+def human_hashes(j):
+    for x in j["records"]:
+        print("%8d  lba %-10d %-8s %s%s" % (x["seq"], x["lba"], x["source"], x["sha256"],
+                                            "  ERR-DATA" if x["err_data"] else ""))
+    if "compare" in j:
+        c = j["compare"]
+        print("compared with %s: %d match, %d differ, %d beyond its end"
+              % (c["image"], c["match"], len(c["differ"]), c["beyond_end"]))
+        for x in c["differ"]:
+            print("  DIFFER  lba %d  seq %d" % (x["lba"], x["seq"]))
+    per = "" if j["us_per_sector"] is None else ", %.1f us per sector" % j["us_per_sector"]
+    print("%s%d records shown; %d sectors hashed since boot/clear, ring holds %d%s"
+          % ("" if j["active"] else "hashing is OFF (self-test failed); ",
+             len(j["records"]), j["newest"], j["capacity"], per))
+
+
+def cmd_hashes(args, dev):
+    j = dev.hashes(since=args.since, clear=args.clear, lba=args.lba, count=args.count)
+    rc = EXIT_OK
+    if args.compare and not args.clear:
+        ok, bad, missing = dev.compare_hashes(j["records"], args.compare)
+        j["compare"] = {"image": args.compare, "match": ok, "differ": bad, "beyond_end": len(missing)}
+        rc = EXIT_DEVICE if bad else EXIT_OK
+    _emit(args, j, human_hashes)
+    return rc
+
+
 def cmd_clear(args, dev):
     _emit(args, dev.clear(log=not args.stats_only, stats=args.stats or args.stats_only))
     return EXIT_OK
@@ -2222,6 +2313,13 @@ def build_parser():
     x.add_argument("lba", type=_int)
     x.add_argument("--bits", type=int, default=16, help="data bits to flip (default 16)")
     x.add_argument("--ecc", type=int, default=0, help="ECC bytes (default: IDENTIFY word 22, else 4)")
+    x = add("hashes", cmd_hashes, "SHA-256 of recently read sectors as they came off the IDE bus "
+                                  "(USB disk and API reads); --compare checks them against an image")
+    x.add_argument("--since", type=_int, default=0, help="first sequence number (default: oldest kept)")
+    x.add_argument("--lba", type=_int, help="only records for this LBA (and --count after it)")
+    x.add_argument("--count", type=_int, default=1)
+    x.add_argument("--compare", metavar="IMG", help="check each record against IMG at LBA*512")
+    x.add_argument("--clear", action="store_true", help="empty the device's hash ring")
     x = add("log", cmd_log, "error log: every failed command with ATA status/error/registers")
     x.add_argument("--clear", action="store_true", help="clear after reading")
     x = add("clear", cmd_clear, "clear the error log (and/or statistics)")
