@@ -77,7 +77,7 @@ int32_t sat_passthrough(uint8_t lun, const uint8_t *cdb, uint8_t *buf, uint32_t 
 
     if (c.proto != IDE_PROTO_NONDATA) {
         // Data length comes from the host transfer; must be whole sectors and
-        // fit the 4 KiB class buffer.  T_DIR must agree with the protocol.
+        // fit the class buffer (CFG_TUD_MSC_EP_BUFSIZE).  T_DIR must agree with the protocol.
         if (t_length == 0 || xfer_len == 0 || (xfer_len % 512) || xfer_len > cap)
             return reject(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00);
         if ((c.proto == IDE_PROTO_PIO_IN) != t_dir_in)

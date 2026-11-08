@@ -536,7 +536,8 @@ class ATAboy:
         # The firmware enforces the real per-sector timeout; the host timeout only
         # has to be longer.  Without an explicit value assume the 600 s maximum.
         sg_t = (timeout_ms or 600000) * count + 15000
-        r = self.call("read", struct.pack(">IHBxI", lba, count, flags, timeout_ms), timeout_ms=sg_t)
+        r = self.call("read", struct.pack(">IHBxI", lba, count, flags, timeout_ms),
+                      alloc=max(4096, 48 + count * 512), timeout_ms=sg_t)
         if r.ctype != CT_BINARY:
             raise ApiError(r)
         return AtaResult(r.payload, r.result)
