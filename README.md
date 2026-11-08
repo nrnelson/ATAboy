@@ -1,3 +1,29 @@
+> **About this fork.** This branch adds an automation API to the ATAboy firmware
+> for data recovery work: everything the setup menu does (detect, geometry,
+> mount, settings) plus raw ATA commands, READ LONG, drive-internal surface
+> scans, a full error log and remote firmware updates, all over the existing
+> USB connection, with no serial terminal needed. The menu still works exactly
+> as before.
+>
+> * Firmware source: [`firmware/`](firmware/) (based on v0.6f3; builds with pico-sdk 2.2.0)
+> * Host tool: [`host/ataboy`](host/ataboy), a single Python file with no dependencies (Linux)
+> * Protocol reference: [`docs/API.md`](docs/API.md)
+>
+> ```
+> ataboy detect --mount                 # probe, IDENTIFY, pick geometry, mount
+> ataboy status                         # drive, geometry, config, stats, last error
+> ataboy config read_timeout_ms=15000   # let a failing drive finish its own retries
+> ataboy verify 0 336260                # list bad sectors without moving data over USB
+> smartctl -d sat -a /dev/sdX           # standard tools via SAT ATA pass-through
+> ```
+>
+> Changes for recovery use: the read timeout is adjustable and persistent (stock
+> resets the drive after 1 s, mid-retry), real ATA errors reach the host instead
+> of "medium not present", failed sectors can be read through the error, and the
+> IDE bus is locked between the menu and USB cores.
+
+-----------------------------------------------------------------------------------
+
 If you don't want to build your own, the hardware can be purchased here:  https://obsoletetech.us/products/ataboy-an-open-source-legacy-ide-usb-bridge
 
 
