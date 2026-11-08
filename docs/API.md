@@ -30,7 +30,8 @@ ataboy -j read 19969 --through-error --out sector.bin
 ataboy readlong 19969 --vote 5 --image disk.img
 ataboy verify 0 336260              # drive-internal READ VERIFY scan, lists bad LBAs
 ataboy log                          # every failed command with ATA status/error/registers
-ataboy rescue disk.img disk.map     # after ddrescue: retry just the bad sectors, patch image + map
+ataboy image disk.img               # resumable imager with a ddrescue-compatible mapfile
+ataboy rescue disk.img disk.img.map # retry just the failed sectors, patch image + map
 smartctl -d sat -a /dev/sdX         # standard tools via SAT pass-through
 ataboy reboot --bootsel             # UF2 bootloader for a firmware update
 ```
@@ -122,6 +123,7 @@ before parsing.
 | 21 | TASKFILE | — | JSON registers (`valid` false while BSY) |
 | 22 | READ | [4-7] LBA · [8-9] count (1..`max_read_sectors`) · [10] flags: bit0 no retry (0x21), bit1 read-through-error · [12-15] per-sector timeout ms (0 = config) | binary: result block + data |
 | 23 | READ_LONG | [4-7] LBA · [8] ECC bytes (0 = auto) · [10] flags: bit0 no retry (0x23) · [12-15] timeout ms | binary: result block + 512 data + ECC bytes |
+| 25 | CORRUPT | [4-7] LBA · [8] data bits to flip (1..255) · [9] ECC bytes (0 = auto) | binary result block (of the WRITE LONG). **Destructive test helper**: READ LONG, flip bits, WRITE LONG with the old ECC; needs write protect off and an ARM |
 | 24 | VERIFY | [4-7] LBA · [8-11] count · [12-15] per-command timeout ms | binary: result block (no data) |
 | 30 | LOG | [4-7] start index (0 = oldest retained) | JSON page of the error log |
 | 31 | LOG_CLEAR | [4] bit0 clear log, bit1 reset statistics | JSON |
@@ -229,6 +231,15 @@ The ring holds the last 64 failures. A page holds as many entries as fit in
 `write`, `read_diag` (API READ), `read_long`, `verify`, `passthrough` or `identify`.
 `tf` is null when the drive was still BSY. While BSY is set, every register
 reads back as STATUS, so those values would be garbage.
+
+### Testing recovery tools: CORRUPT
+
+CORRUPT makes a damaged sector on purpose, so imaging and recovery tools can
+be exercised repeatably on a scratch drive. On an early-90s IBM drive with 4
+ECC bytes per sector, up to 5 scattered flipped bits were corrected silently
+(no CORR bit), and 6 or more gave UNC. With read-through-error, the data then
+differed from the original by exactly the flipped bits. Writing the sector
+normally repairs it.
 
 ## SAT ATA PASS-THROUGH
 

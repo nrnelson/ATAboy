@@ -767,13 +767,14 @@ class ATAboy:
                 "kB_per_s": round(done * 0.512 / secs, 1) if secs else None}
 
     def rescue(self, image, mapfile, timeout_ms=15000, votes=5, readlong=True,
-               no_retry_pass=True, max_sectors=0, time_budget_s=0, progress=None):
+               no_retry_pass=True, max_sectors=0, time_budget_s=0, progress=None,
+               include_untried=False):
         """Targeted recovery after ddrescue: retry only the sectors the mapfile
         marks non-finished, gentlest first, writing recovered data into the image
         and updating the mapfile.  READ LONG results go into the image but stay
         marked bad in the map; they are listed in IMAGE.readlong.json."""
         m = Mapfile.load(mapfile)
-        targets = m.bad_sectors(max_sectors)
+        targets = m.bad_sectors(max_sectors, include_untried=include_untried)
         t0 = time.time()
         rec = {"result": "ok", "image": image, "mapfile": mapfile, "candidates": len(targets),
                "recovered_no_retry": [], "recovered_retry": [], "readlong": [], "still_bad": [],
@@ -931,10 +932,12 @@ class Mapfile:
             raise ValueError("%s: not a ddrescue mapfile" % path)
         return cls(path, header, cur_line, blocks)
 
-    def bad_sectors(self, limit=0):
+    def bad_sectors(self, limit=0, include_untried=False):
+        """Sectors in tried-and-failed areas ('-', '*', '/'); '?' (never
+        tried) only with include_untried."""
         out = []
         for pos, size, st in self.blocks:
-            if st == "+":
+            if st == "+" or (st == "?" and not include_untried):
                 continue
             for lba in range(pos // 512, (pos + size + 511) // 512):
                 out.append(lba)
@@ -1237,7 +1240,8 @@ def cmd_rescue(args, dev):
     before = Mapfile.load(args.mapfile).summary()
     out = dev.rescue(args.image, args.mapfile, timeout_ms=args.timeout, votes=args.vote,
                      readlong=not args.no_readlong, no_retry_pass=not args.no_fast_pass,
-                     max_sectors=args.max_sectors, time_budget_s=args.budget, progress=prog)
+                     max_sectors=args.max_sectors, time_budget_s=args.budget, progress=prog,
+                     include_untried=args.include_untried)
     out["map_before"] = before
     out["map_after"] = Mapfile.load(args.mapfile).summary()
     _emit(args, out, lambda o: print("rescue: %d candidate sectors, %d recovered (%d fast, %d with retries), "
@@ -1430,6 +1434,8 @@ def build_parser():
     x.add_argument("--no-readlong", action="store_true", help="skip the READ LONG pass")
     x.add_argument("--no-fast-pass", action="store_true", help="skip the no-retry pass")
     x.add_argument("--max-sectors", type=int, default=0, help="only the first N bad sectors")
+    x.add_argument("--include-untried", action="store_true",
+                   help="also read never-tried areas sector by sector (slow; normally use image)")
     x.add_argument("--budget", type=float, default=0, help="stop after N seconds")
     x = add("corrupt", cmd_corrupt, "DESTRUCTIVE test helper: damage a sector on purpose (READ LONG, flip "
                                     "bits, WRITE LONG with stale ECC) to exercise recovery tools")
