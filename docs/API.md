@@ -149,6 +149,7 @@ before parsing.
 {
   "result": "ok", "fw": "0.6f3-api1", "uptime_ms": 81234,
   "mounted": true, "write_protect": true, "armed": false,
+  "settings": {"load": "ok", "field": null},
   "drive": {"present": true, "identified": true, "forced": false, "device": "master",
             "model": "IBM-H2172-A2", "serial": "...", "firmware": "...",
             "default_chs": [989, 10, 34], "lba": false, "lba28_sectors": 0,
@@ -186,6 +187,22 @@ Register values are plain integers; `*_bits` fields decode them
 Settings live in RAM until CONFIG_SAVE. The saved block extends the stock
 firmware's, so settings saved by stock v0.6f3 still load (the new fields take
 their defaults).
+
+**Saved settings are checked at boot.** The block carries a CRC-32, and every
+field is range-checked (booleans 0/1, device, timeouts, `ecc_len`, geometry:
+CHS 1..65535 / 1..16 / 1..63 or all zero, LBA 1..2^48-1). STATUS
+`settings.load` says what happened:
+
+| `load` | Meaning |
+|---|---|
+| `ok` | CRC matched, all fields in range |
+| `legacy` | saved by stock or older API firmware (no CRC yet), all fields in range; the next save adds the CRC |
+| `none` | nothing saved: defaults |
+| `crc_error` | the CRC didn't match (torn write, flash corruption): **defaults loaded** |
+| `invalid` | a field was out of range, named in `settings.field`: **defaults loaded** |
+
+The serial menu shows a notice for `crc_error` and `invalid`. Saving writes
+the CRC; nothing is rewritten until you save.
 
 **Long timeouts and the host.** While the firmware waits on a sector, the USB
 command is outstanding. The Linux SCSI timeout for `/dev/sdX`

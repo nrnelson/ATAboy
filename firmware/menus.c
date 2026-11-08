@@ -843,6 +843,12 @@ static void try_auto_mount(void) {
 void core1_entry(void) {
     multicore_lockout_victim_init();   // core 0 may save config to flash
     sync_from_config();
+    if (config_load_status == CONFIG_LOAD_CRC_ERROR || config_load_status == CONFIG_LOAD_INVALID) {
+        // Defaults are already in effect (no geometry, nothing to mount): just say so.
+        strcpy(hdd_status_text, "\033[91;1mSaved settings corrupt - defaults loaded");
+        show_detect_result = true;
+        force_detect = false;
+    }
     try_auto_mount();
     bool trigger_overlay = false;
 

@@ -1732,6 +1732,10 @@ def _int(s):
 def human_status(j):
     d, g = j["drive"], j["geometry"]
     print("firmware   %s  (uptime %.1f s)" % (j["fw"], j["uptime_ms"] / 1000))
+    st = j.get("settings") or {}
+    if st.get("load") in ("crc_error", "invalid"):
+        print("settings   SAVED SETTINGS REJECTED (%s%s): defaults loaded" % (
+            st["load"], ", field " + st["field"] if st.get("field") else ""))
     if d["identified"] or d["forced"]:
         print("drive      %s  serial %s  fw %s  [%s]" % (d["model"], d["serial"] or "-", d["firmware"] or "-", d["device"]))
     else:

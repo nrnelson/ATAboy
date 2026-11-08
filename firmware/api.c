@@ -235,6 +235,12 @@ static void json_status_body(json_t *j) {
     j_bool(j, "write_protect", config.drive_write_protected);
     j_bool(j, "armed", api_is_armed());
 
+    j_obj(j, "settings");
+    j_str(j, "load", config_load_name(config_load_status));
+    if (config_load_detail) j_str(j, "field", config_load_detail);
+    else j_null(j, "field");
+    j_end(j);
+
     j_obj(j, "drive");
     j_bool(j, "present", drive.present);
     j_bool(j, "identified", drive.identified);
