@@ -942,18 +942,34 @@ def cmd_arm(args, dev):
 
 
 def cmd_reboot(args, dev):
-    _emit(args, dev.reboot(bootsel=args.bootsel), lambda j: print(j["message"]))
+    j = dev.reboot(bootsel=args.bootsel)
+    block = dev.info_dev["block"] if dev.info_dev else None
+    dev.close()
+    # The firmware reboots ~200 ms after replying; don't return while the old
+    # instance is still answering, or a following "wait" would talk to it.
+    t0 = time.time()
+    while block and os.path.exists("/sys/block/" + os.path.basename(block)) and time.time() - t0 < 5:
+        time.sleep(0.1)
+    j["gone_after_s"] = round(time.time() - t0, 2)
+    _emit(args, j, lambda j: print(j["message"]))
     return EXIT_OK
 
 
 def cmd_wait(args, dev_unused):
     t0 = time.time()
+    last_exec = 0
     while time.time() - t0 < args.timeout:
         devs = find_devices()
+        if not devs and args.exec_cmd and time.time() - last_exec > 3:
+            subprocess.run(args.exec_cmd, shell=True, capture_output=True)   # e.g. usbipd attach
+            last_exec = time.time()
         if devs:
             try:
-                with ATAboy(devs[0]["sg"] or devs[0]["block"]) as d:
-                    info = d.info()
+                if os.geteuid() == 0:
+                    with ATAboy(devs[0]["sg"] or devs[0]["block"]) as d:
+                        info = d.info()
+                else:       # no root: identify from sysfs (INQUIRY revision) only
+                    info = {"fw": "rev " + devs[0]["rev"], "git": "run as root for details"}
                 _emit(args, {"result": "ok", "device": devs[0], "info": info,
                              "waited_s": round(time.time() - t0, 1)},
                       lambda o: print("%s is up: %s (%s)" % (o["device"]["block"], o["info"]["fw"], o["info"]["git"])))
@@ -1076,6 +1092,9 @@ def build_parser():
     x.add_argument("--bootsel", action="store_true")
     x = add("wait", cmd_wait, "wait until an ATAboy answers (after reboot / replug)")
     x.add_argument("--timeout", type=int, default=30)
+    x.add_argument("--exec", dest="exec_cmd", metavar="CMD", default=os.environ.get("ATABOY_REATTACH"),
+                   help="shell command to run (every 3 s) while no device is visible, e.g. a usbipd "
+                        "attach under WSL (env ATABOY_REATTACH)")
     x = add("ata", cmd_ata, "raw ATA command via SAT pass-through (respects write protect / arming)")
     x.add_argument("command", type=_int)
     x.add_argument("--feature", type=_int, default=0)
@@ -1096,7 +1115,7 @@ NO_DEVICE_CMDS = {"list", "wait"}
 
 
 def _maybe_sudo(args, argv):
-    if os.geteuid() == 0 or args.no_sudo or args.cmd == "list":
+    if os.geteuid() == 0 or args.no_sudo or args.cmd in NO_DEVICE_CMDS:
         return
     script = os.path.abspath(sys.argv[0])
     extra = ["--json"] if args.json and "-j" not in argv and "--json" not in argv else []

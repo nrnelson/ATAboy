@@ -271,9 +271,16 @@ Every pass-through command is classified (`firmware/ata_policy.c`):
   driver still sees it. `ataboy mount` / `unmount` also ask the kernel to
   rescan.
 - With `no_retry` set, the USB disk reads with READ SECTORS without retries
-  (0x21), a fast first pass for imaging old drives with `ddrescue`.
+  (0x21), a fast first pass for imaging old drives with `ddrescue`. On an
+  early-90s IBM drive an unreadable sector failed in 20-50 ms this way instead
+  of 4.3 s with the drive's own retries.
 
 ## Firmware updates
+
+`ataboy reboot` returns once the old instance has disconnected; follow it with
+`ataboy wait`. Under WSL2 the re-enumerated device has to be re-attached with
+usbipd: `ataboy wait --exec 'usbipd.exe attach --wsl --busid 1-3'` (or set
+`ATABOY_REATTACH`) runs that command while the device is missing.
 
 `REBOOT` with mode 1 enters the RP2350 ROM bootloader (UF2 drive `RP2350` plus
 PICOBOOT). Copy a `.uf2` onto the drive, or use `picotool load`, and the ATAboy
