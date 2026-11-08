@@ -813,6 +813,68 @@ class TestMisc(HostTestCase):
 
 
 
+def fake_sysfs(root, units):
+    """A minimal /sys for find_devices(): units = [(serial, disk, tty or None)]."""
+    def put(path, text=""):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text + "\n")
+    for n, (serial, disk, tty) in enumerate(units):
+        usb = os.path.join(root, "devices", "pci0", "usb1", "1-%d" % (n + 1))
+        put(usb + "/idVendor", "cafe")
+        put(usb + "/idProduct", "4005")
+        put(usb + "/serial", serial)
+        if disk:
+            scsi = os.path.join(usb, "1-%d:1.2" % (n + 1), "host%d" % n, "target%d:0:0" % n, "%d:0:0:0" % n)
+            put(scsi + "/vendor", "ATAboy  ")
+            put(scsi + "/rev", "api1")
+            put(scsi + "/timeout", "30")
+            os.makedirs(scsi + "/scsi_generic/sg%d" % n)
+            blk = os.path.join(root, "block", disk)
+            put(blk + "/size", "336260")
+            os.symlink(scsi, blk + "/device")
+        if tty:
+            itf = os.path.join(usb, "1-%d:1.3" % (n + 1))
+            put(itf + "/interface", "ATAboy API")
+            cls = os.path.join(root, "class", "tty", tty)
+            os.makedirs(cls)
+            os.symlink(itf, cls + "/device")
+        console = os.path.join(usb, "1-%d:1.0" % (n + 1))      # the setup-UI port is not the API
+        put(console + "/interface", "ATAboy CDC")
+        cls = os.path.join(root, "class", "tty", "ttyACM%d" % (10 + n))
+        os.makedirs(cls)
+        os.symlink(console, cls + "/device")
+
+
+class TestDiscovery(HostTestCase):
+    def test_serials_and_ports(self):
+        root = self.path("sys")
+        fake_sysfs(root, [("E66138935F4B2F2B", "sdb", "ttyACM1"), ("0123456789ABCDEF", "sdc", None)])
+        devs = ab.find_devices(sysfs=root)
+        self.assertEqual([(d["block"], d["sg"], d["tty"], d["serial"]) for d in devs],
+                         [("/dev/sdb", "/dev/sg0", "/dev/ttyACM1", "E66138935F4B2F2B"),
+                          ("/dev/sdc", "/dev/sg1", None, "0123456789ABCDEF")])
+        self.assertEqual(ab.select_device(devs, "0123456789abcdef")["block"], "/dev/sdc")
+        self.assertEqual(ab.select_device(devs)["block"], "/dev/sdb")
+        with self.assertRaises(ab.TransportError):
+            ab.select_device(devs, "nope")
+        with self.assertRaises(ab.TransportError):
+            ab.select_device([])
+
+    def test_port_without_disk(self):
+        root = self.path("sys")
+        fake_sysfs(root, [("AAAA", None, "ttyACM3")])
+        devs = ab.find_devices(sysfs=root)
+        self.assertEqual(len(devs), 1)
+        self.assertEqual((devs[0]["block"], devs[0]["tty"], devs[0]["serial"]), (None, "/dev/ttyACM3", "AAAA"))
+
+    def test_cli_serial_option(self):
+        args = ab.build_parser().parse_args(["status", "--serial", "AAAA"])
+        self.assertEqual(args.serial, "AAAA")
+        args = ab.build_parser().parse_args(["-s", "BBBB", "status"])
+        self.assertEqual(args.serial, "BBBB")
+
+
 class EmptyReplyTest(HostTestCase):
     def blank_first(self, ops):
         real, state = self.fake.sgio, {"n": 0}

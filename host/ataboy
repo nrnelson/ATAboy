@@ -174,23 +174,71 @@ def _read(path):
         return ""
 
 
-def find_devices():
-    """All attached ATAboys: list of dicts with block/sg device paths."""
-    out = []
-    for blk in sorted(glob.glob("/sys/block/sd*")):
+USB_VID, USB_PID = "cafe", "4005"
+API_INTERFACE = "ATAboy API"       # interface string of the API serial port (firmware with "serial_api")
+
+
+def _usb_device_dir(path):
+    """The USB device directory (the one with idVendor) above a sysfs path."""
+    p = os.path.realpath(path)
+    while len(p) > 1:
+        if os.path.isfile(os.path.join(p, "idVendor")) and os.path.isfile(os.path.join(p, "idProduct")):
+            return p
+        p = os.path.dirname(p)
+    return None
+
+
+def _api_ports(sysfs):
+    """{USB device sysfs dir: tty name} for every ATAboy API serial port."""
+    out = {}
+    for tty in sorted(glob.glob(os.path.join(sysfs, "class", "tty", "ttyACM*"))):
+        itf = os.path.realpath(os.path.join(tty, "device"))
+        if _read(itf + "/interface") != API_INTERFACE:
+            continue
+        usb = _usb_device_dir(itf)
+        if usb and _read(usb + "/idVendor").lower() == USB_VID and _read(usb + "/idProduct").lower() == USB_PID:
+            out[usb] = os.path.basename(tty)
+    return out
+
+
+def find_devices(sysfs="/sys", dev="/dev"):
+    """All attached ATAboys: list of dicts with the block/sg device, the API
+    serial port (tty, None on firmware without one) and the USB serial number."""
+    out, ports = [], _api_ports(sysfs)
+    for blk in sorted(glob.glob(os.path.join(sysfs, "block", "sd*"))):
         if _read(blk + "/device/vendor") != "ATAboy":
             continue
         name = os.path.basename(blk)
         sg = glob.glob(blk + "/device/scsi_generic/sg*")
+        usb = _usb_device_dir(blk + "/device")
+        tty = ports.pop(usb, None) if usb else None
         out.append({
-            "block": "/dev/" + name,
-            "sg": "/dev/" + os.path.basename(sg[0]) if sg else None,
+            "block": os.path.join(dev, name),
+            "sg": os.path.join(dev, os.path.basename(sg[0])) if sg else None,
+            "tty": os.path.join(dev, tty) if tty else None,
+            "serial": _read(usb + "/serial") if usb else "",
             "rev": _read(blk + "/device/rev"),
             "size_sectors": int(_read(blk + "/size") or 0),
             "scsi_timeout_s": int(_read(blk + "/device/timeout") or 0),
             "sysfs": os.path.realpath(blk + "/device"),
+            "usb": usb,
         })
+    for usb, tty in sorted(ports.items()):      # API port without a disk (usb-storage not bound)
+        out.append({"block": None, "sg": None, "tty": os.path.join(dev, tty), "serial": _read(usb + "/serial"),
+                    "rev": "", "size_sectors": 0, "scsi_timeout_s": 0, "sysfs": None, "usb": usb})
     return out
+
+
+def select_device(devs, serial=None):
+    """The device to use from find_devices(): the one with this USB serial
+    number (case-insensitive), else the first.  Raises TransportError."""
+    if serial:
+        devs = [d for d in devs if d["serial"].lower() == serial.lower()]
+        if not devs:
+            raise TransportError("no ATAboy with USB serial %s" % serial)
+    if not devs:
+        raise TransportError("no ATAboy found (no /sys/block/sd* with vendor 'ATAboy')")
+    return devs[0]
 
 
 # ---------------------------------------------------------------------------
@@ -383,17 +431,17 @@ def decode_identify(raw):
 # ---------------------------------------------------------------------------
 
 class ATAboy:
-    """One ATAboy.  path = /dev/sgN or /dev/sdX (default: first one found)."""
+    """One ATAboy.  path = /dev/sgN or /dev/sdX (default: the first one found,
+    or the one whose USB serial number is 'serial')."""
 
-    def __init__(self, path=None):
+    def __init__(self, path=None, serial=None):
         self.info_dev = None
         self.empty_replies = 0          # empty replies re-sent (see call())
         if path is None:
-            devs = find_devices()
-            if not devs:
-                raise TransportError("no ATAboy found (no /sys/block/sd* with vendor 'ATAboy')")
-            self.info_dev = devs[0]
-            path = devs[0]["sg"] or devs[0]["block"]
+            self.info_dev = select_device(find_devices(), serial)
+            path = self.info_dev["sg"] or self.info_dev["block"]
+            if not path:
+                raise TransportError("ATAboy %s has no SCSI disk device" % self.info_dev["serial"])
         else:
             for d in find_devices():
                 if path in (d["sg"], d["block"]):
@@ -1774,8 +1822,9 @@ def human_ata_result(r):
 
 
 def cmd_list(args, dev):
-    _emit(args, find_devices(), lambda l: [print("%s  %s  rev %s  %d sectors" % (
-        d["block"], d["sg"], d["rev"], d["size_sectors"])) for d in l] or (not l and print("no ATAboy found")))
+    _emit(args, find_devices(), lambda l: [print("%s  %s  %s  serial %s  rev %s  %d sectors" % (
+        d["block"], d["sg"], d["tty"] or "-", d["serial"] or "-", d["rev"] or "-", d["size_sectors"]))
+        for d in l] or (not l and print("no ATAboy found")))
     return EXIT_OK
 
 
@@ -1986,6 +2035,8 @@ def cmd_wait(args, dev_unused):
     last_exec = 0
     while time.time() - t0 < args.timeout:
         devs = find_devices()
+        if args.serial:
+            devs = [d for d in devs if d["serial"].lower() == args.serial.lower()]
         if not devs and args.exec_cmd and time.time() - last_exec > 3:
             subprocess.run(args.exec_cmd, shell=True, capture_output=True)   # e.g. usbipd attach
             last_exec = time.time()
@@ -2120,6 +2171,8 @@ def build_parser():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("-d", "--dev", default=os.environ.get("ATABOY_DEV"),
                    help="/dev/sgN or /dev/sdX (default: first ATAboy found; env ATABOY_DEV)")
+    p.add_argument("-s", "--serial", default=os.environ.get("ATABOY_SERIAL"),
+                   help="pick the ATAboy with this USB serial number (see 'list'; env ATABOY_SERIAL)")
     p.add_argument("-j", "--json", action="store_true", default=os.environ.get("ATABOY_JSON") == "1",
                    help="machine-readable JSON output (env ATABOY_JSON=1)")
     p.add_argument("--compact", action="store_true", help="single-line JSON")
@@ -2132,6 +2185,7 @@ def build_parser():
     # ("ataboy status -j"); SUPPRESS keeps the top-level value unless given.
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("-d", "--dev", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    common.add_argument("-s", "--serial", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     common.add_argument("-j", "--json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     common.add_argument("--compact", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     common.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
@@ -2267,6 +2321,8 @@ def _maybe_sudo(args, argv):
     extra = ["--json"] if args.json and "-j" not in argv and "--json" not in argv else []
     if args.dev is None and os.environ.get("ATABOY_DEV"):
         extra += ["--dev", os.environ["ATABOY_DEV"]]
+    if os.environ.get("ATABOY_SERIAL") and args.serial == os.environ["ATABOY_SERIAL"]:
+        extra += ["--serial", os.environ["ATABOY_SERIAL"]]      # sudo drops the environment
     cmd = [sys.executable, script] + extra + argv
     if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0:
         os.execvp("sudo", ["sudo", "-n", "--"] + cmd)
@@ -2282,7 +2338,7 @@ def main(argv=None):
     dev = None
     try:
         if args.cmd not in NO_DEVICE_CMDS:
-            dev = ATAboy(args.dev)
+            dev = ATAboy(args.dev, serial=args.serial)
         return args.fn(args, dev)
     except ApiError as e:
         obj = e.reply.json if isinstance(e.reply.json, dict) else {"result": e.reply.result_name}
