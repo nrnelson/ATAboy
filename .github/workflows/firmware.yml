@@ -2,7 +2,7 @@ name: firmware
 
 on:
   push:
-    branches: [main, automation-api]
+    branches: [main]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
