@@ -322,7 +322,7 @@ static bool restore_geometry(void) {
 // Pulse RESET- (resets both devices on the cable), wait, recalibrate and
 // restore the geometry.  IORDY is ignored meanwhile: a drive holds it low
 // during POST.
-static bool hard_reset(void) {
+static bool hard_reset(uint32_t wait_ms) {
     uint8_t st;
     ide_health.hw_resets++;
     sent_armed = false;
@@ -332,7 +332,7 @@ static bool hard_reset(void) {
     gpio_put(IDE_RESET, 1);
     sleep_ms(100);
     wr_ctl(0x00);
-    bool ok = wait_after_reset(IDE_RESET_WAIT_MS, &st);
+    bool ok = wait_after_reset(wait_ms, &st);
     if (ok) {
         // Recalibrate: seek heads to track 0 (required by some pre-ATA drives).
         // ATA-4 and later drives may abort it, so its status is not judged.
@@ -351,7 +351,7 @@ static bool hard_reset(void) {
 // PARAMETERS.  Wait (bounded) for the configured device, restore the CHS
 // geometry and check it was accepted; if the drive doesn't come back, one
 // hardware reset.  Returns IDE_RST_*.
-static int soft_reset(void) {
+static int soft_reset(uint32_t wait_ms) {
     uint32_t t0 = time_us_32();
     uint8_t st;
     ide_health.soft_resets++;
@@ -361,12 +361,12 @@ static int soft_reset(void) {
     busy_wait_us_32(10);                   // >= 5 us
     wr_ctl(0x00);
     busy_wait_us_32(2000);                 // >= 2 ms before BSY is valid
-    bool ok = wait_after_reset(IDE_RESET_WAIT_MS, &st) && restore_geometry();
+    bool ok = wait_after_reset(wait_ms, &st) && restore_geometry();
     ide_set_iordy(config.iordy_enabled);
     int r = IDE_RST_OK;
     if (!ok) {
         ide_health.soft_reset_failures++;
-        r = hard_reset() ? IDE_RST_HW : IDE_RST_FAILED;
+        r = hard_reset(wait_ms) ? IDE_RST_HW : IDE_RST_FAILED;
     }
     ide_health.last_reset = (int8_t)r;
     ide_health.last_reset_ms = (time_us_32() - t0) / 1000u;
@@ -436,19 +436,23 @@ void ide_hw_init(void) {
     ide_set_iordy(config.iordy_enabled);
 }
 
-bool ide_reset_drive(void) {
+bool ide_reset_drive(void) { return ide_reset_drive_wait(IDE_RESET_WAIT_MS); }
+
+bool ide_reset_drive_wait(uint32_t wait_ms) {
     ide_lock();
     uint32_t t0 = time_us_32();
-    bool ok = hard_reset();
+    bool ok = hard_reset(wait_ms);
     ide_health.last_reset = ok ? IDE_RST_HW : IDE_RST_FAILED;
     ide_health.last_reset_ms = (time_us_32() - t0) / 1000u;
     ide_unlock();
     return ok;
 }
 
-int ide_soft_reset(void) {
+int ide_soft_reset(void) { return ide_soft_reset_wait(IDE_RESET_WAIT_MS); }
+
+int ide_soft_reset_wait(uint32_t wait_ms) {
     ide_lock();
-    int r = soft_reset();
+    int r = soft_reset(wait_ms);
     ide_unlock();
     return r;
 }
@@ -699,7 +703,11 @@ int ide_exec(ide_cmd_t *c) {
     }
 
     if ((res == IDE_TIMEOUT || res == IDE_BUS_FAULT || leftover) && !(c->flags & IDE_F_NO_RECOVER)) {
-        int rr = soft_reset();
+        // Inside a USB command: a short wait, so the host's SCSI timeout
+        // (30 s on Linux) isn't blown by the reset alone.  A drive that needs
+        // longer shows as not ready on the next command and catches up;
+        // an explicit RESET (API/menu) waits the full IDE_RESET_WAIT_MS.
+        int rr = soft_reset(IDE_RECOVERY_WAIT_MS);
         c->recovered = true;
         if (rr == IDE_RST_HW) c->events |= IDE_EV_HW_RESET;
         else if (rr == IDE_RST_FAILED) c->events |= IDE_EV_HW_RESET | IDE_EV_RESET_FAILED;

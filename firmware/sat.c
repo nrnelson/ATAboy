@@ -52,12 +52,14 @@ int32_t sat_passthrough(uint8_t lun, const uint8_t *cdb, uint8_t *buf, uint32_t 
     c.ext = extend;
 
     switch (proto) {
+    // Resets asked for through pass-through run inside the host's SCSI
+    // timeout, so they use the short recovery wait (see ide.h).
     case SAT_HARD_RESET:
-        ide_reset_drive();
+        ide_reset_drive_wait(IDE_RECOVERY_WAIT_MS);
         return 0;
     case SAT_SRST:
     case SAT_DEV_RESET:
-        ide_soft_reset();
+        ide_soft_reset_wait(IDE_RECOVERY_WAIT_MS);
         return 0;
     case SAT_RETURN_INFO:
         sense_set_ata(lun, SCSI_SENSE_RECOVERED_ERROR, ASC_PT_INFO, ASCQ_PT_INFO, &last_pt);

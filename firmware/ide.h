@@ -53,6 +53,8 @@ uint8_t ide_probe_devices(uint8_t only);   // reset + scan; only = 0 (both), 0xA
 void    ide_hw_init(void);
 bool    ide_reset_drive(void);             // RESET line + recalibrate + restore CHS geometry
 int     ide_soft_reset(void);              // SRST + restore CHS geometry; IDE_RST_*
+int     ide_soft_reset_wait(uint32_t wait_ms);   // same, bounded per stage (SRST, RESET fallback)
+bool    ide_reset_drive_wait(uint32_t wait_ms);
 bool    ide_wait_until_ready(uint32_t timeout_ms);
 
 void    ide_write_reg(uint8_t reg, uint8_t val);
@@ -79,6 +81,9 @@ uint8_t ide_seek_read_one(uint32_t target, bool lba);
 // PARAMETERS in CHS mode and checks it was accepted.  A soft reset that
 // doesn't bring the drive back gets one hardware reset.
 #define IDE_RESET_WAIT_MS 31000u
+// Recovery after a timeout inside a command waits less (per stage: SRST,
+// then the RESET-line fallback), to stay inside the host's SCSI timeout.
+#define IDE_RECOVERY_WAIT_MS 5000u
 
 #define IDE_RST_OK      0   // SRST: drive back (and geometry accepted)
 #define IDE_RST_HW      1   // SRST failed, the RESET line brought it back (or explicit hard reset ok)
