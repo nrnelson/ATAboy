@@ -32,9 +32,22 @@ ataboy verify 0 336260              # drive-internal READ VERIFY scan, lists bad
 ataboy log                          # every failed command with ATA status/error/registers
 ataboy image disk.img               # resumable imager with a ddrescue-compatible mapfile
 ataboy rescue disk.img disk.img.map # retry just the failed sectors, patch image + map
+ataboy whatfile disk.img --from-map disk.img.map  # which files/dirs/FAT the bad sectors hit
 smartctl -d sat -a /dev/sdX         # standard tools via SAT pass-through
 ataboy reboot --bootsel             # UF2 bootloader for a firmware update
 ```
+
+`whatfile` works on an image file only (no device, no root). It reads FAT12/16/32
+on MBR primary and logical partitions, or a bare FAT volume, and reports one line
+per LBA: file (path, byte offset, whether the sector is only slack past EOF),
+directory (and the entries stored in that sector), FAT copy, boot/reserved
+sector, root directory, free or lost cluster, MBR/EBR/gap, or non-FAT
+partition. Deleted entries are matched best effort (first cluster certain, the
+rest assume the file was contiguous). LBAs come from the command line,
+`--from-map` (every tried-and-failed sector of a ddrescue mapfile) or
+`--from-json` (a list, or an object with `bad_lbas` such as `verify -j`
+output). With `-j` the output adds a per-object summary (`files`: path ->
+LBAs) and counts per kind.
 
 `-j` / `ATABOY_JSON=1` gives JSON on stdout. Exit status: `0` ok, `1` the device
 reported a failure (ATA error, bad argument, ...), `2` usage, `3` transport /

@@ -10,6 +10,7 @@ PASS-THROUGH (16) for raw ATA commands.  Standard library only.
     ataboy -j read 19969 --through-error --out s.bin
     ataboy verify 0 336260        # drive-internal surface scan, lists bad LBAs
     ataboy log                    # failed commands with full ATA registers
+    ataboy whatfile disk.img --from-map disk.img.map   # which files own the bad sectors
 
 Every command accepts -j/--json for machine-readable output (or set
 ATABOY_JSON=1).  Exit status: 0 ok, 1 device reported a failure, 2 usage
@@ -26,6 +27,7 @@ Protocol reference: docs/API.md in the firmware repository.
 """
 
 import argparse
+import array
 import ctypes
 import errno
 import fcntl
@@ -1012,6 +1014,550 @@ def parse_ata_return(sense):
 
 
 # ---------------------------------------------------------------------------
+#  FAT12/16/32 reader: which file owns a sector (bad-sector triage)
+# ---------------------------------------------------------------------------
+
+SECTOR = 512                     # image LBAs are always 512 bytes
+
+PART_TYPES = {
+    0x00: "empty", 0x01: "FAT12", 0x04: "FAT16 <32M", 0x05: "extended", 0x06: "FAT16",
+    0x07: "NTFS/HPFS/exFAT", 0x0B: "FAT32", 0x0C: "FAT32 LBA", 0x0E: "FAT16 LBA", 0x0F: "extended LBA",
+    0x11: "hidden FAT12", 0x12: "Compaq diagnostics", 0x14: "hidden FAT16 <32M", 0x16: "hidden FAT16",
+    0x17: "hidden NTFS/HPFS", 0x1B: "hidden FAT32", 0x1C: "hidden FAT32 LBA", 0x1E: "hidden FAT16 LBA",
+    0x27: "recovery", 0x42: "Windows dynamic", 0x63: "Unix System V", 0x82: "Linux swap / Solaris",
+    0x83: "Linux", 0x84: "hibernation", 0x85: "Linux extended", 0x8E: "Linux LVM", 0xA0: "hibernation",
+    0xA5: "FreeBSD", 0xA6: "OpenBSD", 0xA9: "NetBSD", 0xAF: "HFS/HFS+", 0xBE: "Solaris boot",
+    0xBF: "Solaris", 0xDE: "Dell utility", 0xEE: "GPT protective", 0xEF: "EFI system", 0xFD: "Linux RAID",
+}
+FAT_PART_TYPES = {0x01, 0x04, 0x06, 0x0B, 0x0C, 0x0E, 0x11, 0x14, 0x16, 0x1B, 0x1C, 0x1E}
+EXT_PART_TYPES = {0x05, 0x0F, 0x85}
+
+
+def _read_at(f, off, n):
+    f.seek(off)
+    d = f.read(n)
+    return d + bytes(n - len(d)) if len(d) < n else d
+
+
+def parse_bpb(bs):
+    """Decode a FAT boot sector's BPB; None if it does not look like one.
+    FAT type follows Microsoft's rule: by cluster count, not by any label."""
+    if len(bs) < 512 or bs[0] not in (0xEB, 0xE9):
+        return None
+    bps, spc, rsv, nfats, rootent, tot16, media, fat16 = struct.unpack_from("<HBHBHHBH", bs, 11)
+    tot32, = struct.unpack_from("<I", bs, 32)
+    fat32sz, = struct.unpack_from("<I", bs, 36)
+    if bps not in (512, 1024, 2048, 4096) or spc == 0 or spc & (spc - 1) or rsv == 0 \
+            or not 1 <= nfats <= 4 or not (media == 0xF0 or media >= 0xF8):
+        return None
+    fatsz = fat16 or fat32sz
+    total = tot16 or tot32
+    root_secs = (rootent * 32 + bps - 1) // bps
+    data_start = rsv + nfats * fatsz + root_secs
+    if fatsz == 0 or total <= data_start:
+        return None
+    clusters = (total - data_start) // spc
+    fat_type = 12 if clusters < 4085 else 16 if clusters < 65525 else 32
+    b = {"oem": bs[3:11].decode("cp437", "replace").rstrip(), "bytes_per_sector": bps,
+         "sectors_per_cluster": spc, "reserved_sectors": rsv, "fats": nfats, "root_entries": rootent,
+         "total_sectors": total, "media": media, "fat_sectors": fatsz, "root_dir_sectors": root_secs,
+         "data_start": data_start, "clusters": clusters, "fat_type": fat_type,
+         "root_cluster": 0, "fsinfo_sector": 0, "backup_boot_sector": 0, "ext_flags": 0, "label": None}
+    if fat_type == 32:
+        if fat16 or rootent:                      # FAT32 needs BPB_FATSz16 = 0 and no fixed root
+            return None
+        b["ext_flags"], _, b["root_cluster"], b["fsinfo_sector"], b["backup_boot_sector"] = \
+            struct.unpack_from("<HHIHH", bs, 40)
+        sig, lab = bs[66], bs[71:82]
+    else:
+        sig, lab = bs[38], bs[43:54]
+    if sig == 0x29:
+        b["label"] = lab.decode("cp437", "replace").rstrip() or None
+    return b
+
+
+def _lfn_chars(e):
+    s = (e[1:11] + e[14:26] + e[28:32]).decode("utf-16-le", "replace")
+    return s.split("\x00", 1)[0].replace("￿", "")
+
+
+def _sfn_checksum(raw11):
+    s = 0
+    for ch in raw11:
+        s = (((s & 1) << 7) + (s >> 1) + ch) & 0xFF
+    return s
+
+
+def _fat_time(d, t):
+    y, mo, dd, h, mi, sec = 1980 + (d >> 9), (d >> 5) & 15, d & 31, t >> 11, (t >> 5) & 63, (t & 31) * 2
+    if not (1 <= mo <= 12 and 1 <= dd <= 31 and h < 24 and mi < 60 and sec < 60):
+        return None
+    return "%04d-%02d-%02d %02d:%02d:%02d" % (y, mo, dd, h, mi, sec)
+
+
+_SFN_BAD = set(b'"*+,./:;<=>?[\\]|')
+
+
+def _plausible_sfn(e):
+    """Reject stale garbage in directory slots (control or forbidden
+    characters in the 8.3 name, reserved attribute bits)."""
+    if e[11] & 0xC0 or e[12] & 0xE7 or e[0] == 0x20 or (e[0] < 0x20 and e[0] != 0x05):
+        return False
+    if e[0] == 0x2E:
+        return e[:11] in (b".          ", b"..         ")
+    return all(c >= 0x20 and c not in _SFN_BAD for c in e[1:11])
+
+
+class FatVolume:
+    """Read-only FAT12/16/32 volume in an image file (or any seekable file
+    object).  start_lba is the volume's first 512-byte sector in the image.
+    build_index() walks every directory once (deleted entries and long names
+    included) and records which object owns each cluster; locate(lba) then
+    answers any number of sector queries."""
+
+    def __init__(self, f, start_lba=0, name="volume"):
+        self.f, self.start_lba, self.name = f, start_lba, name
+        b = parse_bpb(_read_at(f, start_lba * SECTOR, SECTOR))
+        if not b:
+            raise ValueError("no FAT boot sector at LBA %d" % start_lba)
+        self.bpb = b
+        self.fat_type = b["fat_type"]
+        self.bps, self.spc = b["bytes_per_sector"], b["sectors_per_cluster"]
+        self.cluster_bytes = self.bps * self.spc
+        self.reserved, self.nfats, self.fat_sectors = b["reserved_sectors"], b["fats"], b["fat_sectors"]
+        self.root_start = self.reserved + self.nfats * self.fat_sectors
+        self.data_start = b["data_start"]
+        self.total_sectors = b["total_sectors"]
+        self.max_cluster = b["clusters"] + 1
+        mirrored = not (self.fat_type == 32 and b["ext_flags"] & 0x80)
+        self.active_fat = 0 if mirrored else min(b["ext_flags"] & 0x0F, self.nfats - 1)
+        self.fat_mirrored = mirrored
+        self.bad_mark = {12: 0xFF7, 16: 0xFFF7, 32: 0x0FFFFFF7}[self.fat_type]
+        self._fat = None
+        self.objects = None
+
+    # -- low level ---------------------------------------------------------
+    def end_lba(self):
+        """First image LBA after the file system."""
+        return self.start_lba + (self.total_sectors * self.bps + SECTOR - 1) // SECTOR
+
+    def _read_sectors(self, sector, count):
+        return _read_at(self.f, self.start_lba * SECTOR + sector * self.bps, count * self.bps)
+
+    @property
+    def fat(self):
+        if self._fat is None:
+            n = self.max_cluster + 1
+            raw = self._read_sectors(self.reserved + self.active_fat * self.fat_sectors, self.fat_sectors)
+            if self.fat_type == 12:
+                fat = array.array("H")
+                for c in range(n):
+                    o = c + (c >> 1)
+                    v = raw[o] | (raw[o + 1] << 8) if o + 1 < len(raw) else 0
+                    fat.append(v >> 4 if c & 1 else v & 0xFFF)
+            else:
+                code = "H" if self.fat_type == 16 else "I" if array.array("I").itemsize == 4 else "L"
+                fat = array.array(code)
+                fat.frombytes(raw[:min(n, len(raw) // fat.itemsize) * fat.itemsize])
+                if sys.byteorder == "big":
+                    fat.byteswap()
+                if self.fat_type == 32:          # the top 4 bits are reserved
+                    for c in range(len(fat)):
+                        if fat[c] & 0xF0000000:
+                            fat[c] &= 0x0FFFFFFF
+            fat.extend([0] * (n - len(fat)))
+            self._fat = fat
+        return self._fat
+
+    def chain(self, first):
+        """Cluster chain from first, stopping at EOC, free/bad/out-of-range
+        values and loops."""
+        fat, out, seen, c = self.fat, [], set(), first
+        while 2 <= c <= self.max_cluster and c not in seen:
+            seen.add(c)
+            out.append(c)
+            c = fat[c]
+        return out
+
+    def _read_chain(self, chain):
+        return b"".join(self._read_sectors(self.data_start + (c - 2) * self.spc, self.spc) for c in chain)
+
+    def _parse_dir(self, data):
+        """32-byte directory entries, deleted ones included (stops at the
+        first never-used 0x00 entry)."""
+        out, lfn = [], []
+        for off in range(0, len(data) - 31, 32):
+            e = data[off:off + 32]
+            if e[0] == 0:
+                break
+            attr = e[11]
+            if attr & 0x3F == 0x0F:
+                lfn.append(e)
+                continue
+            if not _plausible_sfn(e):
+                lfn = []
+                continue
+            deleted = e[0] == 0xE5
+            raw = bytearray(e[:11])
+            if raw[0] == 0x05:
+                raw[0] = 0xE5
+            long_name, pending, lfn = None, lfn, []
+            if pending:
+                want = _sfn_checksum(e[:11])
+                if deleted:      # first byte lost: guess it from the long name
+                    guess = _lfn_chars(pending[-1])[:1].upper().encode("cp437", "replace")[:1]
+                    if guess and _sfn_checksum(guess + e[1:11]) == pending[0][13]:
+                        raw[0] = guess[0]
+                        want = pending[0][13]
+                    elif all(p[0] == 0xE5 and p[13] == pending[0][13] for p in pending):
+                        want = pending[0][13]
+                if all(p[13] == want for p in pending):
+                    long_name = "".join(_lfn_chars(p) for p in reversed(pending)) or None
+            base, ext = bytes(raw[:8]).rstrip(b" "), bytes(raw[8:11]).rstrip(b" ")
+            base_s, ext_s = base.decode("cp437", "replace"), ext.decode("cp437", "replace")
+            if deleted and raw[0] == 0xE5:
+                base_s = "_" + base_s[1:]
+            short = base_s + ("." + ext_s if ext_s else "")
+            nt = e[12]
+            shown = (base_s.lower() if nt & 0x08 else base_s) + \
+                ("." + (ext_s.lower() if nt & 0x10 else ext_s) if ext_s else "")
+            hi = struct.unpack_from("<H", e, 20)[0] if self.fat_type == 32 else 0
+            lo, size = struct.unpack_from("<HI", e, 26)
+            t, d = struct.unpack_from("<HH", e, 22)
+            mtime = _fat_time(d, t)
+            out.append({"offset": off, "name": long_name or shown, "short_name": short, "deleted": deleted,
+                        "attr": attr, "is_dir": bool(attr & 0x10), "is_label": bool(attr & 0x08) and not attr & 0x10,
+                        "dot": raw[0] == 0x2E and short in (".", ".."), "first_cluster": (hi << 16) | lo,
+                        "size": size, "modified": mtime})
+        return out
+
+    # -- index -------------------------------------------------------------
+    def build_index(self):
+        """Walk all directories; map every allocated cluster to its owner."""
+        if self.objects is not None:
+            return self
+        n = self.max_cluster + 1
+        self._owner = array.array("i", [-1]) * n
+        self._pos = array.array("i", [0]) * n
+        self._deleted = []                      # (first cluster, n clusters, object index)
+        self.cross_links = 0
+        root = {"path": "/", "kind": "directory", "entries": []}
+        self.objects = [root]
+        if self.fat_type == 32:
+            rc = self.chain(self.bpb["root_cluster"])
+            self._claim(0, rc)
+            root["first_cluster"] = self.bpb["root_cluster"]
+            stack = [(0, rc, False)]
+            visited = {self.bpb["root_cluster"]}
+        else:
+            stack = [(0, None, False)]
+            visited = set()
+        while stack:
+            oi, chain, gone = stack.pop()
+            d = self.objects[oi]
+            if chain is None:
+                data = self._read_sectors(self.root_start, self.bpb["root_dir_sectors"])
+            else:
+                data = self._read_chain(chain)
+            for ent in self._parse_dir(data):
+                deleted = ent["deleted"] or gone
+                if ent["is_label"]:
+                    d["entries"].append({"offset": ent["offset"], "name": ent["name"], "label": True})
+                    continue
+                if ent["dot"]:
+                    continue
+                d["entries"].append({"offset": ent["offset"], "name": ent["name"], "deleted": deleted,
+                                     "dir": ent["is_dir"]})
+                obj = {"path": d["path"].rstrip("/") + "/" + ent["name"],
+                       "kind": "directory" if ent["is_dir"] else "file",
+                       "size": None if ent["is_dir"] else ent["size"],
+                       "first_cluster": ent["first_cluster"], "modified": ent["modified"]}
+                if ent["short_name"] != ent["name"]:
+                    obj["short_name"] = ent["short_name"]
+                if deleted:
+                    obj["deleted"] = True
+                    if gone and not ent["deleted"]:
+                        obj["parent_deleted"] = True
+                idx = len(self.objects)
+                self.objects.append(obj)
+                fc = ent["first_cluster"]
+                if not 2 <= fc <= self.max_cluster:
+                    continue
+                if not deleted:
+                    ch = self.chain(fc)
+                    obj["clusters"] = len(ch)
+                    self._claim(idx, ch)
+                    if ent["is_dir"] and fc not in visited:
+                        visited.add(fc)
+                        obj["entries"] = []
+                        stack.append((idx, ch, False))
+                    elif not ent["is_dir"]:
+                        need = (ent["size"] + self.cluster_bytes - 1) // self.cluster_bytes
+                        if need != len(ch):
+                            obj["chain_mismatch"] = {"expected_clusters": need, "chain_clusters": len(ch)}
+                else:
+                    # FAT keeps no chain for deleted files: assume contiguous clusters
+                    # from the first one (best effort), one cluster for a directory.
+                    cnt = 1 if ent["is_dir"] else max(1, (ent["size"] + self.cluster_bytes - 1)
+                                                      // self.cluster_bytes)
+                    if fc + cnt - 1 > self.max_cluster:
+                        obj["implausible"] = "size runs past the end of the volume"
+                        continue
+                    obj["assumed_clusters"] = cnt
+                    self._deleted.append((fc, cnt, idx))
+                    if ent["is_dir"] and fc not in visited:
+                        blk = self._read_chain([fc])
+                        if blk[:11] == b".          " and blk[11] & 0x10:
+                            visited.add(fc)
+                            obj["entries"] = []
+                            stack.append((idx, [fc], True))
+        return self
+
+    def _claim(self, idx, chain):
+        own, pos = self._owner, self._pos
+        for i, c in enumerate(chain):
+            if own[c] == -1:
+                own[c], pos[c] = idx, i
+            else:
+                self.cross_links += 1
+
+    def info(self):
+        b = self.bpb
+        out = {"fs": "FAT%d" % self.fat_type, "oem": b["oem"], "label": b["label"],
+               "bytes_per_sector": self.bps, "sectors_per_cluster": self.spc, "cluster_bytes": self.cluster_bytes,
+               "reserved_sectors": self.reserved, "fats": self.nfats, "fat_sectors": self.fat_sectors,
+               "root_entries": b["root_entries"], "total_sectors": self.total_sectors, "clusters": b["clusters"],
+               "data_start_lba": self.start_lba + self.data_start * self.bps // SECTOR}
+        if self.fat_type == 32:
+            out["root_cluster"] = b["root_cluster"]
+        if self.objects is not None:
+            live = [o for o in self.objects[1:] if not o.get("deleted")]
+            out.update(files=sum(o["kind"] == "file" for o in live),
+                       directories=sum(o["kind"] == "directory" for o in live),
+                       deleted_entries=len(self.objects) - 1 - len(live), cross_links=self.cross_links)
+        return out
+
+    # -- queries -----------------------------------------------------------
+    @staticmethod
+    def _entries_in(obj, lo, hi):
+        return [e for e in obj.get("entries", ()) if lo <= e["offset"] < hi]
+
+    def _obj_record(self, obj, cluster, byte_off, kind=None):
+        r = {"kind": kind or obj["kind"], "path": obj["path"], "cluster": cluster}
+        for k in ("short_name", "modified", "size"):
+            if obj.get(k) is not None:
+                r[k] = obj[k]
+        if obj["kind"] == "file":
+            r["offset"] = byte_off
+            r["past_eof"] = byte_off >= obj["size"]
+        else:
+            r["is_dir"] = True
+            r["entries"] = self._entries_in(obj, byte_off, byte_off + SECTOR)
+        return r
+
+    def locate(self, lba):
+        """What owns 512-byte image sector lba (which must be inside the volume)."""
+        self.build_index()
+        off = (lba - self.start_lba) * SECTOR
+        s, within = divmod(off, self.bps)
+        if s >= self.total_sectors:
+            return {"kind": "partition_slack", "detail": "past the end of the file system"}
+        b = self.bpb
+        if s == 0:
+            return {"kind": "boot_sector"}
+        if s < self.reserved:
+            if self.fat_type == 32 and s == b["fsinfo_sector"]:
+                return {"kind": "fsinfo"}
+            bk = b["backup_boot_sector"]
+            if self.fat_type == 32 and bk and bk <= s < bk + 3:
+                return {"kind": "backup_boot_sector", "detail": "backup boot record sector %d" % (s - bk)}
+            return {"kind": "reserved", "detail": "reserved sector %d" % s}
+        if s < self.root_start:
+            copy, rel = divmod(s - self.reserved, self.fat_sectors)
+            bo = rel * self.bps + within
+            per = {12: 1.5, 16: 2, 32: 4}[self.fat_type]
+            c0, c1 = int(bo / per), int((bo + SECTOR - 1) / per)
+            r = {"kind": "fat", "fat_copy": copy + 1, "fats": self.nfats,
+                 "clusters": [c0, min(c1, self.max_cluster)]}
+            if c0 > self.max_cluster:
+                r["detail"] = "unused tail of the FAT"
+            elif self.nfats > 1 and self.fat_mirrored:
+                r["detail"] = "other FAT copies hold the same entries"
+            return r
+        if s < self.data_start:
+            bo = (s - self.root_start) * self.bps + within
+            return {"kind": "root_dir", "path": "/", "is_dir": True,
+                    "entries": self._entries_in(self.objects[0], bo, bo + SECTOR)}
+        cl, rel = divmod(s - self.data_start, self.spc)
+        cl += 2
+        if cl > self.max_cluster:
+            return {"kind": "volume_slack", "detail": "data area past the last whole cluster"}
+        in_cl = rel * self.bps + within
+        oi = self._owner[cl]
+        if oi >= 0:
+            return self._obj_record(self.objects[oi], cl, self._pos[cl] * self.cluster_bytes + in_cl)
+        v = self.fat[cl]
+        state = "free" if v == 0 else "bad" if v == self.bad_mark else "lost"
+        # Deleted entries only claim clusters no live object owns.  The first
+        # cluster is certain; the rest assume the file was contiguous.
+        cands = sorted(((cl - fc, self.objects[i]) for fc, n, i in self._deleted if fc <= cl < fc + n),
+                       key=lambda x: x[0])
+        if cands:
+            k, obj = cands[0]
+            r = self._obj_record(obj, cl, k * self.cluster_bytes + in_cl, kind="deleted")
+            r["best_effort"] = True
+            r["fat_entry"] = state
+            r["detail"] = ("first cluster of the deleted entry" if k == 0 else
+                           "cluster %d of the deleted entry, assuming it was contiguous" % k) + \
+                {"free": "", "bad": "; cluster since marked bad in the FAT",
+                 "lost": "; cluster now allocated but unreachable (lost chain)"}[state]
+            if len(cands) > 1:
+                r["also"] = [o["path"] for _, o in cands[1:]]
+            return r
+        if v == 0:
+            return {"kind": "free", "cluster": cl}
+        if v == self.bad_mark:
+            return {"kind": "bad_cluster", "cluster": cl, "detail": "marked bad in the FAT"}
+        return {"kind": "lost", "cluster": cl, "detail": "allocated in the FAT but not reachable from any directory"}
+
+
+def disk_layout(f, image_sectors=None):
+    """Partitions of an MBR disk image (primary + logical in an extended
+    chain), or a single superfloppy volume when LBA 0 is a FAT boot sector.
+    Each entry says whether it holds a FAT file system."""
+    if image_sectors is None:
+        f.seek(0, 2)
+        image_sectors = f.tell() // SECTOR
+    mbr = _read_at(f, 0, SECTOR)
+    out = {"image_sectors": image_sectors, "scheme": None, "partitions": [], "ebr_lbas": []}
+    bpb = parse_bpb(mbr)
+    ents = [struct.unpack_from("<B3sB3sII", mbr, 446 + 16 * i) for i in range(4)]
+    table_ok = mbr[510:512] == b"\x55\xaa" and all(e[0] in (0, 0x80) for e in ents) \
+        and any(e[2] and e[5] for e in ents)
+    if bpb and (not table_ok or mbr[54:59] == b"FAT12" or mbr[54:59] == b"FAT16" or mbr[82:87] == b"FAT32"):
+        out["scheme"] = "superfloppy"
+        out["partitions"].append({"name": "vol", "index": 0, "type": None, "type_name": "superfloppy",
+                                  "start_lba": 0, "sectors": image_sectors, "boot": False})
+    elif mbr[510:512] == b"\x55\xaa":
+        out["scheme"] = "mbr"
+        for i, (boot, _, typ, _, start, cnt) in enumerate(ents):
+            if typ == 0 or cnt == 0:
+                continue
+            out["partitions"].append({"name": "p%d" % (i + 1), "index": i + 1, "type": typ,
+                                      "type_name": PART_TYPES.get(typ, "unknown"), "start_lba": start,
+                                      "sectors": cnt, "boot": boot == 0x80})
+            if typ in EXT_PART_TYPES:
+                out["partitions"][-1]["extended"] = True
+                n, ebr, seen = 5, start, set()
+                while ebr and ebr not in seen and ebr < image_sectors and len(seen) < 256:
+                    seen.add(ebr)
+                    out["ebr_lbas"].append(ebr)
+                    e = _read_at(f, ebr * SECTOR, SECTOR)
+                    if e[510:512] != b"\x55\xaa":
+                        break
+                    _, _, t1, _, s1, c1 = struct.unpack_from("<B3sB3sII", e, 446)
+                    _, _, t2, _, s2, _ = struct.unpack_from("<B3sB3sII", e, 462)
+                    if t1 and c1:
+                        out["partitions"].append({"name": "p%d" % n, "index": n, "type": t1,
+                                                  "type_name": PART_TYPES.get(t1, "unknown"),
+                                                  "start_lba": ebr + s1, "sectors": c1, "boot": False,
+                                                  "logical": True})
+                        n += 1
+                    ebr = start + s2 if t2 in EXT_PART_TYPES and s2 else 0
+    else:
+        out["scheme"] = "none"
+    for p in out["partitions"]:
+        p["end_lba"] = p["start_lba"] + p["sectors"] - 1
+        p["fat"] = None
+        if p.get("extended"):
+            continue
+        b = parse_bpb(_read_at(f, p["start_lba"] * SECTOR, SECTOR)) if p["start_lba"] < image_sectors else None
+        if b:
+            p["fat"] = "FAT%d" % b["fat_type"]
+            if p["type"] is not None and p["type"] not in FAT_PART_TYPES:
+                p["note"] = "type 0x%02X but holds a FAT%d file system" % (p["type"], b["fat_type"])
+        elif p["type"] in FAT_PART_TYPES:
+            p["note"] = "FAT partition type but no valid FAT boot sector"
+    return out
+
+
+def whatfile(image_path, lbas):
+    """Map image LBAs to what owns them: MBR/EBR/gaps, boot sector, FAT
+    copies, root directory, files (with offset and slack flag), directories
+    (with the entries stored in that sector), deleted entries (best effort),
+    free/lost clusters, non-FAT partitions.  Returns a plain dict."""
+    seen, todo = set(), []
+    for x in lbas:
+        if x not in seen:
+            seen.add(x)
+            todo.append(int(x))
+    with open(image_path, "rb") as f:
+        lay = disk_layout(f)
+        parts = lay["partitions"]
+        vols, results = {}, []
+        primary_start = min([p["start_lba"] for p in parts if not p.get("logical")] or [lay["image_sectors"]])
+        ebrs = set(lay["ebr_lbas"])
+        for lba in todo:
+            r = {"lba": lba}
+            hit = [p for p in parts if p["start_lba"] <= lba <= p["end_lba"]]
+            inner = [p for p in hit if not p.get("extended")]
+            if lba < 0:
+                r["kind"] = "invalid"
+            elif lba >= lay["image_sectors"]:
+                r["kind"] = "beyond_image"
+            elif inner:
+                p = inner[0]
+                r["partition"] = p["name"]
+                if p["fat"]:
+                    if p["name"] not in vols:
+                        vols[p["name"]] = FatVolume(f, p["start_lba"], p["name"]).build_index()
+                    v = vols[p["name"]]
+                    r["fs"] = p["fat"]
+                    r.update(v.locate(lba) if lba < v.end_lba() else
+                             {"kind": "partition_slack", "detail": "inside the partition, past the file system"})
+                else:
+                    r["kind"] = "non_fat_partition"
+                    r["type"] = p["type"]
+                    r["type_name"] = p["type_name"]
+            elif lba == 0 and lay["scheme"] == "mbr":
+                r["kind"] = "mbr"
+            elif lba in ebrs:
+                r["kind"] = "ebr"
+                r["detail"] = "extended boot record (logical partition table)"
+            elif hit:
+                r["kind"] = "unpartitioned"
+                r["partition"] = hit[0]["name"]
+                r["detail"] = "inside the extended partition, outside any logical drive"
+            elif lay["scheme"] == "mbr" and lba < primary_start:
+                r["kind"] = "mbr_gap"
+                r["detail"] = "between the partition table and the first partition"
+            else:
+                r["kind"] = "unpartitioned"
+            results.append(r)
+        for p in parts:
+            if p["name"] in vols:
+                p["volume"] = vols[p["name"]].info()
+    objs, counts = {}, {}
+    for r in results:
+        counts[r["kind"]] = counts.get(r["kind"], 0) + 1
+        if r["kind"] in ("file", "directory", "deleted", "root_dir"):
+            key = (r.get("partition"), r["path"], r["kind"])
+            o = objs.get(key)
+            if o is None:
+                o = objs[key] = {"partition": r.get("partition"), "path": r["path"], "kind": r["kind"], "lbas": []}
+                if r.get("size") is not None:
+                    o["size"] = r["size"]
+                if r["kind"] == "file":
+                    o["slack_only"] = True
+            o["lbas"].append(r["lba"])
+            if r["kind"] == "file" and not r["past_eof"]:
+                o["slack_only"] = False
+    return {"result": "ok", "image": image_path, "image_sectors": lay["image_sectors"],
+            "scheme": lay["scheme"], "partitions": parts, "results": results,
+            "files": list(objs.values()), "counts": counts}
+
+
+# ---------------------------------------------------------------------------
 #  CLI
 # ---------------------------------------------------------------------------
 
@@ -1341,6 +1887,94 @@ def cmd_ata(args, dev):
     return EXIT_OK if r.get("ok") else EXIT_DEVICE
 
 
+def whatfile_lbas(lbas=(), mapfile=None, json_file=None):
+    """Collect LBAs from the command line, a ddrescue mapfile (every non-'+'
+    sector that was tried) and/or a JSON file (list, or {"bad_lbas": [...]})."""
+    out = list(lbas or ())
+    if mapfile:
+        out += Mapfile.load(mapfile).bad_sectors(include_untried=False)
+    if json_file:
+        with open(json_file) as f:
+            j = json.load(f)
+        if isinstance(j, dict):
+            j = j.get("bad_lbas", j.get("lbas", []))
+        if not isinstance(j, list):
+            raise ValueError("%s: expected a list of LBAs or an object with \"bad_lbas\"" % json_file)
+        out += [x["lba"] if isinstance(x, dict) else int(x, 0) if isinstance(x, str) else int(x) for x in j]
+    return out
+
+
+def _entries_str(entries, limit=6):
+    names = [e["name"] + ("/" if e.get("dir") else "") + (" (deleted)" if e.get("deleted") else "")
+             + (" (label)" if e.get("label") else "") for e in entries]
+    if not names:
+        return "no entries in this sector"
+    more = len(names) - limit
+    return "entries: " + ", ".join(names[:limit]) + (", +%d more" % more if more > 0 else "")
+
+
+def human_whatfile_line(r):
+    k = r["kind"]
+    where = "%s %s" % (r.get("partition", "-"), r.get("fs") or "")
+    if k == "file":
+        what = "file %s  [offset %d of %d bytes%s, cluster %d]" % (
+            r["path"], r["offset"], r["size"], ", past EOF (slack)" if r["past_eof"] else "", r["cluster"])
+    elif k in ("directory", "root_dir"):
+        what = "%s %s  [%s]" % ("directory" if k == "directory" else "root directory", r["path"],
+                                _entries_str(r["entries"]))
+    elif k == "deleted":
+        what = "deleted (best effort) %s%s  [cluster %d, %s; %s]" % (
+            r["path"], "/" if r.get("is_dir") else "", r["cluster"], r["detail"],
+            _entries_str(r["entries"]) if r.get("is_dir") else
+            "offset %d of %d bytes%s" % (r["offset"], r["size"], ", past EOF (slack)" if r["past_eof"] else ""))
+    elif k == "fat":
+        what = "FAT copy %d of %d (entries for clusters %d-%d)%s" % (
+            r["fat_copy"], r["fats"], r["clusters"][0], r["clusters"][1],
+            "; " + r["detail"] if r.get("detail") else "")
+    elif k == "non_fat_partition":
+        what = "non-FAT partition (type 0x%02X %s)" % (r["type"], r["type_name"])
+    else:
+        what = k.replace("_", " ") + (" %d" % r["cluster"] if "cluster" in r else "") + \
+            ("  (%s)" % r["detail"] if r.get("detail") else "")
+    print("%10d  %-10s %s" % (r["lba"], where.strip(), what))
+
+
+def human_whatfile(o):
+    for p in o["partitions"]:
+        v = p.get("volume")
+        print("%-4s LBA %d-%d  type %s  %s%s%s" % (
+            p["name"], p["start_lba"], p["end_lba"],
+            "0x%02X" % p["type"] if p["type"] is not None else "-", p["type_name"],
+            "  [%s %s, %d files, %d dirs, %d deleted entries]" % (
+                v["fs"], v["label"] or "no label", v["files"], v["directories"], v["deleted_entries"]) if v
+            else ("  [%s]" % p["fat"] if p["fat"] else ""),
+            "  (%s)" % p["note"] if p.get("note") else ""))
+    print()
+    for r in o["results"]:
+        human_whatfile_line(r)
+    if o["files"]:
+        print("\naffected objects:")
+        for x in o["files"]:
+            lb = x["lbas"]
+            print("  %-9s %s %s  %d sector%s: %s%s" % (
+                x["kind"], x["partition"], x["path"], len(lb), "" if len(lb) == 1 else "s",
+                " ".join(str(v) for v in lb[:8]), " ..." if len(lb) > 8 else "")
+                  + ("  (slack only, data intact)" if x.get("slack_only") else ""))
+
+
+def cmd_whatfile(args, dev_unused):
+    try:
+        lbas = whatfile_lbas(args.lbas, args.from_map, args.from_json)
+        if not lbas:
+            raise ValueError("no LBAs given (LBA arguments, --from-map or --from-json)")
+        out = whatfile(args.image, lbas)
+    except (OSError, ValueError) as e:
+        _emit(args, {"result": "error", "message": str(e)}, lambda o: print("error: %s" % e, file=sys.stderr))
+        return EXIT_USAGE
+    _emit(args, out, human_whatfile)
+    return EXIT_OK
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="ataboy", description=__doc__.split("\n\n")[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1472,10 +2106,16 @@ def build_parser():
     x.add_argument("--no-ck", action="store_true", help="don't request result registers")
     x.add_argument("--dangerous", action="store_true", help="arm first (needed for DANGEROUS commands)")
     x.add_argument("--timeout", type=int, default=60000)
+    x = add("whatfile", cmd_whatfile, "map image LBAs to the FAT12/16/32 files, directories, FATs or free "
+                                      "space that own them (works on an image file; no device, no root)")
+    x.add_argument("image", help="disk image (MBR-partitioned or a bare FAT volume)")
+    x.add_argument("lbas", type=_int, nargs="*", metavar="LBA", help="512-byte sector numbers (0x.. ok)")
+    x.add_argument("--from-map", metavar="MAPFILE", help="all tried-and-failed sectors of a ddrescue mapfile")
+    x.add_argument("--from-json", metavar="FILE", help="JSON list of LBAs, or an object with \"bad_lbas\"")
     return p
 
 
-NO_DEVICE_CMDS = {"list", "wait"}
+NO_DEVICE_CMDS = {"list", "wait", "whatfile"}
 
 
 def _maybe_sudo(args, argv):
