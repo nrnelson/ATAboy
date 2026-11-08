@@ -1,0 +1,1143 @@
+#!/usr/bin/env python3
+"""ataboy - command-line client and Python library for the ATAboy automation API.
+
+Talks to the ATAboy firmware over the USB mass-storage (SCSI) interface using
+the Linux SG_IO ioctl: vendor command 0xC0 for the ATAboy API and SAT ATA
+PASS-THROUGH (16) for raw ATA commands.  Standard library only.
+
+    ataboy status                 # what is attached, geometry, mount state, errors
+    ataboy detect --mount         # probe, IDENTIFY, pick geometry, mount
+    ataboy -j read 19969 --through-error --out s.bin
+    ataboy verify 0 336260        # drive-internal surface scan, lists bad LBAs
+    ataboy log                    # failed commands with full ATA registers
+
+Every command accepts -j/--json for machine-readable output (or set
+ATABOY_JSON=1).  Exit status: 0 ok, 1 device reported a failure, 2 usage
+error, 3 transport/device-not-found error, 4 permission error.
+
+As a library:
+
+    from ataboy import ATAboy           # (copy or symlink this file to ataboy.py)
+    with ATAboy() as dev:
+        print(dev.status()["geometry"])
+        r = dev.read(19969, 1, through_error=True)
+
+Protocol reference: docs/API.md in the firmware repository.
+"""
+
+import argparse
+import ctypes
+import errno
+import fcntl
+import glob
+import json
+import os
+import struct
+import subprocess
+import sys
+import time
+
+__version__ = "1.0.0"
+API_PROTO = 1
+
+# ---------------------------------------------------------------------------
+#  SG_IO transport
+# ---------------------------------------------------------------------------
+
+SG_IO = 0x2285
+SG_DXFER_NONE = -1
+SG_DXFER_TO_DEV = -2
+SG_DXFER_FROM_DEV = -3
+
+
+class _SgIoHdr(ctypes.Structure):
+    _fields_ = [
+        ("interface_id", ctypes.c_int),
+        ("dxfer_direction", ctypes.c_int),
+        ("cmd_len", ctypes.c_ubyte),
+        ("mx_sb_len", ctypes.c_ubyte),
+        ("iovec_count", ctypes.c_ushort),
+        ("dxfer_len", ctypes.c_uint),
+        ("dxferp", ctypes.c_void_p),
+        ("cmdp", ctypes.c_void_p),
+        ("sbp", ctypes.c_void_p),
+        ("timeout", ctypes.c_uint),
+        ("flags", ctypes.c_uint),
+        ("pack_id", ctypes.c_int),
+        ("usr_ptr", ctypes.c_void_p),
+        ("status", ctypes.c_ubyte),
+        ("masked_status", ctypes.c_ubyte),
+        ("msg_status", ctypes.c_ubyte),
+        ("sb_len_wr", ctypes.c_ubyte),
+        ("host_status", ctypes.c_ushort),
+        ("driver_status", ctypes.c_ushort),
+        ("resid", ctypes.c_int),
+        ("duration", ctypes.c_uint),
+        ("info", ctypes.c_uint),
+    ]
+
+
+class TransportError(Exception):
+    """The SCSI command could not be delivered or the device is missing."""
+
+
+class ScsiCheckCondition(Exception):
+    """The device answered CHECK CONDITION; .sense holds the sense bytes."""
+
+    def __init__(self, sense, status=2):
+        self.sense = bytes(sense)
+        self.status = status
+        self.key, self.asc, self.ascq = parse_sense_key(self.sense)
+        super().__init__("CHECK CONDITION sense %s (key %02x asc %02x ascq %02x)"
+                         % (self.sense.hex(), self.key, self.asc, self.ascq))
+
+
+class ApiError(Exception):
+    """The ATAboy API reported a non-ok result; .reply is the full Reply."""
+
+    def __init__(self, reply):
+        self.reply = reply
+        msg = reply.result_name
+        if isinstance(reply.json, dict) and reply.json.get("message"):
+            msg += ": " + reply.json["message"]
+        super().__init__(msg)
+
+
+def parse_sense_key(sense):
+    if len(sense) < 3:
+        return 0, 0, 0
+    code = sense[0] & 0x7F
+    if code in (0x72, 0x73):
+        return sense[1] & 0x0F, sense[2] if len(sense) > 2 else 0, sense[3] if len(sense) > 3 else 0
+    return (sense[2] & 0x0F, sense[12] if len(sense) > 12 else 0,
+            sense[13] if len(sense) > 13 else 0)
+
+
+def sgio(fd, cdb, direction, data=None, length=0, timeout_ms=60000):
+    """Issue one SCSI command.  Returns (data_in_bytes, resid).
+    Raises ScsiCheckCondition / TransportError."""
+    cdb = bytes(cdb)
+    cdb_buf = ctypes.create_string_buffer(cdb, len(cdb))
+    sense_buf = ctypes.create_string_buffer(96)
+    if direction == SG_DXFER_TO_DEV:
+        data = bytes(data)
+        length = len(data)
+        dbuf = ctypes.create_string_buffer(data, length)
+    elif direction == SG_DXFER_FROM_DEV:
+        dbuf = ctypes.create_string_buffer(length)
+    else:
+        dbuf = None
+        length = 0
+    h = _SgIoHdr()
+    h.interface_id = ord("S")
+    h.dxfer_direction = direction
+    h.cmd_len = len(cdb)
+    h.mx_sb_len = len(sense_buf)
+    h.dxfer_len = length
+    h.dxferp = ctypes.cast(dbuf, ctypes.c_void_p) if dbuf is not None else None
+    h.cmdp = ctypes.cast(cdb_buf, ctypes.c_void_p)
+    h.sbp = ctypes.cast(sense_buf, ctypes.c_void_p)
+    h.timeout = int(timeout_ms)
+    try:
+        fcntl.ioctl(fd, SG_IO, h)
+    except OSError as e:
+        if e.errno in (errno.EPERM, errno.EACCES):
+            raise PermissionError("SG_IO needs root (CAP_SYS_RAWIO) for vendor/pass-through commands") from e
+        raise TransportError("SG_IO ioctl failed: %s" % e) from e
+    sense = sense_buf.raw[:h.sb_len_wr]
+    if h.host_status or (h.driver_status & 0x0F and not sense):
+        raise TransportError("transport error host_status=0x%x driver_status=0x%x"
+                             % (h.host_status, h.driver_status))
+    if h.status == 0x02 or (h.masked_status == 0x01) or sense:
+        if h.status != 0 or sense:
+            raise ScsiCheckCondition(sense, h.status)
+    if h.status not in (0,):
+        raise TransportError("SCSI status 0x%02x" % h.status)
+    got = b""
+    if direction == SG_DXFER_FROM_DEV:
+        n = max(0, length - h.resid)
+        got = dbuf.raw[:n]
+    return got, h.resid
+
+
+# ---------------------------------------------------------------------------
+#  Device discovery
+# ---------------------------------------------------------------------------
+
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def find_devices():
+    """All attached ATAboys: list of dicts with block/sg device paths."""
+    out = []
+    for blk in sorted(glob.glob("/sys/block/sd*")):
+        if _read(blk + "/device/vendor") != "ATAboy":
+            continue
+        name = os.path.basename(blk)
+        sg = glob.glob(blk + "/device/scsi_generic/sg*")
+        out.append({
+            "block": "/dev/" + name,
+            "sg": "/dev/" + os.path.basename(sg[0]) if sg else None,
+            "rev": _read(blk + "/device/rev"),
+            "size_sectors": int(_read(blk + "/size") or 0),
+            "scsi_timeout_s": int(_read(blk + "/device/timeout") or 0),
+            "sysfs": os.path.realpath(blk + "/device"),
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
+#  Decoders
+# ---------------------------------------------------------------------------
+
+ST_BITS = [(0x80, "BSY"), (0x40, "DRDY"), (0x20, "DF"), (0x10, "DSC"),
+           (0x08, "DRQ"), (0x04, "CORR"), (0x02, "IDX"), (0x01, "ERR")]
+ER_BITS = [(0x80, "BBK"), (0x40, "UNC"), (0x20, "MC"), (0x10, "IDNF"),
+           (0x08, "MCR"), (0x04, "ABRT"), (0x02, "TK0NF"), (0x01, "AMNF")]
+
+
+def bits(v, table):
+    return "|".join(n for m, n in table if v & m)
+
+
+RESULTS = ["ok", "bad_subop", "bad_arg", "no_drive", "not_mounted", "write_protected",
+           "not_armed", "ata_error", "timeout", "not_ready", "bus_fault", "no_geometry",
+           "mounted", "identify_failed", "unsupported", "protocol", "alloc_too_small"]
+IDE_RESULTS = {0: "ok", -1: "ata_error", -2: "timeout", -3: "not_ready", -4: "bus_fault", -5: "protocol"}
+
+CT_NONE, CT_JSON, CT_BINARY = 0, 1, 2
+
+OPS = {
+    "info": 0x00, "status": 0x01, "config_get": 0x02, "config_set": 0x03,
+    "config_save": 0x04, "config_defaults": 0x05, "detect": 0x10, "geometry": 0x11,
+    "mount": 0x12, "unmount": 0x13, "reset": 0x14, "identify": 0x20, "taskfile": 0x21,
+    "read": 0x22, "read_long": 0x23, "verify": 0x24, "log": 0x30, "log_clear": 0x31,
+    "arm": 0x40, "reboot": 0x41,
+}
+
+CONFIG_KEYS = {
+    "write_protect": (1, "bool"), "auto_mount": (2, "bool"), "iordy": (3, "bool"),
+    "intrq": (4, "bool"), "read_timeout_ms": (5, "int"), "write_timeout_ms": (6, "int"),
+    "ecc_len": (7, "int"), "no_retry": (8, "bool"), "device": (9, "device"),
+}
+
+GEOMETRY_MODES = {"auto": 0, "normal": 1, "large": 2, "lba": 3, "manual": 4, "keep": 5}
+
+
+class Reply:
+    """Decoded API reply (16-byte header + JSON or binary payload)."""
+    HDR = struct.Struct(">2sBBBBHIB3x")
+
+    def __init__(self, raw):
+        if len(raw) < 16:
+            raise TransportError("short reply (%d bytes)" % len(raw))
+        magic, proto, op, result, ctype, plen, uptime, flags = self.HDR.unpack_from(raw)
+        if magic != b"AB":
+            raise TransportError("bad reply magic %r - is the API firmware loaded?" % magic)
+        self.proto, self.op, self.result, self.ctype = proto, op, result, ctype
+        self.uptime_ms, self.flags = uptime, flags
+        self.payload = raw[16:16 + plen]
+        if len(self.payload) < plen:
+            raise TransportError("truncated reply: %d of %d payload bytes" % (len(self.payload), plen))
+        self.json = None
+        if ctype == CT_JSON:
+            try:
+                self.json = json.loads(self.payload.decode("utf-8"))
+            except ValueError as e:
+                raise TransportError("device sent malformed JSON: %s" % e)
+
+    @property
+    def ok(self):
+        return self.result == 0
+
+    @property
+    def result_name(self):
+        return RESULTS[self.result] if self.result < len(RESULTS) else "result_%d" % self.result
+
+    @property
+    def flag_dict(self):
+        f = self.flags
+        return {"mounted": bool(f & 1), "write_protect": bool(f & 2), "identified": bool(f & 4),
+                "armed": bool(f & 8), "geometry_valid": bool(f & 16)}
+
+
+class AtaResult:
+    """Binary ATA result block (32 bytes) + data from read/read_long/verify."""
+    FMT = struct.Struct(">IHHBBBBII5sBbxI")
+
+    def __init__(self, payload, op_result):
+        (self.lba, self.count, self.done, self.status, self.error, self.command, fl,
+         self.elapsed_us, fail_lba, tf, self.ecc_len, ide_res, done32) = self.FMT.unpack_from(payload)
+        self.timed_out = bool(fl & 0x01)
+        self.err_data = bool(fl & 0x02)
+        self.tf_valid = bool(fl & 0x04)
+        self.recovered = bool(fl & 0x08)
+        self.bus_fault = bool(fl & 0x10)
+        self.not_ready = bool(fl & 0x20)
+        self.partial = bool(fl & 0x40)
+        self.fail_lba = None if fail_lba == 0xFFFFFFFF else fail_lba
+        self.tf = list(tf)
+        self.ide_result = IDE_RESULTS.get(ide_res, str(ide_res))
+        self.result = RESULTS[op_result] if op_result < len(RESULTS) else str(op_result)
+        self.data = payload[32:]
+        if self.command in (0x40, 0x41, 0x42):          # VERIFY carries a 32-bit count
+            self.done = done32
+
+    @property
+    def ok(self):
+        return self.result == "ok"
+
+    def to_dict(self, with_data=False):
+        d = {
+            "result": self.result, "ide_result": self.ide_result, "lba": self.lba,
+            "count": self.count, "done": self.done, "command": self.command,
+            "status": self.status, "status_bits": bits(self.status, ST_BITS),
+            "error": self.error, "error_bits": bits(self.error, ER_BITS),
+            "timed_out": self.timed_out, "err_data": self.err_data, "tf_valid": self.tf_valid,
+            "recovered": self.recovered, "bus_fault": self.bus_fault, "not_ready": self.not_ready,
+            "partial": self.partial, "fail_lba": self.fail_lba, "elapsed_ms": round(self.elapsed_us / 1000, 3),
+            "tf": self.tf if self.tf_valid else None, "data_bytes": len(self.data),
+        }
+        if self.ecc_len:
+            d["ecc_len"] = self.ecc_len
+        if with_data:
+            d["data_hex"] = self.data.hex()
+        return d
+
+
+def ata_string(words, lo, hi):
+    raw = b"".join(struct.pack(">H", w) for w in words[lo:hi])
+    return raw.decode("ascii", "replace").strip().strip("\x00")
+
+
+def decode_identify(raw):
+    """Decode the useful parts of IDENTIFY DEVICE data."""
+    w = struct.unpack("<256H", raw[:512])
+    lba28 = w[60] | (w[61] << 16)
+    lba48 = w[100] | (w[101] << 16) | (w[102] << 32) | (w[103] << 48)
+    sup = lambda word, bit: w[word] != 0xFFFF and bool(w[word] & (1 << bit))
+    major = w[80] if w[80] not in (0, 0xFFFF) else 0
+    ata_versions = [n for n in range(1, 15) if major & (1 << n)]
+    pio = ["PIO0-2"]
+    if w[53] & 2:
+        pio += ["PIO%d" % (3 + i) for i in range(2) if w[64] & (1 << i)]
+    udma = [i for i in range(8) if (w[53] & 4) and w[88] & (1 << i)]
+    integ = None
+    if (w[255] & 0xFF) == 0xA5:
+        integ = (sum(raw[:512]) & 0xFF) == 0
+    d = {
+        "model": ata_string(w, 27, 47),
+        "serial": ata_string(w, 10, 20),
+        "firmware": ata_string(w, 23, 27),
+        "default_chs": [w[1], w[3], w[6]],
+        "default_chs_sectors": w[1] * w[3] * w[6],
+        "current_chs": [w[54], w[55], w[56]] if w[53] & 1 else None,
+        "lba": bool(w[49] & 0x200),
+        "lba28_sectors": lba28,
+        "lba48": sup(83, 10),
+        "lba48_sectors": lba48,
+        "capacity_bytes": (lba48 if sup(83, 10) and lba48 else (lba28 if w[49] & 0x200 else w[1] * w[3] * w[6])) * 512,
+        "ecc_bytes": w[22],
+        "buffer_kib": w[21] // 2,
+        "max_multiple": w[47] & 0xFF,
+        "iordy": bool(w[49] & 0x800),
+        "dma": bool(w[49] & 0x100),
+        "pio_modes": pio,
+        "udma_modes": udma,
+        "ata_versions": ata_versions,
+        "smart": sup(82, 0), "smart_enabled": sup(85, 0),
+        "security": sup(82, 1), "security_status": w[128],
+        "write_cache": sup(82, 5), "write_cache_enabled": sup(85, 5),
+        "hpa": sup(82, 10),
+        "integrity_ok": integ,
+    }
+    return d
+
+
+# ---------------------------------------------------------------------------
+#  The device
+# ---------------------------------------------------------------------------
+
+class ATAboy:
+    """One ATAboy.  path = /dev/sgN or /dev/sdX (default: first one found)."""
+
+    def __init__(self, path=None):
+        self.info_dev = None
+        if path is None:
+            devs = find_devices()
+            if not devs:
+                raise TransportError("no ATAboy found (no /sys/block/sd* with vendor 'ATAboy')")
+            self.info_dev = devs[0]
+            path = devs[0]["sg"] or devs[0]["block"]
+        else:
+            for d in find_devices():
+                if path in (d["sg"], d["block"]):
+                    self.info_dev = d
+        self.path = path
+        flags = os.O_RDWR if "/sg" in path else os.O_RDONLY | os.O_NONBLOCK
+        try:
+            self.fd = os.open(path, flags)
+        except PermissionError:
+            raise
+        except OSError as e:
+            raise TransportError("cannot open %s: %s" % (path, e))
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+    # -- raw API call --------------------------------------------------------
+
+    def call(self, op, args=b"", alloc=4096, timeout_ms=60000, check=False):
+        if isinstance(op, str):
+            op = OPS[op]
+        args = bytes(args)[:12]
+        cdb = bytes([0xC0, op, ord("A"), ord("B")]) + args + bytes(12 - len(args))
+        data, _ = sgio(self.fd, cdb, SG_DXFER_FROM_DEV, length=alloc, timeout_ms=timeout_ms)
+        r = Reply(data)
+        if r.proto != API_PROTO:
+            raise TransportError("device speaks API protocol %d, this client %d" % (r.proto, API_PROTO))
+        if check and not r.ok:
+            raise ApiError(r)
+        return r
+
+    def _json(self, op, args=b"", timeout_ms=60000, check=True):
+        r = self.call(op, args, timeout_ms=timeout_ms, check=check)
+        return r.json
+
+    # -- state / config --------------------------------------------------------
+
+    def info(self):
+        return self._json("info")
+
+    def status(self):
+        return self._json("status")
+
+    def config(self):
+        return self._json("config_get")["config"]
+
+    def set_config(self, key, value):
+        num, kind = CONFIG_KEYS[key]
+        if kind == "bool":
+            v = 1 if value in (True, 1, "1", "on", "true", "yes", "enabled") else 0
+        elif kind == "device":
+            v = {"master": 0, "slave": 1, "0": 0, "1": 1, 0: 0, 1: 1}[value]
+        else:
+            v = int(value)
+        j = self._json("config_set", struct.pack(">B3xI", num, v))
+        if key == "read_timeout_ms":
+            self.ensure_kernel_timeout(v)
+        return j["config"]
+
+    def save(self):
+        return self._json("config_save")
+
+    def defaults(self):
+        return self._json("config_defaults")
+
+    def ensure_kernel_timeout(self, fw_timeout_ms):
+        """Make the kernel's SCSI timeout for /dev/sdX longer than the firmware
+        per-sector timeout so the host doesn't abort a read the drive is still retrying."""
+        if not self.info_dev:
+            return None
+        path = self.info_dev["sysfs"] + "/timeout"
+        need = fw_timeout_ms // 1000 + 30
+        try:
+            cur = int(_read(path) or 0)
+            if cur < need:
+                with open(path, "w") as f:
+                    f.write(str(need))
+                return need
+            return cur
+        except OSError:
+            return None
+
+    # -- drive setup -----------------------------------------------------------
+
+    def detect(self, device="auto", geometry="auto", chs=None, probe=True, force=False, mount=False):
+        dev = {"auto": 0, "master": 1, "slave": 2}[device]
+        geo = GEOMETRY_MODES[geometry]
+        c, h, s = chs or (0, 0, 0)
+        flags = (0 if probe else 1) | (2 if mount else 0) | (4 if force else 0)
+        r = self.call("detect", struct.pack(">BBHBBB", dev, geo, c, h, s, flags), timeout_ms=120000)
+        if r.ok and mount:
+            self.rescan()
+        return r
+
+    def geometry(self, mode, chs=None):
+        c, h, s = chs or (0, 0, 0)
+        return self.call("geometry", struct.pack(">BBHBB", 0, GEOMETRY_MODES[mode], c, h, s))
+
+    def mount(self, rescan=True):
+        r = self.call("mount")
+        if r.ok and rescan:
+            self.rescan()
+        return r
+
+    def unmount(self, rescan=True):
+        r = self.call("unmount")
+        if r.ok and rescan:
+            self.rescan()
+        return r
+
+    def rescan(self, wait_s=5.0):
+        """Ask the kernel to re-read capacity; returns the new size in sectors."""
+        if not self.info_dev:
+            return None
+        try:
+            with open(self.info_dev["sysfs"] + "/rescan", "w") as f:
+                f.write("1")
+        except OSError:
+            return None
+        blk = "/sys/block/" + os.path.basename(self.info_dev["block"]) + "/size"
+        t0 = time.time()
+        size = int(_read(blk) or 0)
+        st = self.status()
+        want = st["geometry"]["sectors"] if st["mounted"] else 0
+        while size != want and time.time() - t0 < wait_s:
+            time.sleep(0.25)
+            try:
+                with open(self.info_dev["sysfs"] + "/rescan", "w") as f:
+                    f.write("1")
+            except OSError:
+                pass
+            size = int(_read(blk) or 0)
+        return size
+
+    def reset(self, hard=False):
+        return self.call("reset", bytes([1 if hard else 0]), timeout_ms=60000)
+
+    # -- data / diagnostics ------------------------------------------------------
+
+    def identify(self, cached=False):
+        r = self.call("identify", bytes([1 if cached else 0]), check=True)
+        return r.payload[:512]
+
+    def taskfile(self):
+        return self._json("taskfile")
+
+    def read(self, lba, count=1, no_retry=False, through_error=False, timeout_ms=0):
+        """Read 1..max_read_sectors sectors with full ATA diagnostics."""
+        flags = (1 if no_retry else 0) | (2 if through_error else 0)
+        # The firmware enforces the real per-sector timeout; the host timeout only
+        # has to be longer.  Without an explicit value assume the 600 s maximum.
+        sg_t = (timeout_ms or 600000) * count + 15000
+        r = self.call("read", struct.pack(">IHBxI", lba, count, flags, timeout_ms), timeout_ms=sg_t)
+        if r.ctype != CT_BINARY:
+            raise ApiError(r)
+        return AtaResult(r.payload, r.result)
+
+    def read_long(self, lba, ecc_len=0, no_retry=False, timeout_ms=0):
+        flags = 1 if no_retry else 0
+        sg_t = (timeout_ms or 600000) + 15000
+        r = self.call("read_long", struct.pack(">IBxBxI", lba, ecc_len, flags, timeout_ms), timeout_ms=sg_t)
+        if r.ctype != CT_BINARY:
+            raise ApiError(r)
+        return AtaResult(r.payload, r.result)
+
+    def verify(self, lba, count, timeout_ms=0):
+        """One VERIFY request (firmware stops after ~10 s; check .partial)."""
+        sg_t = 10000 + (timeout_ms or 600000) + 30000
+        r = self.call("verify", struct.pack(">III", lba, count, timeout_ms), timeout_ms=sg_t)
+        if r.ctype != CT_BINARY:
+            raise ApiError(r)
+        return AtaResult(r.payload, r.result)
+
+    def log(self):
+        """All retained error-log entries (pages through the device log)."""
+        entries, start, total = [], 0, 0
+        while True:
+            j = self._json("log", struct.pack(">I", start))
+            total = j["total"]
+            entries += j["entries"]
+            if j["next"] is None or j["returned"] == 0:
+                break
+            start = j["next"]
+        return {"total": total, "retained": len(entries), "entries": entries}
+
+    def clear(self, log=True, stats=False):
+        return self._json("log_clear", bytes([(1 if log else 0) | (2 if stats else 0)]))
+
+    def arm(self):
+        return self._json("arm", b"ARM!")
+
+    def reboot(self, bootsel=False):
+        return self._json("reboot", bytes([1 if bootsel else 0, 0, 0, 0]) + b"BOOT")
+
+    # -- raw ATA pass-through (SAT ATA PASS-THROUGH 16) ----------------------------
+
+    def ata(self, command, feature=0, count=0, lba=0, device=0, ext=False,
+            data_in=0, data_out=None, ck_cond=True, timeout_ms=60000):
+        """Issue a raw ATA command.  data_in = bytes to read (multiple of 512),
+        data_out = bytes to write.  Returns dict with registers (+ 'data')."""
+        if data_out is not None:
+            proto, t_dir, n = 5, 0, len(data_out)
+        elif data_in:
+            proto, t_dir, n = 4, 1, data_in
+        else:
+            proto, t_dir, n = 3, 0, 0
+        b1 = (proto << 1) | (1 if ext else 0)
+        b2 = (0x20 if ck_cond else 0) | (t_dir << 3) | ((0x04 | 0x02) if n else 0)
+        cdb = bytes([0x85, b1, b2,
+                     (feature >> 8) & 0xFF, feature & 0xFF,
+                     (count >> 8) & 0xFF, count & 0xFF,
+                     (lba >> 24) & 0xFF, lba & 0xFF,
+                     (lba >> 32) & 0xFF, (lba >> 8) & 0xFF,
+                     (lba >> 40) & 0xFF, (lba >> 16) & 0xFF,
+                     device & 0xFF, command & 0xFF, 0])
+        out = {"command": command, "ok": True}
+        data = b""
+        try:
+            if data_out is not None:
+                sgio(self.fd, cdb, SG_DXFER_TO_DEV, data=data_out, timeout_ms=timeout_ms)
+            elif data_in:
+                data, _ = sgio(self.fd, cdb, SG_DXFER_FROM_DEV, length=data_in, timeout_ms=timeout_ms)
+            else:
+                sgio(self.fd, cdb, SG_DXFER_NONE, timeout_ms=timeout_ms)
+        except ScsiCheckCondition as e:
+            regs = parse_ata_return(e.sense)
+            out["sense"] = e.sense.hex()
+            out["sense_key"] = e.key
+            if regs is None:
+                out["ok"] = False
+                out["blocked"] = {(7, 0x27, 0): "write_protected", (7, 0x20, 2): "not_armed",
+                                  (5, 0x24, 0): "invalid_field"}.get((e.key, e.asc, e.ascq), "rejected")
+                return out
+            out.update(regs)
+            out["ok"] = e.key == 1           # RECOVERED ERROR = ck_cond report on success
+        out["data"] = data
+        return out
+
+
+def parse_ata_return(sense):
+    """Registers from a SAT ATA Status Return descriptor (descriptor sense)."""
+    if len(sense) < 8 or (sense[0] & 0x7F) not in (0x72, 0x73):
+        return None
+    i, end = 8, 8 + sense[7]
+    while i + 1 < min(end, len(sense)):
+        code, ln = sense[i], sense[i + 1]
+        if code == 0x09 and i + 14 <= len(sense):
+            d = sense[i:i + 14]
+            ext = d[2] & 1
+            return {
+                "status": d[13], "status_bits": bits(d[13], ST_BITS),
+                "error": d[3], "error_bits": bits(d[3], ER_BITS),
+                "count": d[5] | (d[4] << 8 if ext else 0),
+                "lba": d[7] | (d[9] << 8) | (d[11] << 16) |
+                       ((d[6] << 24) | (d[8] << 32) | (d[10] << 40) if ext else 0),
+                "device": d[12],
+            }
+        i += 2 + ln
+    return None
+
+
+# ---------------------------------------------------------------------------
+#  CLI
+# ---------------------------------------------------------------------------
+
+EXIT_OK, EXIT_DEVICE, EXIT_USAGE, EXIT_TRANSPORT, EXIT_PERM = 0, 1, 2, 3, 4
+
+
+def _emit(args, obj, human=None):
+    if args.json:
+        print(json.dumps(obj, indent=None if args.compact else 2, default=lambda b: b.hex()))
+    elif human is not None:
+        human(obj)
+    else:
+        print(json.dumps(obj, indent=2, default=lambda b: b.hex()))
+
+
+def _hexdump(data, base=0):
+    for off in range(0, len(data), 16):
+        chunk = data[off:off + 16]
+        hx = " ".join("%02x" % b for b in chunk)
+        asc = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        print("%08x  %-47s  %s" % (base + off, hx, asc))
+
+
+def _chs(s):
+    try:
+        c, h, sp = (int(x) for x in s.replace(",", "/").split("/"))
+        return c, h, sp
+    except ValueError:
+        raise argparse.ArgumentTypeError("CHS must look like 989/10/34")
+
+
+def _int(s):
+    return int(s, 0)
+
+
+def human_status(j):
+    d, g = j["drive"], j["geometry"]
+    print("firmware   %s  (uptime %.1f s)" % (j["fw"], j["uptime_ms"] / 1000))
+    if d["identified"] or d["forced"]:
+        print("drive      %s  serial %s  fw %s  [%s]" % (d["model"], d["serial"] or "-", d["firmware"] or "-", d["device"]))
+    else:
+        print("drive      %s" % ("present, not identified" if d["present"] else "not detected"))
+    if g["valid"]:
+        print("geometry   %s %s  %d/%d/%d  %d sectors (%.1f MB)" % (
+            g["mode"], g["addressing"], g["cyls"], g["heads"], g["spt"], g["sectors"], g["sectors"] * 512 / 1e6))
+    else:
+        print("geometry   not set")
+    c = j["config"]
+    print("state      %s, write protect %s, read timeout %d ms%s%s" % (
+        "MOUNTED" if j["mounted"] else "not mounted", "ON" if j["write_protect"] else "OFF",
+        c["read_timeout_ms"], ", no-retry reads" if c["no_retry"] else "", ", ARMED" if j["armed"] else ""))
+    print("bus        status %02X %s" % (j["bus"]["status"], j["bus"]["status_bits"]))
+    s = j["stats"]
+    print("stats      reads %d (%d sectors, %d errors)  writes %d (%d errors)  timeouts %d  recoveries %d" % (
+        s["read_cmds"], s["read_sectors"], s["read_errors"], s["write_cmds"], s["write_errors"],
+        s["timeouts"], s["recoveries"]))
+    e = j["errors"]
+    print("errors     %d logged" % e["total"])
+    if e["last"]:
+        human_log_entry(e["last"], prefix="  last     ")
+
+
+def human_log_entry(x, prefix=""):
+    print("%s#%-4d t=%9.3fs %-10s cmd %02X LBA %-9d fail %-9d st %02X[%s] err %02X[%s] %s %d/%d ms%s" % (
+        prefix, x["seq"], x["t_ms"] / 1000, x["op"], x["cmd"], x["lba"], x["fail_lba"],
+        x["status"], x["status_bits"], x["error"], x["error_bits"], x["result"],
+        x["elapsed_ms"], x["timeout_ms"], "" if x["tf_valid"] else " (regs invalid: BSY)"))
+
+
+def human_ata_result(r):
+    d = r if isinstance(r, dict) else r.to_dict()
+    print("%s  LBA %d  %d/%d sectors  st %02X[%s] err %02X[%s]  %.1f ms%s%s%s" % (
+        d["result"].upper(), d["lba"], d["done"], d["count"], d["status"], d["status_bits"],
+        d["error"], d["error_bits"], d["elapsed_ms"],
+        "  fail_lba %d" % d["fail_lba"] if d["fail_lba"] is not None else "",
+        "  (data returned despite error)" if d["err_data"] else "",
+        "  TIMEOUT" if d["timed_out"] else ""))
+
+
+def cmd_list(args, dev):
+    _emit(args, find_devices(), lambda l: [print("%s  %s  rev %s  %d sectors" % (
+        d["block"], d["sg"], d["rev"], d["size_sectors"])) for d in l] or (not l and print("no ATAboy found")))
+    return EXIT_OK
+
+
+def cmd_info(args, dev):
+    _emit(args, dev.info(), lambda j: print("%s (%s, proto %d) built %s  board %s %s" % (
+        j["fw"], j["git"], j["proto"], j["built"], j["board"], j["board_id"])))
+    return EXIT_OK
+
+
+def cmd_status(args, dev):
+    j = dev.status()
+    if dev.info_dev:
+        j["host"] = {k: dev.info_dev[k] for k in ("block", "sg", "scsi_timeout_s")}
+    _emit(args, j, human_status)
+    return EXIT_OK
+
+
+def cmd_config(args, dev):
+    cfg = None
+    for kv in args.settings:
+        if "=" not in kv:
+            raise SystemExit("settings look like key=value; keys: " + ", ".join(CONFIG_KEYS))
+        k, v = kv.split("=", 1)
+        k = k.replace("-", "_")
+        if k == "read_timeout":
+            k = "read_timeout_ms"
+        if k not in CONFIG_KEYS:
+            raise SystemExit("unknown key %s; keys: %s" % (k, ", ".join(CONFIG_KEYS)))
+        cfg = dev.set_config(k, v)
+    if args.save:
+        dev.save()
+    if cfg is None:
+        cfg = dev.config()
+    out = {"result": "ok", "config": cfg, "saved": bool(args.save)}
+    if dev.info_dev:
+        out["kernel_scsi_timeout_s"] = int(_read(dev.info_dev["sysfs"] + "/timeout") or 0)
+    _emit(args, out, lambda o: [print("%-18s %s" % (k, v)) for k, v in o["config"].items()])
+    return EXIT_OK
+
+
+def _status_reply(args, r, what):
+    j = r.json or {}
+    _emit(args, j, lambda j: (print("%s: %s%s" % (what, j.get("result"), (" - " + j["message"]) if j.get("message") else "")),
+                              j.get("drive") and human_status(j)))
+    return EXIT_OK if r.ok else EXIT_DEVICE
+
+
+def cmd_detect(args, dev):
+    r = dev.detect(device=args.device, geometry=args.geometry, chs=args.chs,
+                   probe=not args.no_probe, force=args.force, mount=args.mount)
+    return _status_reply(args, r, "detect")
+
+
+def cmd_geometry(args, dev):
+    return _status_reply(args, dev.geometry(args.mode, args.chs), "geometry")
+
+
+def cmd_mount(args, dev):
+    r = dev.mount(rescan=not args.no_rescan)
+    return _status_reply(args, r, "mount")
+
+
+def cmd_unmount(args, dev):
+    return _status_reply(args, dev.unmount(rescan=not args.no_rescan), "unmount")
+
+
+def cmd_reset(args, dev):
+    return _status_reply(args, dev.reset(hard=args.hard), "reset")
+
+
+def cmd_identify(args, dev):
+    raw = dev.identify(cached=args.cached)
+    if args.raw:
+        with open(args.raw, "wb") as f:
+            f.write(raw)
+    d = decode_identify(raw)
+    if args.words:
+        d["words"] = list(struct.unpack("<256H", raw))
+    _emit(args, d, lambda d: [print("%-20s %s" % (k, v)) for k, v in d.items() if k != "words"])
+    return EXIT_OK
+
+
+def cmd_taskfile(args, dev):
+    _emit(args, dev.taskfile(), lambda j: print(
+        "ERR %02X[%s] CNT %02X LBA %02X/%02X/%02X DEV %02X ST %02X[%s]%s" % (
+            j["error"], j["error_bits"], j["count"], j["lba_lo"], j["lba_mid"], j["lba_hi"],
+            j["device"], j["status"], j["status_bits"], "" if j["valid"] else "  (BSY: registers invalid)")))
+    return EXIT_OK
+
+
+def cmd_read(args, dev):
+    """Read a range in chunks; per-chunk diagnostics; optional output / image patching."""
+    maxn = dev.info().get("max_read_sectors", 7)
+    lba, end = args.lba, args.lba + args.count
+    results, bad, ok_sectors = [], [], 0
+    out = open(args.out, "r+b" if os.path.exists(args.out) and args.image else "wb") if args.out else None
+    status = EXIT_OK
+    try:
+        while lba < end:
+            n = min(maxn, end - lba) if not bad or args.chunk_after_error == 0 else 1
+            r = dev.read(lba, n, no_retry=args.no_retry, through_error=args.through_error,
+                         timeout_ms=args.timeout)
+            got = r.done + (1 if r.err_data else 0)
+            if out and got:
+                out.seek(((lba if args.image else lba - args.lba)) * 512)
+                out.write(r.data[:got * 512])
+            ok_sectors += r.done
+            results.append(r.to_dict(with_data=args.hex and not out))
+            if not r.ok:
+                status = EXIT_DEVICE
+                fl = r.fail_lba if r.fail_lba is not None else lba + r.done
+                bad.append(fl)
+                if not args.keep_going:
+                    break
+                lba = max(fl + 1, lba + max(1, r.done))
+            else:
+                lba += n
+            if args.hexdump and not args.json and got:
+                _hexdump(r.data[:got * 512], (lba - got) * 512)
+    finally:
+        if out:
+            out.close()
+    summary = {"result": "ok" if not bad else "errors", "start": args.lba, "count": args.count,
+               "ok_sectors": ok_sectors, "bad_lbas": bad, "chunks": results}
+    _emit(args, summary, lambda s: ([human_ata_result(c) for c in s["chunks"] if c["result"] != "ok" or args.verbose],
+                                    print("read %d sectors from LBA %d: %d ok, %d bad%s" % (
+                                        s["count"], s["start"], s["ok_sectors"], len(s["bad_lbas"]),
+                                        (" " + str(s["bad_lbas"][:20])) if s["bad_lbas"] else ""))))
+    return status
+
+
+def cmd_readlong(args, dev):
+    reads = []
+    for _ in range(max(1, args.vote)):
+        r = dev.read_long(args.lba, ecc_len=args.ecc, no_retry=args.no_retry, timeout_ms=args.timeout)
+        reads.append(r)
+        if not r.data:
+            break
+    last = reads[-1]
+    out = last.to_dict()
+    payload = last.data
+    if args.vote > 1 and all(r.data for r in reads):
+        n = len(reads[0].data)
+        voted = bytearray(n)
+        unstable = 0
+        for i in range(n):
+            col = [r.data[i] for r in reads]
+            best = max(set(col), key=col.count)
+            voted[i] = best
+            unstable += len(set(col)) > 1
+        payload = bytes(voted)
+        out["vote"] = {"reads": len(reads), "unstable_bytes": unstable}
+    if payload:
+        out["ecc_hex"] = payload[512:].hex()
+        if args.out:
+            with open(args.out, "wb") as f:
+                f.write(payload if args.with_ecc else payload[:512])
+            out["written"] = args.out
+        if args.image:
+            with open(args.image, "r+b") as f:
+                f.seek(args.lba * 512)
+                f.write(payload[:512])
+            out["patched_image"] = args.image
+    _emit(args, out, lambda o: (human_ata_result(o), print("ECC bytes: %s%s" % (o.get("ecc_hex", "-"),
+          ("  vote: %d reads, %d unstable bytes" % (o["vote"]["reads"], o["vote"]["unstable_bytes"])) if "vote" in o else ""))))
+    return EXIT_OK if last.data else EXIT_DEVICE
+
+
+def cmd_verify(args, dev):
+    lba, end = args.lba, args.lba + args.count
+    bad, t0, requests = [], time.time(), 0
+    while lba < end:
+        r = dev.verify(lba, end - lba, timeout_ms=args.timeout)
+        requests += 1
+        lba += r.done
+        if r.result == "ok" and not r.partial and lba >= end:
+            break
+        if r.result != "ok":
+            bad.append({"lba": lba, "status": r.status, "error": r.error, "error_bits": bits(r.error, ER_BITS),
+                        "ide_result": r.ide_result})
+            if not args.json:
+                print("bad LBA %d  st %02X err %02X[%s] %s" % (lba, r.status, r.error, bits(r.error, ER_BITS), r.ide_result),
+                      flush=True)
+            lba += 1
+            if args.max_errors and len(bad) >= args.max_errors:
+                break
+        if not args.json and args.progress:
+            print("  ... %d / %d" % (lba - args.lba, args.count), file=sys.stderr, flush=True)
+    out = {"result": "ok" if not bad else "errors", "start": args.lba, "count": args.count,
+           "scanned": lba - args.lba, "bad": bad, "seconds": round(time.time() - t0, 1), "requests": requests}
+    _emit(args, out, lambda o: print("verified %d sectors from LBA %d in %.1f s: %d bad" % (
+        o["scanned"], o["start"], o["seconds"], len(o["bad"]))))
+    return EXIT_OK if not bad else EXIT_DEVICE
+
+
+def cmd_log(args, dev):
+    j = dev.log()
+    if args.clear:
+        dev.clear(log=True)
+        j["cleared"] = True
+    _emit(args, j, lambda j: ([human_log_entry(x) for x in j["entries"]],
+                              print("%d failures logged, %d retained" % (j["total"], j["retained"]))))
+    return EXIT_OK
+
+
+def cmd_clear(args, dev):
+    _emit(args, dev.clear(log=not args.stats_only, stats=args.stats or args.stats_only))
+    return EXIT_OK
+
+
+def cmd_arm(args, dev):
+    _emit(args, dev.arm(), lambda j: print(j["message"]))
+    return EXIT_OK
+
+
+def cmd_reboot(args, dev):
+    _emit(args, dev.reboot(bootsel=args.bootsel), lambda j: print(j["message"]))
+    return EXIT_OK
+
+
+def cmd_wait(args, dev_unused):
+    t0 = time.time()
+    while time.time() - t0 < args.timeout:
+        devs = find_devices()
+        if devs:
+            try:
+                with ATAboy(devs[0]["sg"] or devs[0]["block"]) as d:
+                    info = d.info()
+                _emit(args, {"result": "ok", "device": devs[0], "info": info,
+                             "waited_s": round(time.time() - t0, 1)},
+                      lambda o: print("%s is up: %s (%s)" % (o["device"]["block"], o["info"]["fw"], o["info"]["git"])))
+                return EXIT_OK
+            except (TransportError, ScsiCheckCondition, OSError):
+                pass
+        time.sleep(0.5)
+    _emit(args, {"result": "timeout", "waited_s": args.timeout}, lambda o: print("no ATAboy after %d s" % args.timeout))
+    return EXIT_TRANSPORT
+
+
+def cmd_ata(args, dev):
+    if args.dangerous:
+        dev.arm()
+    data_out = open(args.write, "rb").read() if args.write else None
+    r = dev.ata(args.command, feature=args.feature, count=args.count, lba=args.lba,
+                device=args.device, ext=args.ext, data_in=args.read * 512,
+                data_out=data_out, ck_cond=not args.no_ck, timeout_ms=args.timeout)
+    data = r.pop("data", b"")
+    if data and args.out:
+        with open(args.out, "wb") as f:
+            f.write(data)
+        r["written"] = args.out
+    elif data:
+        r["data_hex"] = data.hex()
+    _emit(args, r, lambda r: (print(" ".join("%s=%s" % (k, ("%02X" % v) if isinstance(v, int) and k in ("status", "error", "device") else v)
+                                             for k, v in r.items() if k != "data_hex")),
+                              data and not args.out and _hexdump(data)))
+    return EXIT_OK if r.get("ok") else EXIT_DEVICE
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="ataboy", description=__doc__.split("\n\n")[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("-d", "--dev", default=os.environ.get("ATABOY_DEV"),
+                   help="/dev/sgN or /dev/sdX (default: first ATAboy found; env ATABOY_DEV)")
+    p.add_argument("-j", "--json", action="store_true", default=os.environ.get("ATABOY_JSON") == "1",
+                   help="machine-readable JSON output (env ATABOY_JSON=1)")
+    p.add_argument("--compact", action="store_true", help="single-line JSON")
+    p.add_argument("--no-sudo", action="store_true", help="don't re-run under sudo when not root")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--version", action="version", version="ataboy " + __version__)
+    sp = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+
+    # The common options are also accepted after the subcommand
+    # ("ataboy status -j"); SUPPRESS keeps the top-level value unless given.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("-d", "--dev", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    common.add_argument("-j", "--json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    common.add_argument("--compact", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+
+    def add(name, fn, help_):
+        x = sp.add_parser(name, help=help_, description=help_, parents=[common])
+        x.set_defaults(fn=fn)
+        return x
+
+    add("list", cmd_list, "list attached ATAboys (no root needed)")
+    add("info", cmd_info, "firmware identity, protocol version, capabilities")
+    add("status", cmd_status, "drive, geometry, mount, config, stats and last error in one call")
+    x = add("config", cmd_config, "show or change settings: config read_timeout_ms=15000 no_retry=1 --save")
+    x.add_argument("settings", nargs="*", help="key=value (" + ", ".join(CONFIG_KEYS) + ")")
+    x.add_argument("--save", action="store_true", help="persist to flash")
+    x = add("detect", cmd_detect, "probe the bus, IDENTIFY, choose geometry (optionally mount)")
+    x.add_argument("--device", choices=["auto", "master", "slave"], default="auto")
+    x.add_argument("--geometry", choices=list(GEOMETRY_MODES), default="auto",
+                   help="auto = LBA if supported, else NORMAL (default)")
+    x.add_argument("--chs", type=_chs, help="C/H/S for --geometry manual")
+    x.add_argument("--no-probe", action="store_true", help="skip bus reset/probe; just IDENTIFY")
+    x.add_argument("--force", action="store_true", help="accept manual geometry if IDENTIFY fails")
+    x.add_argument("--mount", action="store_true", help="mount on success")
+    x = add("geometry", cmd_geometry, "set geometry from cached IDENTIFY data or manual C/H/S")
+    x.add_argument("mode", choices=["normal", "large", "lba", "manual"])
+    x.add_argument("--chs", type=_chs)
+    x = add("mount", cmd_mount, "expose the drive as USB mass storage (and rescan the host disk)")
+    x.add_argument("--no-rescan", action="store_true")
+    x = add("unmount", cmd_unmount, "detach the drive from USB mass storage")
+    x.add_argument("--no-rescan", action="store_true")
+    x = add("reset", cmd_reset, "soft reset (SRST); --hard pulses the RESET line and recalibrates")
+    x.add_argument("--hard", action="store_true")
+    x = add("identify", cmd_identify, "IDENTIFY DEVICE, decoded")
+    x.add_argument("--cached", action="store_true", help="use data from the last detect, no bus access")
+    x.add_argument("--raw", metavar="FILE", help="also write the 512 raw bytes")
+    x.add_argument("--words", action="store_true", help="include all 256 words")
+    add("taskfile", cmd_taskfile, "snapshot of the ATA task-file registers")
+    x = add("read", cmd_read, "read sectors with per-command ATA diagnostics")
+    x.add_argument("lba", type=_int)
+    x.add_argument("count", type=_int, nargs="?", default=1)
+    x.add_argument("--out", metavar="FILE", help="write data (offset 0 = first LBA)")
+    x.add_argument("--image", action="store_true", help="--out is a full-disk image: write at LBA*512, in place")
+    x.add_argument("--no-retry", action="store_true", help="READ SECTORS without drive retries (0x21)")
+    x.add_argument("--through-error", action="store_true", help="return the drive's data for a failing sector")
+    x.add_argument("--timeout", type=int, default=0, help="per-sector timeout ms (default: config)")
+    x.add_argument("--keep-going", action="store_true", help="continue past bad sectors")
+    x.add_argument("--chunk-after-error", type=int, default=1, help=argparse.SUPPRESS)
+    x.add_argument("--hex", action="store_true", help="include data as hex in JSON output")
+    x.add_argument("--hexdump", action="store_true", help="hexdump data (human output)")
+    x = add("readlong", cmd_readlong, "READ LONG: raw sector + ECC bytes without correction")
+    x.add_argument("lba", type=_int)
+    x.add_argument("--ecc", type=int, default=0, help="ECC bytes (default: config, IDENTIFY word 22, else 4)")
+    x.add_argument("--no-retry", action="store_true", help="use 0x23 (no drive retries)")
+    x.add_argument("--timeout", type=int, default=0)
+    x.add_argument("--vote", type=int, default=1, help="read N times and majority-vote each byte")
+    x.add_argument("--out", metavar="FILE")
+    x.add_argument("--with-ecc", action="store_true", help="include ECC bytes in --out")
+    x.add_argument("--image", metavar="IMG", help="patch the 512 data bytes into IMG at LBA*512")
+    x = add("verify", cmd_verify, "READ VERIFY scan (drive-internal, no data over USB); lists bad LBAs")
+    x.add_argument("lba", type=_int)
+    x.add_argument("count", type=_int)
+    x.add_argument("--timeout", type=int, default=0, help="per-command timeout ms")
+    x.add_argument("--max-errors", type=int, default=0)
+    x.add_argument("--progress", action="store_true")
+    x = add("log", cmd_log, "error log: every failed command with ATA status/error/registers")
+    x.add_argument("--clear", action="store_true", help="clear after reading")
+    x = add("clear", cmd_clear, "clear the error log (and/or statistics)")
+    x.add_argument("--stats", action="store_true", help="also reset statistics")
+    x.add_argument("--stats-only", action="store_true")
+    add("arm", cmd_arm, "allow ONE dangerous pass-through command within 10 s")
+    x = add("reboot", cmd_reboot, "restart the firmware; --bootsel enters the UF2 bootloader")
+    x.add_argument("--bootsel", action="store_true")
+    x = add("wait", cmd_wait, "wait until an ATAboy answers (after reboot / replug)")
+    x.add_argument("--timeout", type=int, default=30)
+    x = add("ata", cmd_ata, "raw ATA command via SAT pass-through (respects write protect / arming)")
+    x.add_argument("command", type=_int)
+    x.add_argument("--feature", type=_int, default=0)
+    x.add_argument("--count", type=_int, default=0)
+    x.add_argument("--lba", type=_int, default=0)
+    x.add_argument("--device", type=_int, default=0, help="device register (LBA bit 0x40, head bits)")
+    x.add_argument("--ext", action="store_true", help="48-bit command")
+    x.add_argument("--read", type=int, default=0, metavar="SECTORS", help="PIO data-in of N sectors")
+    x.add_argument("--write", metavar="FILE", help="PIO data-out from FILE")
+    x.add_argument("--out", metavar="FILE", help="save data-in to FILE")
+    x.add_argument("--no-ck", action="store_true", help="don't request result registers")
+    x.add_argument("--dangerous", action="store_true", help="arm first (needed for DANGEROUS commands)")
+    x.add_argument("--timeout", type=int, default=60000)
+    return p
+
+
+NO_DEVICE_CMDS = {"list", "wait"}
+
+
+def _maybe_sudo(args, argv):
+    if os.geteuid() == 0 or args.no_sudo or args.cmd == "list":
+        return
+    script = os.path.abspath(sys.argv[0])
+    extra = ["--json"] if args.json and "-j" not in argv and "--json" not in argv else []
+    if args.dev is None and os.environ.get("ATABOY_DEV"):
+        extra += ["--dev", os.environ["ATABOY_DEV"]]
+    cmd = [sys.executable, script] + extra + argv
+    if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0:
+        os.execvp("sudo", ["sudo", "-n", "--"] + cmd)
+    if sys.stdin.isatty():
+        os.execvp("sudo", ["sudo", "--"] + cmd)
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    _maybe_sudo(args, argv)
+    dev = None
+    try:
+        if args.cmd not in NO_DEVICE_CMDS:
+            dev = ATAboy(args.dev)
+        return args.fn(args, dev)
+    except ApiError as e:
+        obj = e.reply.json if isinstance(e.reply.json, dict) else {"result": e.reply.result_name}
+        _emit(args, obj, lambda o: print("error: %s" % e, file=sys.stderr))
+        return EXIT_DEVICE
+    except PermissionError as e:
+        _emit(args, {"result": "permission_denied", "message": str(e)},
+              lambda o: print("error: %s (run as root)" % e, file=sys.stderr))
+        return EXIT_PERM
+    except (TransportError, ScsiCheckCondition) as e:
+        if isinstance(e, ScsiCheckCondition) and (e.key, e.asc) == (5, 0x24) and dev and dev.info_dev \
+                and not dev.info_dev["rev"].startswith("api"):
+            e = TransportError("firmware revision '%s' does not implement the API; flash the API firmware"
+                               % dev.info_dev["rev"])
+        _emit(args, {"result": "transport_error", "message": str(e)},
+              lambda o: print("error: %s" % e, file=sys.stderr))
+        return EXIT_TRANSPORT
+    finally:
+        if dev:
+            dev.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
