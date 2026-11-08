@@ -209,7 +209,8 @@ def bits(v, table):
 
 RESULTS = ["ok", "bad_subop", "bad_arg", "no_drive", "not_mounted", "write_protected",
            "not_armed", "ata_error", "timeout", "not_ready", "bus_fault", "no_geometry",
-           "mounted", "identify_failed", "unsupported", "protocol", "alloc_too_small"]
+           "mounted", "identify_failed", "unsupported", "protocol", "alloc_too_small",
+           "geometry_mismatch"]
 IDE_RESULTS = {0: "ok", -1: "ata_error", -2: "timeout", -3: "not_ready", -4: "bus_fault", -5: "protocol"}
 
 CT_NONE, CT_JSON, CT_BINARY = 0, 1, 2
@@ -520,14 +521,16 @@ class ATAboy:
 
     # -- drive setup -----------------------------------------------------------
 
-    def detect(self, device="auto", geometry="auto", chs=None, probe=True, force=False, mount=False):
+    def detect(self, device="auto", geometry="auto", chs=None, probe=True, force=False, mount=False,
+               force_mount=False):
         dev = {"auto": 0, "master": 1, "slave": 2}[device]
         geo = GEOMETRY_MODES[geometry]
         c, h, s = chs or (0, 0, 0)
-        flags = (0 if probe else 1) | (2 if mount else 0) | (4 if force else 0)
+        flags = (0 if probe else 1) | (2 if mount or force_mount else 0) | (4 if force else 0) | \
+            (8 if force_mount else 0)
         r = self.call("detect", struct.pack(">BBHBBB", dev, geo, c, h, s, flags), timeout_ms=120000)
         self.sync_kernel_timeout(r.json)      # before the rescan makes the kernel read the disk
-        if r.ok and mount:
+        if r.ok and (mount or force_mount):
             self.rescan()
         return r
 
@@ -535,8 +538,11 @@ class ATAboy:
         c, h, s = chs or (0, 0, 0)
         return self.call("geometry", struct.pack(">BBHBB", 0, GEOMETRY_MODES[mode], c, h, s))
 
-    def mount(self, rescan=True):
-        r = self.call("mount")
+    def mount(self, rescan=True, force=False):
+        """force skips the firmware's checks: a drive must answer, not stay
+        busy, and own the configured geometry (else no_drive / not_ready /
+        geometry_mismatch)."""
+        r = self.call("mount", bytes([1 if force else 0]))
         self.sync_kernel_timeout(r.json)
         if r.ok and rescan:
             self.rescan()
@@ -1743,6 +1749,10 @@ def human_status(j):
     if g["valid"]:
         print("geometry   %s %s  %d/%d/%d  %d sectors (%.1f MB)" % (
             g["mode"], g["addressing"], g["cyls"], g["heads"], g["spt"], g["sectors"], g["sectors"] * 512 / 1e6))
+        owner = g.get("owner") or {}
+        if g.get("identity") == "mismatch":
+            print("           MISMATCH: set up for %s (serial %s), not the drive attached; detect again" % (
+                owner.get("model") or "a drive with different IDENTIFY data", owner.get("serial") or "-"))
     else:
         print("geometry   not set")
     c = j["config"]
@@ -1829,7 +1839,8 @@ def _status_reply(args, r, what):
 
 def cmd_detect(args, dev):
     r = dev.detect(device=args.device, geometry=args.geometry, chs=args.chs,
-                   probe=not args.no_probe, force=args.force, mount=args.mount)
+                   probe=not args.no_probe, force=args.force, mount=args.mount,
+                   force_mount=args.force_mount)
     return _status_reply(args, r, "detect")
 
 
@@ -1838,7 +1849,7 @@ def cmd_geometry(args, dev):
 
 
 def cmd_mount(args, dev):
-    r = dev.mount(rescan=not args.no_rescan)
+    r = dev.mount(rescan=not args.no_rescan, force=args.force)
     return _status_reply(args, r, "mount")
 
 
@@ -2159,11 +2170,16 @@ def build_parser():
     x.add_argument("--no-probe", action="store_true", help="skip bus reset/probe; just IDENTIFY")
     x.add_argument("--force", action="store_true", help="accept manual geometry if IDENTIFY fails")
     x.add_argument("--mount", action="store_true", help="mount on success")
+    x.add_argument("--force-mount", action="store_true",
+                   help="mount on success even if the kept geometry belongs to another drive")
     x = add("geometry", cmd_geometry, "set geometry from cached IDENTIFY data or manual C/H/S")
     x.add_argument("mode", choices=["normal", "large", "lba", "manual"])
     x.add_argument("--chs", type=_chs)
     x = add("mount", cmd_mount, "expose the drive as USB mass storage (and rescan the host disk)")
     x.add_argument("--no-rescan", action="store_true")
+    x.add_argument("--force", action="store_true",
+                   help="mount even if no drive answers, it stays busy, or the geometry was set up "
+                        "for another drive")
     x = add("unmount", cmd_unmount, "detach the drive from USB mass storage")
     x.add_argument("--no-rescan", action="store_true")
     x = add("reset", cmd_reset, "soft reset (SRST); --hard pulses the RESET line and recalibrates")

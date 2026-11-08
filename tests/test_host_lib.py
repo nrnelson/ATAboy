@@ -79,6 +79,8 @@ class FakeDevice:
         self.readlong_count = {}
         self.raise_on = None         # callable(op, args) -> exception to raise, or None
         self.settings = {"load": "ok", "field": None}
+        self.owner = {"model": "FAKE DRIVE", "serial": "1"}
+        self.model, self.serial = "FAKE DRIVE", "1"
 
     # -- transport ------------------------------------------------------------
 
@@ -140,12 +142,13 @@ class FakeDevice:
                 "write_protect": self.config["write_protect"], "armed": False,
                 "settings": dict(self.settings),
                 "drive": {"present": True, "identified": self.identified, "forced": False,
-                          "device": "master", "model": "FAKE DRIVE", "serial": "1", "firmware": "1",
+                          "device": "master", "model": self.model, "serial": self.serial, "firmware": "1",
                           "default_chs": [0, 0, 0], "lba": True, "lba28_sectors": min(self.total, (1 << 28) - 1),
                           "lba48": self.total >= (1 << 28), "lba48_sectors": self.total,
                           "ecc_bytes": self.ecc, "ata_major": 0},
                 "geometry": {"valid": self.geometry_valid, "mode": "lba", "addressing": "lba",
-                             "cyls": 0, "heads": 0, "spt": 0, "sectors": self.total},
+                             "cyls": 0, "heads": 0, "spt": 0, "sectors": self.total,
+                             "owner": dict(self.owner), "identity": self.identity()},
                 "bus": {"status": 0x50, "status_bits": "DRDY|DSC", "pio_faults": 0},
                 "config": dict(self.config),
                 "stats": {k: 0 for k in ("read_cmds", "read_sectors", "read_errors", "write_cmds",
@@ -156,6 +159,20 @@ class FakeDevice:
                                         "last": self.log[-1] if self.log else None}}
 
     # -- firmware model -------------------------------------------------------
+
+    def identity(self):
+        if not self.identified or not (self.owner["model"] or self.owner["serial"]):
+            return "unknown"
+        return "match" if (self.owner["model"], self.owner["serial"]) == (self.model, self.serial) else "mismatch"
+
+    def mount(self, force):
+        """Firmware mount checks (drive_mount_ex): owner mismatch refuses unless forced."""
+        if not self.geometry_valid:
+            return R["no_geometry"], "detect or set geometry first"
+        if not force and not self.mounted and self.identity() == "mismatch":
+            return R["geometry_mismatch"], "the geometry was set up for another drive"
+        self.mounted = True
+        return 0, None
 
     def fails(self, lba, no_retry):
         mode = self.bad.get(lba)
@@ -171,13 +188,17 @@ class FakeDevice:
                                        "board": "fake", "board_id": "0",
                                        "max_read_sectors": (4096 - 48) // 512})
         if op in (0x01, 0x10, 0x11, 0x12, 0x13, 0x14):
+            res, msg = 0, None
             if op == 0x12:
-                self.mounted = True
+                res, msg = self.mount(bool(a[0] & 1))
             elif op == 0x13:
                 self.mounted = False
-            elif op == 0x10 and a[6] & 2:
-                self.mounted = True
-            return self.jreply(op, 0, self.status_json())
+            elif op == 0x10:
+                if a[1] != 5:                    # any geometry but "keep": owner = this drive
+                    self.owner = {"model": self.model, "serial": self.serial}
+                if a[6] & 2:
+                    res, msg = self.mount(bool(a[6] & 8))
+            return self.jreply(op, res, self.status_json(), msg)
         if op == 0x02:
             return self.jreply(op, 0, {"config": dict(self.config)})
         if op == 0x03:
@@ -844,6 +865,57 @@ class EmptyReplyTest(HostTestCase):
             self.dev.call("mount")
         self.assertEqual(self.dev.empty_replies, 0)
         self.assertEqual(sum(1 for op, _ in self.fake.calls if op == ab.OPS["mount"]), 1)
+
+class TestGeometryOwner(HostTestCase):
+    def swap_drive(self):
+        self.fake.model, self.fake.serial = "WDC WD10EZEX-00BN5A0", "WD-WCC3F0000000"
+
+    def test_mount_refused_after_swap(self):
+        self.swap_drive()
+        r = self.dev.mount(rescan=False)
+        self.assertEqual(r.result_name, "geometry_mismatch")
+        self.assertFalse(self.fake.mounted)
+        self.assertEqual(r.json["geometry"]["identity"], "mismatch")
+        self.assertEqual(self.fake.calls[-1], (ab.OPS["mount"], bytes(12)))
+
+    def test_force_mount(self):
+        self.swap_drive()
+        r = self.dev.mount(rescan=False, force=True)
+        self.assertTrue(r.ok)
+        self.assertEqual(self.fake.calls[-1][1][0], 1)
+        self.assertTrue(self.fake.mounted)
+
+    def test_detect_sets_owner_keep_does_not(self):
+        self.swap_drive()
+        r = self.dev.detect(geometry="keep", mount=True)
+        self.assertEqual(r.result_name, "geometry_mismatch")
+        r = self.dev.detect(geometry="keep", force_mount=True)
+        self.assertTrue(r.ok)
+        self.assertEqual(self.fake.calls[-1][1][6], 2 | 8)
+        self.fake.mounted = False
+        r = self.dev.detect(mount=True)
+        self.assertTrue(r.ok)
+        self.assertEqual(r.json["geometry"]["owner"]["model"], "WDC WD10EZEX-00BN5A0")
+
+    def test_human_status_shows_mismatch(self):
+        self.swap_drive()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ab.human_status(self.dev.status())
+        self.assertIn("MISMATCH: set up for FAKE DRIVE (serial 1)", buf.getvalue())
+
+    def test_cli_mount_force_exit_codes(self):
+        self.swap_drive()
+        orig = ab.ATAboy
+        ab.ATAboy = lambda path=None: self.dev
+        self.dev.close = lambda: None
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(ab.main(["--no-sudo", "-j", "mount", "--no-rescan"]), ab.EXIT_DEVICE)
+                self.assertEqual(ab.main(["--no-sudo", "-j", "mount", "--no-rescan", "--force"]), ab.EXIT_OK)
+        finally:
+            ab.ATAboy = orig
+
 
 class TestSettingsStatus(HostTestCase):
     def human(self):

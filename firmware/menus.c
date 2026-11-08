@@ -159,11 +159,6 @@ static int visible_strlen(const char *s) {
     return len;
 }
 
-static void sanitize_identify_model(char *s) {
-    int len = strlen(s);
-    while (len > 0 && s[len - 1] == ' ') s[--len] = '\0';
-}
-
 static void decode_ata_string(uint16_t *buf, int offset, int len_words, char *out) {
     int idx = 0;
     for (int i = 0; i < len_words; i++) {
@@ -882,12 +877,16 @@ static void sync_from_api(void) {
 //  Auto-mount — runs on core 1 so IDE ops never block USB on core 0
 // ---------------------------------------------------------------------------
 
+static void show_notice(const char *msg) {
+    snprintf(hdd_status_text, sizeof(hdd_status_text), "\033[91;1m%s", msg);
+    show_detect_result = true;
+    error_is_notice = true;
+    force_detect = false;
+}
+
 static void try_auto_mount(void) {
     if (!config.auto_mount) return;
-
-    bool has_geo = (config.use_lba_mode && config.lba_sectors > 0) ||
-                   (!config.use_lba_mode && config.cyls > 0 && config.heads > 0 && config.spt > 0);
-    if (!has_geo) return;
+    if (!drive_geometry_valid()) return;
 
     // Wait for drive to spin up
     sleep_ms(5000);
@@ -906,21 +905,23 @@ static void try_auto_mount(void) {
     if (!ready) return;
 
     uint16_t id_buf[256];
-    if (!ide_identify(id_buf)) return;
-
-    // Fill model string for display
-    for (int i = 0; i < 20; i++) {
-        uint16_t val = id_buf[27+i];
-        hdd_model_raw[i*2] = (char)(val>>8); hdd_model_raw[i*2+1] = (char)(val&0xFF);
+    if (ide_identify(id_buf)) {
+        drive_note_identify(id_buf);
+    } else if (config.geo_mode == GEO_MANUAL && !config.geo_model[0] && !config.geo_serial[0]) {
+        drive_note_forced();      // geometry was forced for a drive that doesn't answer IDENTIFY
+        drive.present = true;
+    } else {
+        return;
     }
-    hdd_model_raw[40] = '\0'; sanitize_identify_model(hdd_model_raw);
-    drive_note_identify(id_buf);
+    strncpy(hdd_model_raw, drive.model, sizeof(hdd_model_raw) - 1);
+    hdd_model_raw[sizeof(hdd_model_raw) - 1] = '\0';
 
     if (!config.use_lba_mode)
         ide_set_geometry(config.heads, config.spt);
 
-    is_mounted = true;
-    media_changed_waiting = true;
+    int r = drive_mount_ex(0);    // refuses geometry saved for a different drive
+    if (r == R_GEO_MISMATCH) show_notice("Saved geometry is for another drive: not mounted");
+    else if (r == R_NOT_READY) show_notice("Drive not ready: not mounted");
 }
 
 // ---------------------------------------------------------------------------
@@ -981,6 +982,7 @@ void core1_entry(void) {
                 else if (confirm_type == 1) draw_confirm_box("Save Current Setup to EEPROM (Y/N)?");
                 else if (confirm_type == 3) draw_confirm_box("Are you sure you want to mount the drive (Y/N)?");
                 else if (confirm_type == 4) draw_confirm_box("Are you sure you want to unmount (Y/N)?");
+                else if (confirm_type == 5) draw_confirm_box("Geometry is from another drive! Mount (Y/N)?");
                 trigger_overlay = false;
             }
         } else if (current_screen == SCREEN_MOUNTED) {
@@ -1046,8 +1048,19 @@ void core1_entry(void) {
             if (k == 'y' || k == 'Y') {
                 if (confirm_type == 0) { config_defaults(); sync_from_config(); config_save(); current_screen = SCREEN_MAIN; }
                 else if (confirm_type == 1) { sync_to_config(); config_save(); current_screen = confirm_return_screen; }
-                else if (confirm_type == 3) { is_mounted = true; media_changed_waiting = true; current_screen = SCREEN_MOUNTED; }
-                else if (confirm_type == 4) { is_mounted = false; media_changed_waiting = true; current_screen = SCREEN_MAIN; }
+                else if (confirm_type == 3 || confirm_type == 5) {
+                    int r = drive_mount_ex(confirm_type == 5 ? MOUNT_FORCE : 0);
+                    sync_from_api();             // the mount may have identified the drive
+                    if (r == R_OK) current_screen = SCREEN_MOUNTED;
+                    else if (r == R_GEO_MISMATCH) { current_screen = SCREEN_CONFIRM; confirm_type = 5; trigger_overlay = true; }
+                    else {
+                        current_screen = SCREEN_MAIN;
+                        show_notice(r == R_NO_DRIVE ? "No drive answers: not mounted" :
+                                    r == R_NOT_READY ? "Drive stays busy - check power" : "Mount failed");
+                        trigger_overlay = true;
+                    }
+                }
+                else if (confirm_type == 4) { drive_unmount(); current_screen = SCREEN_MAIN; }
                 needs_full_redraw = true;
             } else if (k == 'n' || k == 'N' || k == KEY_ESC) {
                 current_screen = (confirm_type == 1) ? confirm_return_screen :

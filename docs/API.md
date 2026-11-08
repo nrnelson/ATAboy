@@ -116,6 +116,7 @@ before parsing.
 | 14 | `unsupported` | the drive lacks the feature (e.g. LBA) |
 | 15 | `protocol` | the drive's data phase didn't match (e.g. wrong READ LONG ECC length) |
 | 16 | `alloc_too_small` | allocation length too small for this reply |
+| 17 | `geometry_mismatch` | the configured geometry was set up for another drive (see MOUNT) |
 
 ## Sub-operations
 
@@ -127,9 +128,9 @@ before parsing.
 | 03 | CONFIG_SET | [4] key, [8-11] value | JSON config (not saved) |
 | 04 | CONFIG_SAVE | — | JSON config; writes flash |
 | 05 | CONFIG_DEFAULTS | — | JSON config (not saved; refused while mounted) |
-| 10 | DETECT | [4] device 0 auto / 1 master / 2 slave · [5] geometry 0 auto / 1 normal / 2 large / 3 lba / 4 manual / 5 keep · [6-7] cyls · [8] heads · [9] spt · [10] flags: bit0 skip probe, bit1 mount, bit2 force | JSON status |
+| 10 | DETECT | [4] device 0 auto / 1 master / 2 slave · [5] geometry 0 auto / 1 normal / 2 large / 3 lba / 4 manual / 5 keep · [6-7] cyls · [8] heads · [9] spt · [10] flags: bit0 skip probe, bit1 mount, bit2 force, bit3 mount without the mount checks | JSON status |
 | 11 | GEOMETRY | [5] mode 1 normal / 2 large / 3 lba / 4 manual · [6-7] cyls · [8] heads · [9] spt (manual: 1..65535 / 1..16 / 1..63) | JSON status |
-| 12 | MOUNT | — | JSON status |
+| 12 | MOUNT | [4] bit0 force (skip the mount checks) | JSON status |
 | 13 | UNMOUNT | — | JSON status |
 | 14 | RESET | [4] 0 soft (SRST) / 1 hard (RESET line, recalibrate) | JSON status |
 | 20 | IDENTIFY | [4] bit0 cached (no bus access) | binary: 512 bytes of IDENTIFY DEVICE data |
@@ -155,7 +156,8 @@ before parsing.
             "default_chs": [989, 10, 34], "lba": false, "lba28_sectors": 0,
             "lba48": false, "lba48_sectors": 0, "ecc_bytes": 4, "ata_major": 0},
   "geometry": {"valid": true, "mode": "normal", "addressing": "chs",
-               "cyls": 989, "heads": 10, "spt": 34, "sectors": 336260},
+               "cyls": 989, "heads": 10, "spt": 34, "sectors": 336260,
+               "owner": {"model": "IBM-H2172-A2", "serial": "..."}, "identity": "match"},
   "bus": {"status": 80, "status_bits": "DRDY|DSC", "pio_faults": 0},
   "config": {"write_protect": true, "auto_mount": false, "iordy": false, "intrq": false,
              "read_timeout_ms": 15000, "write_timeout_ms": 1000, "ecc_len": 0,
@@ -169,6 +171,30 @@ before parsing.
 
 Register values are plain integers; `*_bits` fields decode them
 (`"DRDY|DSC|DRQ|ERR"`, `"UNC"`).
+
+### MOUNT checks and the geometry owner
+
+Geometry is saved with the settings, so after a power cycle it applies to
+whatever drive is attached. To keep the previous drive's geometry off a new
+one, the firmware remembers which drive the geometry was set up for
+(`geometry.owner`: IDENTIFY model and serial, saved with CONFIG_SAVE; empty
+when the geometry was forced without IDENTIFY data or saved by older
+firmware). MOUNT (and DETECT with bit1, the menu's Mount, and Auto Mount at
+power-up) checks, unless forced:
+
+1. If the drive hasn't been identified since power-up (and wasn't forced),
+   it is sent IDENTIFY. If IDENTIFY then shows a different model or serial
+   than `geometry.owner`, the result is `geometry_mismatch`. With no owner
+   recorded, geometry that came from IDENTIFY (normal, large, lba) must
+   still agree with this drive's IDENTIFY data; manual geometry without an
+   owner, and drives that don't answer IDENTIFY, mount on the saved geometry.
+
+`geometry.identity` shows the comparison from the data already known, without
+bus access: `match`, `mismatch` or `unknown` (no IDENTIFY data yet, or manual
+geometry without an owner). Detecting with any geometry mode except keep sets
+the owner to the drive just identified. Auto Mount does the same checks; it
+also mounts a drive that doesn't answer IDENTIFY when the saved geometry was
+forced for one (manual, no owner).
 
 ### Config keys (CONFIG_SET)
 

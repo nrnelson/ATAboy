@@ -108,6 +108,7 @@ static const char *result_name(int r) {
         "ok", "bad_subop", "bad_arg", "no_drive", "not_mounted", "write_protected",
         "not_armed", "ata_error", "timeout", "not_ready", "bus_fault", "no_geometry",
         "mounted", "identify_failed", "unsupported", "protocol", "alloc_too_small",
+        "geometry_mismatch",
     };
     return (r >= 0 && r < (int)(sizeof(names) / sizeof(names[0]))) ? names[r] : "unknown";
 }
@@ -275,6 +276,11 @@ static void json_status_body(json_t *j) {
     j_uint(j, "heads", config.heads);
     j_uint(j, "spt", config.spt);
     j_uint(j, "sectors", drive_total_sectors());
+    j_obj(j, "owner");
+    j_str(j, "model", config.geo_model);
+    j_str(j, "serial", config.geo_serial);
+    j_end(j);
+    j_str(j, "identity", config_geo_identity_name(drive_geo_identity()));
     j_end(j);
 
     j_obj(j, "bus");
@@ -453,6 +459,15 @@ static int32_t op_config_set(uint8_t *buf, uint32_t cap, const uint8_t *a) {
     return reply_config(buf, cap, R_OK, NULL);
 }
 
+static const char *mount_message(int r) {
+    switch (r) {
+    case R_NO_GEOMETRY:  return "detect or set geometry first";
+    case R_GEO_MISMATCH: return "the geometry was set up for another drive (see geometry.owner); "
+                                "detect again, or force to mount anyway";
+    default:             return NULL;
+    }
+}
+
 static int32_t op_detect(uint8_t *buf, uint32_t cap, const uint8_t *a) {
     uint8_t dev = a[0] == 1 ? 0xA0 : a[0] == 2 ? 0xB0 : 0;
     if (a[0] > 2) return reply_msg(buf, cap, R_BAD_ARG, "device must be 0 (auto), 1 (master) or 2 (slave)");
@@ -473,6 +488,7 @@ static int32_t op_detect(uint8_t *buf, uint32_t cap, const uint8_t *a) {
     else if (r == R_NO_DRIVE) msg = "no device answered on the selected position(s)";
     else if (r == R_IDENTIFY_FAILED) msg = "device present but IDENTIFY failed; retry, or use force with manual geometry";
     else if (r == R_UNSUPPORTED) msg = "drive does not support LBA";
+    else if (mount_message(r)) msg = mount_message(r);
     else if (r == R_BAD_ARG) msg = "invalid manual geometry (cyls 1..65535, heads 1..16, spt 1..63)";
     return reply_status(buf, cap, r, msg);
 }
@@ -782,9 +798,9 @@ int32_t api_handle(uint8_t lun, const uint8_t *cdb, uint8_t *buf, uint32_t cap) 
     case OP_DETECT:     return op_detect(buf, cap, a);
     case OP_GEOMETRY:   return op_geometry(buf, cap, a);
     case OP_MOUNT: {
-        int r = drive_mount();
+        int r = drive_mount_ex((a[0] & 1) ? MOUNT_FORCE : 0);
         drive.api_gen++;
-        return reply_status(buf, cap, r, r == R_NO_GEOMETRY ? "detect or set geometry first" : NULL);
+        return reply_status(buf, cap, r, mount_message(r));
     }
     case OP_UNMOUNT:
         drive_unmount();

@@ -83,12 +83,21 @@ int drive_result_from_ide(int r) {
 //  Geometry / detect / mount
 // ---------------------------------------------------------------------------
 
-static void large_geometry(uint16_t n_cyl, uint8_t n_hd, uint16_t *l_cyl, uint8_t *l_hd) {
-    uint32_t total = (uint32_t)n_cyl * n_hd;
-    uint8_t heads = n_hd ? n_hd : 1;
-    while (heads < 255 && (total / heads) > 65535) heads++;
-    *l_hd = heads;
-    *l_cyl = (uint16_t)(total / heads);
+// Remember which drive the configured geometry belongs to ("" when there is
+// no IDENTIFY data, e.g. forced manual geometry).
+static void set_geometry_owner(void) {
+    _Static_assert(sizeof(config.geo_model) == sizeof(drive.model) &&
+                   sizeof(config.geo_serial) == sizeof(drive.serial), "owner fields must match drive_state_t");
+    memset(config.geo_model, 0, sizeof(config.geo_model));
+    memset(config.geo_serial, 0, sizeof(config.geo_serial));
+    if (drive.identified) {                           // both NUL-terminated by ata_string()
+        memcpy(config.geo_model, drive.model, sizeof(config.geo_model));
+        memcpy(config.geo_serial, drive.serial, sizeof(config.geo_serial));
+    }
+}
+
+int drive_geo_identity(void) {
+    return config_geo_identity(&config, drive.model, drive.serial, drive.identified ? drive.id : NULL);
 }
 
 int drive_apply_geometry(uint8_t mode, uint16_t c, uint8_t h, uint8_t s) {
@@ -103,7 +112,7 @@ int drive_apply_geometry(uint8_t mode, uint16_t c, uint8_t h, uint8_t s) {
         break;
     case GEO_LARGE:
         if (!drive.identified) return R_IDENTIFY_FAILED;
-        large_geometry(id[1], (uint8_t)id[3], &c, &h);
+        config_large_chs(id[1], (uint8_t)id[3], &c, &h);
         s = (uint8_t)id[6];
         break;
     case GEO_LBA: {
@@ -134,6 +143,7 @@ int drive_apply_geometry(uint8_t mode, uint16_t c, uint8_t h, uint8_t s) {
     config.heads = h;
     config.spt = s;
     config.geo_mode = mode;
+    set_geometry_owner();
     if (!lba) ide_set_geometry(h, s);   // INITIALIZE DEVICE PARAMETERS
     ide_unlock();
     return R_OK;
@@ -147,6 +157,7 @@ void drive_clear_geometry(void) {
     config.heads = 0;
     config.spt = 0;
     config.geo_mode = GEO_NONE;
+    set_geometry_owner();
     ide_unlock();
 }
 
@@ -203,17 +214,55 @@ int drive_detect(uint8_t only_dev, uint8_t geo_mode, uint16_t c, uint8_t h, uint
         ide_set_geometry(config.heads, config.spt);   // the probe's RESET cleared INIT PARAMS
     ide_unlock();
 
-    if (r == R_OK && (flags & DETECT_MOUNT)) r = drive_mount();
+    if (r == R_OK && (flags & DETECT_MOUNT)) r = drive_mount_ex((flags & DETECT_MOUNT_FORCE) ? MOUNT_FORCE : 0);
     return r;
 }
 
-int drive_mount(void) {
-    if (!drive_geometry_valid()) return R_NO_GEOMETRY;
-    if (!is_mounted) {
-        is_mounted = true;
-        media_changed_waiting = true;
+// Before exposing the drive, the geometry must belong to it.  A drive not
+// identified since boot is asked for IDENTIFY first, so a mount straight
+// after power-up compares the saved geometry with the drive really attached.
+static int mount_checks(void) {
+    ide_lock();
+    if (!drive.identified && !drive.forced) {
+        uint16_t id[256];
+        ide_cmd_t ic = {0};
+        ic.command = 0xEC;
+        ic.proto = IDE_PROTO_PIO_IN;
+        ic.buf = (uint8_t *)id;
+        ic.sectors = 1;
+        ic.flags = IDE_F_NEED_DRDY;
+        ic.ready_ms = 1000;
+        ic.timeout_ms = 5000;
+        if (ide_exec(&ic) == IDE_OK) {
+            drive_note_identify(id);
+            drive.api_gen++;
+        }
+        drive_record(LOGOP_IDENTIFY, &ic, 0, 1);
+        // No IDENTIFY: nothing to compare against; mount on the saved geometry.
     }
+    ide_unlock();
+
+    int idv = drive_geo_identity();
+    if (idv == GEO_ID_MISMATCH) return R_GEO_MISMATCH;
+    if (idv == GEO_ID_MATCH && !config.geo_model[0] && !config.geo_serial[0])
+        set_geometry_owner();                         // older settings: owner confirmed now
     return R_OK;
+}
+
+int drive_mount_ex(uint8_t flags) {
+    if (!drive_geometry_valid()) return R_NO_GEOMETRY;
+    if (is_mounted) return R_OK;
+    if (!(flags & MOUNT_FORCE)) {
+        int r = mount_checks();
+        if (r != R_OK) return r;
+    }
+    is_mounted = true;
+    media_changed_waiting = true;
+    return R_OK;
+}
+
+int drive_mount(void) {
+    return drive_mount_ex(0);
 }
 
 int drive_unmount(void) {
