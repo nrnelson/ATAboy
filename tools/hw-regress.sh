@@ -90,7 +90,9 @@ if (( scratch )); then
     lba=$(( sectors - 64 ))
     "$A" config write_protect=0 >/dev/null
     [[ $(cat /sys/block/$(basename "$dev")/ro) == 0 ]] && pass "host sees write protect off" || fail "host still read-only"
-    sudo dd if="$dev" of="$work/save.bin" bs=512 skip=$lba count=16 iflag=direct status=none
+    # Saves the 24 sectors the writes below touch (lba..lba+23); never write without it.
+    sudo dd if="$dev" of="$work/save.bin" bs=512 skip=$lba count=24 iflag=direct status=none \
+        || { fail "could not save the scratch area; skipping all write tests"; "$A" config write_protect=1 >/dev/null; echo "---"; exit $fails; }
     head -c 8192 /dev/urandom > "$work/rand"
     sudo dd if="$work/rand" of="$dev" bs=512 seek=$lba count=16 oflag=direct status=none \
         && sudo dd if="$dev" bs=512 skip=$lba count=16 iflag=direct status=none | cmp -s - "$work/rand" \
@@ -119,8 +121,12 @@ EOF
     # Damaged-sector checks need READ/WRITE LONG, which have no 48-bit form: on
     # big drives use an area below 128 GiB, and skip on drives without READ LONG.
     clba=$(( sectors > 268435456 ? 268435456 - 64 : lba ))
-    (( clba != lba )) && sudo dd if="$dev" of="$work/csave.bin" bs=512 skip=$clba count=16 iflag=direct status=none
-    if [[ $("$A" -j readlong $((clba + 4)) --out "$work/rlprobe" | jq_ 'd["result"]') != ok ]]; then
+    if (( clba != lba )) && ! sudo dd if="$dev" of="$work/csave.bin" bs=512 skip=$clba count=16 iflag=direct status=none; then
+        fail "could not save the corrupt-test area"; clba=-1
+    fi
+    if (( clba < 0 )); then
+        skip "corrupt / image / rescue / one-attempt checks (area not saved)"
+    elif [[ $("$A" -j readlong $((clba + 4)) --out "$work/rlprobe" | jq_ 'd["result"]') != ok ]]; then
         skip "corrupt / image / rescue / one-attempt checks (drive does not support READ LONG)"
     else
     "$A" corrupt $((clba + 4)) --bits 32 >/dev/null
@@ -134,13 +140,13 @@ EOF
     sudo dd if="$dev" of=/dev/null bs=512 skip=$((clba + 4)) count=1 iflag=direct status=none 2>/dev/null
     [[ $("$A" -j log | jq_ 'd["total"]') == 1 ]] && pass "bad sector costs one drive attempt" || fail "host retried the bad sector"
     fi
-    if (( clba != lba )); then
+    if (( clba >= 0 && clba != lba )); then
         sudo dd if="$work/csave.bin" of="$dev" bs=512 seek=$clba count=16 oflag=direct status=none
         sudo dd if="$dev" bs=512 skip=$clba count=16 iflag=direct status=none | cmp -s - "$work/csave.bin" \
             && pass "corrupt area restored" || fail "corrupt area restore"
     fi
-    sudo dd if="$work/save.bin" of="$dev" bs=512 seek=$lba count=16 oflag=direct status=none
-    sudo dd if="$dev" bs=512 skip=$lba count=16 iflag=direct status=none | cmp -s - "$work/save.bin" \
+    sudo dd if="$work/save.bin" of="$dev" bs=512 seek=$lba count=24 oflag=direct status=none
+    sudo dd if="$dev" bs=512 skip=$lba count=24 iflag=direct status=none | cmp -s - "$work/save.bin" \
         && pass "scratch area restored" || fail "scratch restore"
     "$A" config write_protect=1 >/dev/null
 fi
