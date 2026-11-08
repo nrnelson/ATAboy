@@ -27,6 +27,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 fails=0
 pass() { printf 'PASS  %s\n' "$*"; }
+skip() { printf 'SKIP  %s\n' "$*"; }
 fail() { printf 'FAIL  %s\n' "$*"; fails=$((fails + 1)); }
 check() { local name=$1; shift; if "$@" >"$work/out" 2>&1; then pass "$name"; else fail "$name"; sed 's/^/      /' "$work/out" | head -5; fi; }
 jq_() { python3 -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
@@ -38,6 +39,7 @@ check "status answers" "$A" -j status
 
 # --- detect / mount -----------------------------------------------------------
 "$A" unmount >/dev/null 2>&1   # detect refuses while mounted
+"$A" config write_protect=1 >/dev/null   # start from the safe default whatever was left set
 if "$A" -j detect --mount >"$work/out" 2>&1; then pass "detect + mount"
 else
     fail "detect + mount"; sed 's/^/      /' "$work/out" | head -5
@@ -98,12 +100,15 @@ if (( scratch )); then
 import json, sys
 lba = int(sys.argv[1]) + 20; g = json.loads(sys.argv[2])["geometry"]
 if g["addressing"] == "chs":
-    t, s = divmod(lba, g["spt"]); c, h = divmod(t, g["heads"]); print(s + 1 | (c << 8), h, 0)
-else:
-    print(lba & 0xFFFFFF, 0x40 | (lba >> 24), 1)
+    t, s = divmod(lba, g["spt"]); c, h = divmod(t, g["heads"]); print(s + 1 | (c << 8), h, "0x30")
+elif g["addressing"] == "lba28":
+    print(lba & 0xFFFFFF, 0x40 | (lba >> 24), "0x30")
+else:                                    # WRITE SECTORS EXT, full 48-bit LBA
+    print(lba, 0x40, "0x34 --ext")
 EOF
-    read -r ptlba ptdev _ < "$work/chs"
-    "$A" -j ata 0x30 --count 1 --lba "$ptlba" --device "$ptdev" --write "$work/r1" >/dev/null \
+    read -r ptlba ptdev ptcmd < "$work/chs"
+    # shellcheck disable=SC2086
+    "$A" -j ata $ptcmd --count 1 --lba "$ptlba" --device "$ptdev" --write "$work/r1" >/dev/null \
         && "$A" read $((lba + 20)) --out "$work/r1b" >/dev/null && cmp -s "$work/r1" "$work/r1b" \
         && pass "pass-through WRITE SECTORS + readback" || fail "pass-through write"
     out=$("$A" -j ata 0xFF)
@@ -111,16 +116,29 @@ EOF
     "$A" clear --stats >/dev/null
     "$A" -j ata 0xFF --dangerous >/dev/null
     [[ $("$A" -j status | jq_ 'd["stats"]["passthru_cmds"]') == 1 ]] && pass "armed command executed exactly once" || fail "armed command count"
-    "$A" corrupt $((lba + 4)) --bits 32 >/dev/null
-    out=$("$A" -j read $((lba + 4)) --through-error --timeout 15000)
+    # Damaged-sector checks need READ/WRITE LONG, which have no 48-bit form: on
+    # big drives use an area below 128 GiB, and skip on drives without READ LONG.
+    clba=$(( sectors > 268435456 ? 268435456 - 64 : lba ))
+    (( clba != lba )) && sudo dd if="$dev" of="$work/csave.bin" bs=512 skip=$clba count=16 iflag=direct status=none
+    if [[ $("$A" -j readlong $((clba + 4)) --out "$work/rlprobe" | jq_ 'd["result"]') != ok ]]; then
+        skip "corrupt / image / rescue / one-attempt checks (drive does not support READ LONG)"
+    else
+    "$A" corrupt $((clba + 4)) --bits 32 >/dev/null
+    out=$("$A" -j read $((clba + 4)) --through-error --timeout 15000)
     [[ $(echo "$out" | jq_ 'd["chunks"][0]["error_bits"]') == UNC ]] && pass "corrupt makes UNC sector" || fail "corrupt: $out"
-    "$A" image "$work/p.img" --start $((lba)) --count 16 >/dev/null
+    "$A" image "$work/p.img" --start $((clba)) --count 16 >/dev/null
     grep -q -- "  -$" "$work/p.img.map" && pass "image maps the bad sector" || fail "image map"
     out=$("$A" -j rescue "$work/p.img" "$work/p.img.map" --vote 3)
     [[ $(echo "$out" | jq_ 'len(d["readlong"])') -ge 1 ]] && pass "rescue falls through to READ LONG" || fail "rescue: $out"
     "$A" clear >/dev/null
-    sudo dd if="$dev" of=/dev/null bs=512 skip=$((lba + 4)) count=1 iflag=direct status=none 2>/dev/null
+    sudo dd if="$dev" of=/dev/null bs=512 skip=$((clba + 4)) count=1 iflag=direct status=none 2>/dev/null
     [[ $("$A" -j log | jq_ 'd["total"]') == 1 ]] && pass "bad sector costs one drive attempt" || fail "host retried the bad sector"
+    fi
+    if (( clba != lba )); then
+        sudo dd if="$work/csave.bin" of="$dev" bs=512 seek=$clba count=16 oflag=direct status=none
+        sudo dd if="$dev" bs=512 skip=$clba count=16 iflag=direct status=none | cmp -s - "$work/csave.bin" \
+            && pass "corrupt area restored" || fail "corrupt area restore"
+    fi
     sudo dd if="$work/save.bin" of="$dev" bs=512 seek=$lba count=16 oflag=direct status=none
     sudo dd if="$dev" bs=512 skip=$lba count=16 iflag=direct status=none | cmp -s - "$work/save.bin" \
         && pass "scratch area restored" || fail "scratch restore"
