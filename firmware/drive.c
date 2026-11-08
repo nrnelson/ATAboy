@@ -223,9 +223,9 @@ int drive_detect(uint8_t only_dev, uint8_t geo_mode, uint16_t c, uint8_t h, uint
 // Before exposing the drive: something must answer on the bus, it must be
 // ready within MOUNT_READY_MS (a drive that never gets ready would stall
 // every USB read, and with it the serial menu), and the geometry must
-// belong to it.  A drive not
-// identified since boot is asked for IDENTIFY first, so a mount straight
-// after power-up compares the saved geometry with the drive really attached.
+// belong to it.  A drive not identified since boot is asked for IDENTIFY
+// first, so a mount straight after power-up compares the saved geometry with
+// the drive really attached.
 static int mount_checks(void) {
     ide_lock();
     uint8_t dev = ide_selected_device();
@@ -251,7 +251,7 @@ static int mount_checks(void) {
     drive.present = true;
 
     if (!drive.identified && !drive.forced) {
-        uint16_t id[256];
+        static uint16_t id[256];                      // under ide_lock; keeps 512 bytes off both stacks
         ide_cmd_t ic = {0};
         ic.command = 0xEC;
         ic.proto = IDE_PROTO_PIO_IN;
