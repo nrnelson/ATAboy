@@ -91,11 +91,13 @@ int32_t sat_passthrough(uint8_t lun, const uint8_t *cdb, uint8_t *buf, uint32_t 
     // Write-protect / arming policy
     ata_class_t cls = ata_classify(c.command, c.feature);
     if (c.proto == IDE_PROTO_PIO_OUT && cls == ATA_CLASS_READ) cls = ATA_CLASS_WRITE;
+    // Any dangerous attempt uses up the arm, even one refused below.
+    bool armed = (cls == ATA_CLASS_DANGEROUS) && api_take_arm();
     if (cls != ATA_CLASS_READ && config.drive_write_protected) {
         drive_stats.passthru_blocked++;
         return reject(lun, SCSI_SENSE_DATA_PROTECT, 0x27, 0x00);   // write protected
     }
-    if (cls == ATA_CLASS_DANGEROUS && !api_take_arm()) {
+    if (cls == ATA_CLASS_DANGEROUS && !armed) {
         drive_stats.passthru_blocked++;
         return reject(lun, SCSI_SENSE_DATA_PROTECT, 0x20, 0x02);   // access denied: not armed
     }

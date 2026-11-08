@@ -1004,6 +1004,7 @@ def build_parser():
     common.add_argument("-d", "--dev", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     common.add_argument("-j", "--json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     common.add_argument("--compact", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    common.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
 
     def add(name, fn, help_):
         x = sp.add_parser(name, help=help_, description=help_, parents=[common])
