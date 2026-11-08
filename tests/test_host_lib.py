@@ -601,6 +601,40 @@ class TestRescue(HostTestCase):
         with open(self.img + ".readlong.json") as f:
             self.assertEqual(sorted(json.load(f)), ["10", "40"])
 
+    def test_map_checkpoints_during_a_pass(self):
+        # interval 0: the map is saved after every recovered sector, so a crash
+        # mid-pass (simulated by reading the map from inside the device) loses nothing
+        seen = []
+
+        def peek(op, a):
+            if op == 0x22 and struct.unpack(">I", a[0:4])[0] == 11:
+                seen.append(ab.Mapfile.load(self.map).status_at(10))
+            return None
+        self.fake.raise_on = peek
+        res = self.dev.rescue(self.img, self.map, readlong=False, save_interval_s=0)
+        self.assertEqual(seen, ["+"])                    # sector 10 already on disk as finished
+        self.assertGreaterEqual(res["map_saves"], 4)
+
+    def test_default_interval_does_not_save_per_sector(self):
+        res = self.dev.rescue(self.img, self.map, readlong=False)
+        self.assertEqual(res["map_saves"], 3)            # end of pass 1, pass 2, final
+
+    def test_ctrl_c_saves_and_reports(self):
+        self.fake.bad.update({11: NORETRY, 12: NORETRY, 13: NORETRY})
+
+        def stop(op, a):
+            if op == 0x22 and not a[6] & 1:             # first retry-pass read
+                return KeyboardInterrupt()
+            return None
+        self.fake.raise_on = stop
+        res = self.dev.rescue(self.img, self.map, readlong=False)
+        self.assertEqual(res["result"], "interrupted")
+        self.assertFalse(res["complete"])
+        self.assertEqual(res["recovered_no_retry"], [10])
+        m = ab.Mapfile.load(self.map)
+        self.assertEqual(m.status_at(10), "+")
+        self.assertEqual(self.image_sector(10), sector(10))
+
     def test_exception_mid_run_saves_map(self):
         self.fake.bad.update({11: NORETRY, 12: NORETRY, 13: NORETRY})
 

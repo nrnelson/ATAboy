@@ -848,7 +848,7 @@ class ATAboy:
 
     def rescue(self, image, mapfile, timeout_ms=15000, votes=5, readlong=True,
                no_retry_pass=True, max_sectors=0, time_budget_s=0, progress=None,
-               include_untried=False):
+               include_untried=False, save_interval_s=30):
         """Targeted recovery after ddrescue: retry only the sectors the mapfile
         marks non-finished, gentlest first, writing recovered data into the image
         and updating the mapfile.  READ LONG results go into the image but stay
@@ -858,7 +858,13 @@ class ATAboy:
         error aborts the run; the exception is then re-raised.  A per-sector
         ApiError (e.g. bad_arg) leaves that sector bad and is listed in
         'errors'.  Sectors that were tried and failed but were '?' in the map
-        are marked '-'."""
+        are marked '-'.
+
+        Like ddrescue, the mapfile is also saved every save_interval_s seconds
+        while sectors are being recovered (image data is flushed to disk first),
+        so a crash or power loss costs at most that much re-reading.  Ctrl-C
+        stops cleanly: everything is saved and the summary comes back with
+        result "interrupted"."""
         m = Mapfile.load(mapfile)
         targets = m.bad_sectors(max_sectors, include_untried=include_untried)
         t0 = time.time()
@@ -866,7 +872,7 @@ class ATAboy:
                "recovered_no_retry": [], "recovered_retry": [], "readlong": [], "still_bad": [],
                "readlong_skipped": [], "errors": [], "complete": True}
         say = progress or (lambda s: None)
-        state = {"budget_hit": False}
+        state = {"budget_hit": False, "interrupted": False, "last_save": time.time(), "saves": 0}
         tried = set()                       # got a real answer from the drive, and it failed
         sidecar_path = image + ".readlong.json"
         sidecar = {}
@@ -889,6 +895,16 @@ class ATAboy:
                     img.seek(lba * 512)
                     img.write(data[:512])
 
+                def checkpoint(force=False):
+                    # data first, then the map that claims it
+                    if not force and time.time() - state["last_save"] < save_interval_s:
+                        return
+                    img.flush()
+                    os.fsync(img.fileno())
+                    m.save()
+                    state["last_save"] = time.time()
+                    state["saves"] += 1
+
                 def read_pass(lbas, pass_name, out_key, **kw):
                     nxt = []
                     for i, lba in enumerate(lbas):
@@ -907,6 +923,7 @@ class ATAboy:
                             rec[out_key].append(lba)
                             tried.discard(lba)
                             say("LBA %d recovered (%s pass, %.0f ms)" % (lba, pass_name, r.elapsed_us / 1000))
+                            checkpoint()
                         else:
                             tried.add(lba)
                             nxt.append(lba)
@@ -916,10 +933,10 @@ class ATAboy:
                 if no_retry_pass:
                     remaining = read_pass(remaining, "no-retry", "recovered_no_retry",
                                           no_retry=True, timeout_ms=min(timeout_ms, 5000))
-                    m.save()
+                    checkpoint(force=True)
                 # Pass 2: drive retries, long timeout
                 remaining = read_pass(remaining, "retry", "recovered_retry", timeout_ms=timeout_ms)
-                m.save()
+                checkpoint(force=True)
                 # Pass 3: READ LONG majority vote (data without ECC correction)
                 if readlong and remaining:
                     if os.path.exists(sidecar_path):
@@ -950,6 +967,8 @@ class ATAboy:
                         say("LBA %d: READ LONG data written (%d unstable bytes over %d reads)"
                             % (lba, entry["unstable_bytes"], entry["votes"]))
                     rec["readlong_sidecar"] = sidecar_path
+        except KeyboardInterrupt:
+            state["interrupted"] = True     # the 'with' has flushed the image; map saved below
         finally:
             # Always keep what was written to the image accounted for in the map.
             for lba in sorted(tried.intersection(remaining)):
@@ -964,11 +983,14 @@ class ATAboy:
                         json.dump(sidecar, sf, indent=1, sort_keys=True)
                     os.replace(tmp, sidecar_path)
         rec["still_bad"] = remaining
-        rec["complete"] = not state["budget_hit"]
+        rec["complete"] = not (state["budget_hit"] or state["interrupted"])
+        rec["map_saves"] = state["saves"] + 1
         rec["recovered"] = len(rec["recovered_no_retry"]) + len(rec["recovered_retry"])
         rec["seconds"] = round(time.time() - t0, 1)
         if remaining:
             rec["result"] = "partial"
+        if state["interrupted"]:
+            rec["result"] = "interrupted"
         return rec
 
     # -- raw ATA pass-through (SAT ATA PASS-THROUGH 16) ----------------------------
@@ -1100,6 +1122,8 @@ class Mapfile:
             f.write("#      pos        size  status\n")
             for pos, size, st in self.blocks:
                 f.write("0x%08X  0x%08X  %s\n" % (pos, size, st))
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, self.path)
 
 
@@ -1903,13 +1927,14 @@ def cmd_rescue(args, dev):
     out = dev.rescue(args.image, args.mapfile, timeout_ms=args.timeout, votes=args.vote,
                      readlong=not args.no_readlong, no_retry_pass=not args.no_fast_pass,
                      max_sectors=args.max_sectors, time_budget_s=args.budget, progress=prog,
-                     include_untried=args.include_untried)
+                     include_untried=args.include_untried, save_interval_s=args.save_interval)
     out["map_before"] = before
     out["map_after"] = Mapfile.load(args.mapfile).summary()
     _emit(args, out, lambda o: print("rescue: %d candidate sectors, %d recovered (%d fast, %d with retries), "
                                      "%d READ LONG, %d still bad%s" % (
         o["candidates"], o["recovered"], len(o["recovered_no_retry"]), len(o["recovered_retry"]),
-        len(o["readlong"]), len(o["still_bad"]), "" if o["complete"] else " (time budget ran out)"),
+        len(o["readlong"]), len(o["still_bad"]),
+        "" if o["complete"] else " (interrupted)" if o["result"] == "interrupted" else " (time budget ran out)"),
         o.get("errors") and print("  %d sector(s) hit device errors: %s" % (len(o["errors"]), o["errors"][:5])),
         o.get("readlong_skipped") and print("  READ LONG skipped for %d sector(s) above the 28-bit limit"
                                             % len(o["readlong_skipped"]))))
@@ -2190,6 +2215,8 @@ def build_parser():
     x.add_argument("--include-untried", action="store_true",
                    help="also read never-tried areas sector by sector (slow; normally use image)")
     x.add_argument("--budget", type=float, default=0, help="stop after N seconds")
+    x.add_argument("--save-interval", type=float, default=30,
+                   help="save the mapfile at least this often while recovering (s, default 30)")
     x = add("corrupt", cmd_corrupt, "DESTRUCTIVE test helper: damage a sector on purpose (READ LONG, flip "
                                     "bits, WRITE LONG with stale ECC) to exercise recovery tools")
     x.add_argument("lba", type=_int)
