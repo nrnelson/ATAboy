@@ -194,8 +194,29 @@ static void json_config(json_t *j, const char *key) {
     j_end(j);
 }
 
+static const char *reset_name(int r) {
+    switch (r) {
+    case IDE_RST_OK:     return "ok";
+    case IDE_RST_HW:     return "hw_reset";
+    case IDE_RST_FAILED: return "failed";
+    default:             return "none";
+    }
+}
+
+static void json_resets(json_t *j, const char *key) {
+    j_obj(j, key);
+    j_uint(j, "soft", ide_health.soft_resets);
+    j_uint(j, "soft_failed", ide_health.soft_reset_failures);
+    j_uint(j, "hard", ide_health.hw_resets);
+    j_uint(j, "hard_failed", ide_health.hw_reset_failures);
+    j_uint(j, "geometry_failed", ide_health.geometry_failures);
+    j_str(j, "last", reset_name(ide_health.last_reset));
+    j_uint(j, "last_ms", ide_health.last_reset_ms);
+    j_end(j);
+}
+
 static void json_log_entry(json_t *j, const char *key, const errlog_entry_t *e) {
-    char sb[48], eb[48];
+    char sb[48], eb[48], evb[96];
     j_obj(j, key);
     j_uint(j, "seq", e->seq);
     j_uint(j, "t_ms", e->t_ms);
@@ -213,6 +234,7 @@ static void json_log_entry(json_t *j, const char *key, const errlog_entry_t *e) 
     j_bool(j, "tf_valid", e->tf_valid);
     j_bool(j, "err_data", e->err_data);
     j_bool(j, "recovered", e->recovered);
+    j_str(j, "events", ide_event_bits(e->events, evb));
     j_uint(j, "elapsed_ms", e->elapsed_ms);
     j_uint(j, "timeout_ms", e->timeout_ms);
     if (e->tf_valid) {
@@ -276,6 +298,7 @@ static void json_status_body(json_t *j) {
     j_uint(j, "status", alt);
     j_str(j, "status_bits", ata_status_bits(alt, sb));
     j_uint(j, "pio_faults", ide_pio_faults);
+    json_resets(j, "resets");
     j_end(j);
 
     json_config(j, "config");
@@ -481,12 +504,11 @@ static int32_t op_geometry(uint8_t *buf, uint32_t cap, const uint8_t *a) {
 }
 
 static int32_t op_reset(uint8_t *buf, uint32_t cap, const uint8_t *a) {
-    if (a[0] == 1) ide_reset_drive();
-    else ide_soft_reset();
+    int rr = (a[0] == 1) ? (ide_reset_drive() ? IDE_RST_HW : IDE_RST_FAILED) : ide_soft_reset();
     drive.api_gen++;
-    uint8_t st = ide_read_alt_status();
-    return reply_status(buf, cap, (st & ATA_ST_BSY) ? R_NOT_READY : R_OK,
-                        (st & ATA_ST_BSY) ? "drive still busy after reset" : NULL);
+    if (rr == IDE_RST_FAILED)
+        return reply_status(buf, cap, R_NOT_READY, "drive did not come back from reset (or refused the CHS geometry)");
+    return reply_status(buf, cap, R_OK, (a[0] != 1 && rr == IDE_RST_HW) ? "soft reset failed; hardware reset recovered the drive" : NULL);
 }
 
 static int32_t op_identify(uint8_t *buf, uint32_t cap, const uint8_t *a) {

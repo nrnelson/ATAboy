@@ -131,7 +131,7 @@ before parsing.
 | 11 | GEOMETRY | [5] mode 1 normal / 2 large / 3 lba / 4 manual · [6-7] cyls · [8] heads · [9] spt | JSON status |
 | 12 | MOUNT | — | JSON status |
 | 13 | UNMOUNT | — | JSON status |
-| 14 | RESET | [4] 0 soft (SRST) / 1 hard (RESET line, recalibrate) | JSON status |
+| 14 | RESET | [4] 0 soft (SRST) / 1 hard (RESET line, recalibrate) | JSON status; `not_ready` if the drive didn't come back (see [Resets](#resets)) |
 | 20 | IDENTIFY | [4] bit0 cached (no bus access) | binary: 512 bytes of IDENTIFY DEVICE data |
 | 21 | TASKFILE | — | JSON registers (`valid` false while BSY) |
 | 22 | READ | [4-7] LBA · [8-9] count (1..`max_read_sectors`) · [10] flags: bit0 no retry (0x21), bit1 read-through-error · [12-15] per-sector timeout ms (0 = config) | binary: result block + data |
@@ -155,7 +155,9 @@ before parsing.
             "lba48": false, "lba48_sectors": 0, "ecc_bytes": 4, "ata_major": 0},
   "geometry": {"valid": true, "mode": "normal", "addressing": "chs",
                "cyls": 989, "heads": 10, "spt": 34, "sectors": 336260},
-  "bus": {"status": 80, "status_bits": "DRDY|DSC", "pio_faults": 0},
+  "bus": {"status": 80, "status_bits": "DRDY|DSC", "pio_faults": 0,
+          "resets": {"soft": 1, "soft_failed": 0, "hard": 0, "hard_failed": 0,
+                     "geometry_failed": 0, "last": "ok", "last_ms": 412}},
   "config": {"write_protect": true, "auto_mount": false, "iordy": false, "intrq": false,
              "read_timeout_ms": 15000, "write_timeout_ms": 1000, "ecc_len": 0,
              "ecc_len_effective": 4, "no_retry": false, "device": "master"},
@@ -242,13 +244,17 @@ continue from `lba + done`.
  "entries": [{"seq": 1, "t_ms": 51234, "op": "read", "cmd": 32, "result": "ata_error",
               "lba": 19968, "count": 8, "done": 1, "fail_lba": 19969,
               "status": 89, "status_bits": "DRDY|DSC|DRQ|ERR", "error": 64, "error_bits": "UNC",
-              "tf_valid": true, "err_data": false, "recovered": false,
+              "tf_valid": true, "err_data": false, "recovered": false, "events": "",
               "elapsed_ms": 4290, "timeout_ms": 15000, "tf": [1, 12, 58, 0, 167]}]}
 ```
 
 The ring holds the last 64 failures. A page holds as many entries as fit in
 4 KiB; fetch `start = next` until `next` is null. `op` is `read` (USB disk),
 `write`, `read_diag` (API READ), `read_long`, `verify`, `passthrough` or `identify`.
+`events` lists what happened around the command, `|`-separated: `hw_reset`
+(the recovery soft reset failed and the RESET line was pulsed), `reset_failed`
+(the drive didn't come back even then). An entry whose `result` is `ok` was
+logged for its events alone: the command itself succeeded.
 `tf` is null when the drive was still BSY. While BSY is set, every register
 reads back as STATUS, so those values would be garbage.
 
@@ -323,6 +329,30 @@ Every pass-through command is classified (`firmware/ata_policy.c`):
   (0x21), a fast first pass for imaging old drives with `ddrescue`. On an
   early-90s IBM drive an unreadable sector failed in 20-50 ms this way instead
   of 4.3 s with the drive's own retries.
+
+## Resets
+
+A soft reset (SRST) happens on RESET mode 0, on SAT soft/device reset, and
+after a command times out, hits a bus fault or leaves data behind (result
+flag bit3). After SRST the firmware:
+
+1. waits for the configured device, up to the 31 s ATA allows, polling once a
+   millisecond and stopping as soon as the drive is ready. A reset selects the
+   master; a slave first waits for a master to finish its own reset, but an
+   empty master position reads FFh on this bus, so a slave alone on the cable
+   stops waiting for it at once. The slave is then re-selected on every poll.
+2. in CHS mode, re-sends INITIALIZE DEVICE PARAMETERS (91h) and checks the
+   drive accepted it. In LBA mode the drive must show DRDY.
+3. if either step fails, pulses the RESET line once (this resets both devices
+   on the cable), waits the same way, sends RECALIBRATE and restores the
+   geometry.
+
+USB is blocked while this runs; a drive that never comes back takes about
+62 s (both waits) before the command fails. `STATUS.bus.resets` counts soft
+resets, soft resets that failed, hardware resets (fallback or RESET mode 1;
+the DETECT probe's own reset isn't counted), hardware resets that failed and
+refused 91h commands; `last` is `ok`, `hw_reset`, `failed` or `none`, and
+`last_ms` how long it took. LOG_CLEAR bit1 zeroes these counters too.
 
 ## Firmware updates
 

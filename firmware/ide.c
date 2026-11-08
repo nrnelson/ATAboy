@@ -183,23 +183,127 @@ static bool set_geometry(uint8_t heads, uint8_t spt) {
     wr(6, dev_base | ((heads - 1) & 0x0F));
     wr(2, spt);
     wr(7, 0x91);                          // INITIALIZE DEVICE PARAMETERS
+    rd_alt();                             // >= 400 ns before STATUS is valid
     uint8_t st;
     if (!wait_ready(1000, true, &st)) return false;
-    return !(st & ATA_ST_ERR);
+    return !(st & (ATA_ST_ERR | ATA_ST_DF));
+}
+
+// ---------------------------------------------------------------------------
+//  Resets
+// ---------------------------------------------------------------------------
+
+ide_health_t ide_health;
+
+void ide_health_clear(void) {
+    ide_lock();
+    memset(&ide_health, 0, sizeof(ide_health));
+    ide_health.last_reset = IDE_RST_NONE;
+    ide_unlock();
+}
+
+static bool chs_active(void) {
+    return !config.use_lba_mode && config.heads && config.heads <= 16 && config.spt;
+}
+
+// Wait for the configured device after SRST or RESET-.  A reset leaves
+// DEV=0, so STATUS reads the master's until the slave is selected again.
+//
+//  - Master configured: wait for BSY=0 (and DRDY=1 in LBA mode; CHS drives
+//    may hold DRDY off until they get INITIALIZE DEVICE PARAMETERS).
+//  - Slave configured: first let a master finish its own reset (selecting
+//    the slave while the master is still busy can be lost), but an empty
+//    master position reads 0xFF on this bus, which looks busy: stop waiting
+//    for it as soon as it reads 0xFF.  Then select the slave and wait for
+//    it, re-selecting it on every poll.
+//
+// Bounded by budget_ms (ATA allows a device 31 s).  Polls once a ms; the
+// caller holds the lock, so USB is blocked for as long as the drive needs.
+static bool wait_after_reset(uint32_t budget_ms, uint8_t *st_out) {
+    uint32_t t0 = time_us_32();
+    uint32_t limit = budget_ms * 1000u;
+    bool need_drdy = !chs_active();
+    uint8_t st = 0xFF;
+
+    if (dev_base == 0xB0) {
+        for (;;) {
+            st = rd(7);
+            if (st == 0xFF || !(st & ATA_ST_BSY)) break;
+            if (time_us_32() - t0 >= limit) { *st_out = st; return false; }   // a master that never came back
+            busy_wait_us_32(1000);
+        }
+    }
+    for (;;) {
+        wr(6, dev_base);
+        busy_wait_us_32(1);
+        st = rd(7);
+        if (st != 0xFF && !(st & ATA_ST_BSY) && (!need_drdy || (st & ATA_ST_DRDY))) break;
+        if (time_us_32() - t0 >= limit) { *st_out = st; return false; }
+        busy_wait_us_32(1000);
+    }
+    *st_out = st;
+    return true;
+}
+
+// After a reset: CHS drives lost INITIALIZE DEVICE PARAMETERS.  Re-send it
+// and check the drive took it; leave the configured device selected.
+static bool restore_geometry(void) {
+    if (!chs_active()) { wr(6, dev_base); return true; }
+    if (set_geometry(config.heads, config.spt)) return true;
+    ide_health.geometry_failures++;
+    return false;
+}
+
+// Pulse RESET- (resets both devices on the cable), wait, recalibrate and
+// restore the geometry.  IORDY is ignored meanwhile: a drive holds it low
+// during POST.
+static bool hard_reset(void) {
+    uint8_t st;
+    ide_health.hw_resets++;
+    ide_set_iordy(false);
+    gpio_put(IDE_RESET, 0);
+    sleep_ms(50);
+    gpio_put(IDE_RESET, 1);
+    sleep_ms(100);
+    wr_ctl(0x00);
+    bool ok = wait_after_reset(IDE_RESET_WAIT_MS, &st);
+    if (ok) {
+        // Recalibrate: seek heads to track 0 (required by some pre-ATA drives).
+        // ATA-4 and later drives may abort it, so its status is not judged.
+        wr(6, dev_base);
+        wr(7, 0x10);
+        rd_alt();
+        wait_ready(10000, true, NULL);
+        ok = restore_geometry();
+    }
+    if (!ok) ide_health.hw_reset_failures++;
+    ide_set_iordy(config.iordy_enabled);
+    return ok;
 }
 
 // SRST aborts whatever the drive is doing and clears INITIALIZE DEVICE
-// PARAMETERS, so CHS geometry is re-applied afterwards.
-static void soft_reset(void) {
-    wr_ctl(0x04);
-    busy_wait_us_32(10);
+// PARAMETERS.  Wait (bounded) for the configured device, restore the CHS
+// geometry and check it was accepted; if the drive doesn't come back, one
+// hardware reset.  Returns IDE_RST_*.
+static int soft_reset(void) {
+    uint32_t t0 = time_us_32();
+    uint8_t st;
+    ide_health.soft_resets++;
+    ide_set_iordy(false);
+    wr_ctl(0x04);                          // SRST=1, nIEN=0
+    busy_wait_us_32(10);                   // >= 5 us
     wr_ctl(0x00);
-    busy_wait_us_32(2000);
-    wait_ready(2000, true, NULL);
-    if (!config.use_lba_mode && config.heads && config.spt)
-        set_geometry(config.heads, config.spt);
-    else
-        wr(6, dev_base);
+    busy_wait_us_32(2000);                 // >= 2 ms before BSY is valid
+    bool ok = wait_after_reset(IDE_RESET_WAIT_MS, &st) && restore_geometry();
+    ide_set_iordy(config.iordy_enabled);
+    int r = IDE_RST_OK;
+    if (!ok) {
+        ide_health.soft_reset_failures++;
+        r = hard_reset() ? IDE_RST_HW : IDE_RST_FAILED;
+    }
+    ide_health.last_reset = (int8_t)r;
+    ide_health.last_reset_ms = (time_us_32() - t0) / 1000u;
+    return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +312,7 @@ static void soft_reset(void) {
 
 void ide_hw_init(void) {
     recursive_mutex_init(&ide_mtx);
+    ide_health.last_reset = IDE_RST_NONE;
 
     // SIO-controlled output pins
     uint32_t sio_out = (1 << IDE_DIR) | (1 << IDE_DIR1) |
@@ -264,36 +369,21 @@ void ide_hw_init(void) {
     ide_set_iordy(config.iordy_enabled);
 }
 
-void ide_reset_drive(void) {
+bool ide_reset_drive(void) {
     ide_lock();
-    // Force IORDY HIGH during reset — drive holds it LOW during POST
-    ide_set_iordy(false);
-
-    gpio_put(IDE_RESET, 0);
-    sleep_ms(50);
-    gpio_put(IDE_RESET, 1);
-    sleep_ms(100);
-    wr_ctl(0x00);
-    wait_ready(10000, true, NULL);
-
-    // Recalibrate — seek heads to track 0 (required by some pre-ATA drives)
-    wr(6, dev_base);
-    wr(7, 0x10);
-    wait_ready(10000, true, NULL);
-
-    // Hardware reset also clears INITIALIZE DEVICE PARAMETERS
-    if (!config.use_lba_mode && config.heads && config.spt)
-        set_geometry(config.heads, config.spt);
-
-    // Restore IORDY to config setting — drive is ready for normal operation
-    ide_set_iordy(config.iordy_enabled);
+    uint32_t t0 = time_us_32();
+    bool ok = hard_reset();
+    ide_health.last_reset = ok ? IDE_RST_HW : IDE_RST_FAILED;
+    ide_health.last_reset_ms = (time_us_32() - t0) / 1000u;
     ide_unlock();
+    return ok;
 }
 
-void ide_soft_reset(void) {
+int ide_soft_reset(void) {
     ide_lock();
-    soft_reset();
+    int r = soft_reset();
     ide_unlock();
+    return r;
 }
 
 uint8_t ide_probe_devices(uint8_t only) {
@@ -371,6 +461,7 @@ int ide_exec(ide_cmd_t *c) {
     c->out_count = c->out_lba_lo = c->out_lba_mid = c->out_lba_hi = c->out_device = 0;
     c->out_hob_count = c->out_hob_lba_lo = c->out_hob_lba_mid = c->out_hob_lba_hi = 0;
     c->tf_valid = c->err_data = c->recovered = false;
+    c->events = 0;
     c->done = 0;
     c->elapsed_us = 0;
 
@@ -484,8 +575,10 @@ int ide_exec(ide_cmd_t *c) {
     }
 
     if ((res == IDE_TIMEOUT || res == IDE_BUS_FAULT || leftover) && !(c->flags & IDE_F_NO_RECOVER)) {
-        soft_reset();
+        int rr = soft_reset();
         c->recovered = true;
+        if (rr == IDE_RST_HW) c->events |= IDE_EV_HW_RESET;
+        else if (rr == IDE_RST_FAILED) c->events |= IDE_EV_HW_RESET | IDE_EV_RESET_FAILED;
     }
 
     c->result = res;

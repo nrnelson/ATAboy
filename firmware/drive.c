@@ -220,7 +220,7 @@ void drive_record(uint8_t op, const ide_cmd_t *c, uint32_t lba, uint32_t count) 
     bool failed = c->result != IDE_OK;
     if (c->result == IDE_TIMEOUT) drive_stats.timeouts++;
     if (c->recovered) drive_stats.recoveries++;
-    if (!failed) return;
+    if (!failed && !c->events) return;   // events (resets, geometry repairs) are logged even on success
 
     errlog_entry_t *x = &errlog[errlog_seq % ERRLOG_SIZE];
     memset(x, 0, sizeof(*x));
@@ -234,6 +234,7 @@ void drive_record(uint8_t op, const ide_cmd_t *c, uint32_t lba, uint32_t count) 
     x->tf_valid   = c->tf_valid;
     x->err_data   = c->err_data;
     x->recovered  = c->recovered;
+    x->events     = c->events;
     x->lba        = lba;
     x->count      = (uint16_t)(count > 0xFFFF ? 0xFFFF : count);
     x->done       = (uint16_t)(c->done > 0xFFFF ? 0xFFFF : c->done);
@@ -262,7 +263,7 @@ const errlog_entry_t *drive_last_failure(void) {
 }
 
 void drive_log_clear(void)   { errlog_seq = 0; }
-void drive_stats_clear(void) { memset(&drive_stats, 0, sizeof(drive_stats)); }
+void drive_stats_clear(void) { memset(&drive_stats, 0, sizeof(drive_stats)); ide_health_clear(); }
 
 // ---------------------------------------------------------------------------
 //  Mass-storage sector I/O

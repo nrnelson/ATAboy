@@ -51,8 +51,8 @@ void    ide_select_device(uint8_t base);   // 0xA0 = master, 0xB0 = slave
 uint8_t ide_selected_device(void);
 uint8_t ide_probe_devices(uint8_t only);   // reset + scan; only = 0 (both), 0xA0 or 0xB0
 void    ide_hw_init(void);
-void    ide_reset_drive(void);             // RESET line + recalibrate
-void    ide_soft_reset(void);              // SRST + restore CHS geometry
+bool    ide_reset_drive(void);             // RESET line + recalibrate + restore CHS geometry
+int     ide_soft_reset(void);              // SRST + restore CHS geometry; IDE_RST_*
 bool    ide_wait_until_ready(uint32_t timeout_ms);
 
 void    ide_write_reg(uint8_t reg, uint8_t val);
@@ -73,6 +73,31 @@ void    ide_read_taskfile(uint8_t tf[8]);
 // Returns the status register value after the operation.
 uint8_t ide_seek_read_one(uint32_t target, bool lba);
 
+// --- Resets ---
+// After SRST or RESET- the firmware waits up to IDE_RESET_WAIT_MS (the 31 s
+// ATA allows) for the configured device, re-sends INITIALIZE DEVICE
+// PARAMETERS in CHS mode and checks it was accepted.  A soft reset that
+// doesn't bring the drive back gets one hardware reset.
+#define IDE_RESET_WAIT_MS 31000u
+
+#define IDE_RST_OK      0   // SRST: drive back (and geometry accepted)
+#define IDE_RST_HW      1   // SRST failed, the RESET line brought it back (or explicit hard reset ok)
+#define IDE_RST_FAILED -1   // drive not back even after the RESET line
+#define IDE_RST_NONE   -2   // no reset since boot / clear
+
+typedef struct {
+    uint32_t soft_resets;          // SRST issued (recovery, API, pass-through)
+    uint32_t soft_reset_failures;  // drive not ready / geometry refused after SRST
+    uint32_t hw_resets;            // RESET line pulses (fallback or explicit; not the detect probe)
+    uint32_t hw_reset_failures;    // drive not back even after RESET
+    uint32_t geometry_failures;    // INITIALIZE DEVICE PARAMETERS refused after a reset
+    uint32_t last_reset_ms;        // duration of the last reset (incl. fallback)
+    int8_t   last_reset;           // IDE_RST_* of the last reset
+} ide_health_t;
+
+extern ide_health_t ide_health;
+void    ide_health_clear(void);
+
 // --- Generic ATA command engine ---
 typedef enum {
     IDE_PROTO_NONDATA = 0,
@@ -87,6 +112,10 @@ typedef enum {
 #define IDE_NOT_READY  -3   // drive never became ready to accept the command
 #define IDE_BUS_FAULT  -4   // PIO burst timed out (IORDY stuck low)
 #define IDE_PROTOCOL   -5   // drive's data phase didn't match the request (DRQ left over)
+
+// Events (ide_cmd_t.events)
+#define IDE_EV_HW_RESET      0x01   // the recovery SRST failed and the RESET line was pulsed
+#define IDE_EV_RESET_FAILED  0x02   // the drive didn't come back from the recovery reset
 
 // Flags
 #define IDE_F_NEED_DRDY     0x01   // wait for DRDY=1 (not just BSY=0) before issuing
@@ -116,6 +145,7 @@ typedef struct {
     bool     tf_valid;        // registers above were read with BSY=0 (else garbage)
     bool     err_data;        // block 'done' was transferred even though ERR was set
     bool     recovered;       // an SRST was issued afterwards
+    uint8_t  events;          // IDE_EV_* (resets and geometry repairs around this command)
     uint32_t done;            // blocks transferred without error
     uint32_t elapsed_us;      // command written -> finished
 } ide_cmd_t;
