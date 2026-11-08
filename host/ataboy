@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """ataboy - command-line client and Python library for the ATAboy automation API.
 
-Talks to the ATAboy firmware over the USB mass-storage (SCSI) interface using
-the Linux SG_IO ioctl: vendor command 0xC0 for the ATAboy API and SAT ATA
-PASS-THROUGH (16) for raw ATA commands.  Standard library only.
+Talks to the ATAboy firmware over its "ATAboy API" USB serial port (no root
+needed; firmware with the "serial_api" feature) or over the USB mass-storage
+(SCSI) interface using the Linux SG_IO ioctl: vendor command 0xC0 for the
+ATAboy API and SAT ATA PASS-THROUGH (16) for raw ATA commands.  Standard
+library only.
 
     ataboy status                 # what is attached, geometry, mount state, errors
     ataboy detect --mount         # probe, IDENTIFY, pick geometry, mount
@@ -19,27 +21,37 @@ error, 3 transport/device-not-found error, 4 permission error.
 As a library:
 
     from ataboy import ATAboy           # (copy or symlink this file to ataboy.py)
-    with ATAboy() as dev:
+    with ATAboy() as dev:               # or ATAboy(serial="E661...", transport="serial")
         print(dev.status()["geometry"])
         r = dev.read(19969, 1, through_error=True)
+        print(dev.link_info())          # transport, boot id, state counter, reboots seen
+
+Transport: the API serial port needs only read/write access to the tty
+(group dialout on most Linux systems), so no sudo; SG_IO (the fallback, and
+always for "ata") needs root.  The CLI re-runs itself under sudo only when
+the serial port can't be used.
 
 Protocol reference: docs/API.md in the firmware repository.
 """
 
 import argparse
 import array
+import binascii
 import ctypes
 import errno
 import fcntl
 import glob
 import json
 import os
+import random
+import select
 import struct
 import subprocess
 import sys
+import termios
 import time
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 API_PROTO = 1
 
 # ---------------------------------------------------------------------------
@@ -81,6 +93,15 @@ class _SgIoHdr(ctypes.Structure):
 
 class TransportError(Exception):
     """The SCSI command could not be delivered or the device is missing."""
+
+
+class ReplyLost(TransportError):
+    """No intact reply arrived.  .maybe_executed is False when the device said
+    it never ran the request (it arrived corrupted), True when it may have."""
+
+    def __init__(self, message, maybe_executed=True):
+        super().__init__(message)
+        self.maybe_executed = maybe_executed
 
 
 class ScsiCheckCondition(Exception):
@@ -160,6 +181,170 @@ def sgio(fd, cdb, direction, data=None, length=0, timeout_ms=60000):
         n = max(0, length - h.resid)
         got = dbuf.raw[:n]
     return got, h.resid
+
+
+# ---------------------------------------------------------------------------
+#  Serial transport (the "ATAboy API" USB serial port, docs/API.md)
+# ---------------------------------------------------------------------------
+
+FRAME_HDR = struct.Struct(">BBBBHHH")      # magic, type, version, flags/status, tag, alloc/0, length
+FRAME_MAGIC, FRAME_REQ, FRAME_RSP, FRAME_VERSION = 0xA5, ord("Q"), ord("R"), 1
+FRAME_MAX_BODY = 4096
+ST_OK, ST_CHECK, ST_BAD_FRAME, ST_UNSUPPORTED = 0, 1, 2, 3
+
+
+def frame_request(tag, cdb, alloc=4096):
+    """One request frame: header, the 16 CDB bytes, CRC-32."""
+    alloc = 0 if alloc >= FRAME_MAX_BODY else alloc
+    f = FRAME_HDR.pack(FRAME_MAGIC, FRAME_REQ, FRAME_VERSION, 0, tag & 0xFFFF, alloc, len(cdb)) + bytes(cdb)
+    return f + struct.pack(">I", binascii.crc32(f) & 0xFFFFFFFF)
+
+
+def frame_response(tag, status, body=b""):
+    """One response frame, as the firmware sends it (used by the tests)."""
+    f = FRAME_HDR.pack(FRAME_MAGIC, FRAME_RSP, FRAME_VERSION, status, tag & 0xFFFF, 0, len(body)) + bytes(body)
+    return f + struct.pack(">I", binascii.crc32(f) & 0xFFFFFFFF)
+
+
+def is_tty_path(path):
+    """A serial device (/dev/ttyACMn, macOS /dev/cu.*, or a udev symlink to one)."""
+    return bool(path) and os.path.basename(os.path.realpath(path)).startswith(("tty", "cu."))
+
+
+class SerialTransport:
+    """API requests over the ATAboy's API serial port.  Needs read/write access
+    to the tty (on most Linux systems: membership of group dialout or uucp),
+    not root.  fd: an already open file descriptor (tests), else path is opened
+    and put into raw mode."""
+
+    name = "serial"
+    SLACK_S = 2.0                       # on top of the request's own timeout
+
+    def __init__(self, path=None, fd=None):
+        self.path = path
+        self.buf = bytearray()
+        self.tag = random.randrange(0x10000)
+        self.stale_frames = 0           # responses discarded because their tag didn't match
+        if fd is not None:
+            self.fd = fd
+            return
+        try:
+            self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        except PermissionError:
+            raise
+        except OSError as e:
+            raise TransportError("cannot open %s: %s" % (path, e))
+        try:
+            # One program at a time: interleaved frames from two programs would
+            # only time out.  (Root can still open the port.)
+            fcntl.ioctl(self.fd, termios.TIOCEXCL)
+            a = termios.tcgetattr(self.fd)
+            a[0] = 0                                            # iflag: no translation, no flow control
+            a[1] = 0                                            # oflag
+            a[2] = termios.CS8 | termios.CREAD | termios.CLOCAL  # cflag
+            a[3] = 0                                            # lflag: raw, no echo
+            a[6][termios.VMIN], a[6][termios.VTIME] = 0, 0
+            termios.tcsetattr(self.fd, termios.TCSANOW, a)
+            termios.tcflush(self.fd, termios.TCIOFLUSH)
+        except (OSError, termios.error) as e:
+            os.close(self.fd)
+            raise TransportError("cannot set up %s: %s" % (path, e))
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def _fill(self, deadline):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return False
+        r, _, _ = select.select([self.fd], [], [], left)
+        if not r:
+            return False
+        try:
+            chunk = os.read(self.fd, 65536)
+        except BlockingIOError:
+            return True
+        except OSError as e:
+            raise TransportError("serial read failed: %s" % e)
+        if not chunk:
+            raise TransportError("serial port closed (device unplugged?)")
+        self.buf += chunk
+        return True
+
+    def _write(self, data, deadline):
+        view = memoryview(data)
+        while view:
+            _, w, _ = select.select([], [self.fd], [], max(0.0, deadline - time.monotonic()))
+            if not w:
+                raise ReplyLost("serial write timed out", maybe_executed=False)
+            try:
+                n = os.write(self.fd, view)
+            except BlockingIOError:
+                continue
+            except OSError as e:
+                raise TransportError("serial write failed: %s" % e)
+            view = view[n:]
+
+    def _drain(self):
+        """Throw away anything left over from an earlier, abandoned request."""
+        self.buf.clear()
+        while True:
+            r, _, _ = select.select([self.fd], [], [], 0)
+            if not r:
+                return
+            try:
+                if not os.read(self.fd, 65536):
+                    return
+            except (BlockingIOError, OSError):
+                return
+
+    def _frame(self, deadline):
+        """Next well-formed response frame: (status, tag, body) or None on a
+        CRC mismatch.  Raises ReplyLost on timeout."""
+        while True:
+            i = self.buf.find(bytes([FRAME_MAGIC, FRAME_RSP]))
+            if i < 0:
+                del self.buf[:max(0, len(self.buf) - 1)]
+            else:
+                del self.buf[:i]
+                if len(self.buf) >= FRAME_HDR.size:
+                    _, _, ver, status, tag, _, n = FRAME_HDR.unpack_from(self.buf)
+                    if ver != FRAME_VERSION or n > FRAME_MAX_BODY:
+                        del self.buf[:1]                       # not a frame: hunt on
+                        continue
+                    end = FRAME_HDR.size + n + 4
+                    if len(self.buf) >= end:
+                        f = bytes(self.buf[:end])
+                        del self.buf[:end]
+                        if binascii.crc32(f[:-4]) & 0xFFFFFFFF != struct.unpack(">I", f[-4:])[0]:
+                            return None
+                        return status, tag, f[FRAME_HDR.size:-4]
+            if not self._fill(deadline):
+                raise ReplyLost("no reply from the ATAboy within the timeout")
+
+    def api(self, cdb, alloc=4096, timeout_ms=60000):
+        """Send one API request; returns the reply bytes (what SG_IO would give)."""
+        self.tag = (self.tag + 1) & 0xFFFF
+        deadline = time.monotonic() + timeout_ms / 1000.0 + self.SLACK_S
+        self._drain()
+        self._write(frame_request(self.tag, cdb, alloc), deadline)
+        while True:
+            fr = self._frame(deadline)
+            if fr is None:
+                raise ReplyLost("reply failed its CRC check")
+            status, tag, body = fr
+            if tag != self.tag:
+                self.stale_frames += 1                         # an answer to an older request
+                continue
+            if status == ST_OK:
+                return body
+            if status == ST_CHECK and len(body) >= 3:
+                raise ScsiCheckCondition(bytes([0x70, 0, body[0], 0, 0, 0, 0, 10, 0, 0, 0, 0, body[1], body[2]]))
+            if status == ST_BAD_FRAME:
+                raise ReplyLost("the ATAboy received a corrupted request (not executed)", maybe_executed=False)
+            raise TransportError("the ATAboy refused the request frame (status %d)" % status)
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +442,8 @@ def bits(v, table):
 
 RESULTS = ["ok", "bad_subop", "bad_arg", "no_drive", "not_mounted", "write_protected",
            "not_armed", "ata_error", "timeout", "not_ready", "bus_fault", "no_geometry",
-           "mounted", "identify_failed", "unsupported", "protocol", "alloc_too_small"]
+           "mounted", "identify_failed", "unsupported", "protocol", "alloc_too_small",
+           "result_17", "request_id_conflict"]
 IDE_RESULTS = {0: "ok", -1: "ata_error", -2: "timeout", -3: "not_ready", -4: "bus_fault", -5: "protocol"}
 
 CT_NONE, CT_JSON, CT_BINARY = 0, 1, 2
@@ -271,8 +457,19 @@ OPS = {
 }
 
 # Read-only ops that may be re-sent if a reply comes back empty.
-RETRY_EMPTY_OPS = {OPS[k] for k in ("info", "status", "config_get", "identify",
+RETRY_EMPTY_OPS = {OPS[k] for k in ("info", "status", "config_get", "identify", "taskfile",
                                     "read", "read_long", "verify", "log")}
+
+# State-changing ops that take a run-once request id (CDB bytes 12-15) in an
+# extended request (firmware INFO "rid_ops").  Re-sending one with the same id
+# returns the stored reply instead of running it twice, so they too are re-sent
+# after an empty or lost reply.  Their arguments never use bytes 12-15.
+RID_OPS = {OPS[k] for k in ("config_set", "config_save", "config_defaults", "detect", "geometry",
+                            "mount", "unmount", "reset", "corrupt", "log_clear", "arm", "reboot")}
+
+# Boot id last seen per device in this process (USB serial or path), so a
+# reboot between two ATAboy() instances is noticed too.
+_LAST_BOOT_ID = {}
 
 CONFIG_KEYS = {
     "write_protect": (1, "bool"), "auto_mount": (2, "bool"), "iordy": (3, "bool"),
@@ -287,8 +484,10 @@ LBA28_LIMIT = 1 << 28          # READ LONG (0x22/0x23) has no 48-bit form
 
 
 class Reply:
-    """Decoded API reply (16-byte header + JSON or binary payload)."""
+    """Decoded API reply: 16-byte header (32 for extended requests) + JSON or
+    binary payload."""
     HDR = struct.Struct(">2sBBBBHIB3x")
+    EXT = struct.Struct(">IIIB3x")          # bytes 16-31: boot id, state counter, request id, flags
 
     def __init__(self, raw):
         if len(raw) < 16:
@@ -298,7 +497,17 @@ class Reply:
             raise TransportError("bad reply magic %r - is the API firmware loaded?" % magic)
         self.proto, self.op, self.result, self.ctype = proto, op, result, ctype
         self.uptime_ms, self.flags = uptime, flags
-        self.payload = raw[16:16 + plen]
+        self.hdr_len = raw[13] if raw[13] == 32 else 16
+        self.ext = self.hdr_len == 32
+        self.boot_id = self.state_counter = self.request_id = None
+        self.replayed = self.rid_taken = False
+        self.rebooted = False               # set by ATAboy.call(): boot id differs from the last reply
+        if self.ext:
+            if len(raw) < 32:
+                raise TransportError("short extended reply (%d bytes)" % len(raw))
+            self.boot_id, self.state_counter, self.request_id, xf = self.EXT.unpack_from(raw, 16)
+            self.replayed, self.rid_taken = bool(xf & 1), bool(xf & 2)
+        self.payload = raw[self.hdr_len:self.hdr_len + plen]
         if len(self.payload) < plen:
             raise TransportError("truncated reply: %d of %d payload bytes" % (len(self.payload), plen))
         self.json = None
@@ -431,34 +640,87 @@ def decode_identify(raw):
 # ---------------------------------------------------------------------------
 
 class ATAboy:
-    """One ATAboy.  path = /dev/sgN or /dev/sdX (default: the first one found,
-    or the one whose USB serial number is 'serial')."""
+    """One ATAboy.  path = /dev/sgN or /dev/sdX (SG_IO) or the API serial port
+    /dev/ttyACMn; default: the first one found, or the one whose USB serial
+    number is 'serial'.  transport "auto" uses the API serial port when the
+    firmware has one and it can be opened (no root needed), else SG_IO;
+    "serial" or "sgio" insist on one."""
 
-    def __init__(self, path=None, serial=None):
-        self.info_dev = None
-        self.empty_replies = 0          # empty replies re-sent (see call())
+    def __init__(self, path=None, serial=None, transport="auto"):
+        if transport not in ("auto", "serial", "sgio"):
+            raise ValueError("transport must be auto, serial or sgio")
+        self._init_state()
         if path is None:
             self.info_dev = select_device(find_devices(), serial)
-            path = self.info_dev["sg"] or self.info_dev["block"]
-            if not path:
-                raise TransportError("ATAboy %s has no SCSI disk device" % self.info_dev["serial"])
         else:
             for d in find_devices():
-                if path in (d["sg"], d["block"]):
+                if path in (d["sg"], d["block"], d["tty"]):
                     self.info_dev = d
+        tty = None
+        if path is not None and is_tty_path(path):
+            if transport == "sgio":
+                raise TransportError("%s is a serial port; SG_IO needs /dev/sgN or /dev/sdX" % path)
+            tty = path
+        elif transport != "sgio" and self.info_dev and (path is None or transport == "serial"):
+            tty = self.info_dev["tty"]
+        if transport == "serial" and not tty:
+            raise TransportError("no ATAboy API serial port (firmware without the serial_api feature?)")
+        if tty:
+            try:
+                self.port = SerialTransport(tty)
+                self.path, self.transport = tty, "serial"
+                return
+            except (PermissionError, TransportError):
+                if transport == "serial":
+                    raise
+        if path is None or is_tty_path(path):
+            path = self.info_dev and (self.info_dev["sg"] or self.info_dev["block"])
+            if not path:
+                raise TransportError("ATAboy %s has no SCSI disk device" % (self.info_dev or {}).get("serial"))
         self.path = path
+        self.fd = self._open_sg(path)
+
+    def _init_state(self):
+        """Per-connection state (also used by tests that build an ATAboy by hand)."""
+        self.info_dev = None
+        self.fd = None                  # SG_IO file descriptor (opened lazily on the serial path)
+        self.port = None                # SerialTransport
+        self.path = None
+        self.transport = "sgio"
+        self.empty_replies = 0          # empty/lost replies re-sent (see call())
+        self.ext = None                 # firmware takes extended requests: None = not known yet
+        self.boot_id = None             # from the last extended reply
+        self.state_counter = None
+        self.reboots = 0                # boot id changes seen by this instance
+        self.last_reboot = None         # {"old_boot_id", "new_boot_id", "op"} of the latest one
+        self.on_reboot = None           # callable(dict), e.g. to warn the user
+
+    @staticmethod
+    def _open_sg(path):
         flags = os.O_RDWR if "/sg" in path else os.O_RDONLY | os.O_NONBLOCK
         try:
-            self.fd = os.open(path, flags)
+            return os.open(path, flags)
         except PermissionError:
             raise
         except OSError as e:
             raise TransportError("cannot open %s: %s" % (path, e))
 
+    def _sg(self):
+        """SG_IO file descriptor, for SAT pass-through on the serial path too."""
+        if self.fd is None:
+            path = self.info_dev and (self.info_dev["sg"] or self.info_dev["block"])
+            if not path:
+                raise TransportError("no SCSI device for this ATAboy (needed for ATA pass-through)")
+            self.fd = self._open_sg(path)
+        return self.fd
+
     def close(self):
         if self.fd is not None:
             os.close(self.fd)
             self.fd = None
+        if self.port is not None:
+            self.port.close()
+            self.port = None
 
     def __enter__(self):
         return self
@@ -466,23 +728,89 @@ class ATAboy:
     def __exit__(self, *a):
         self.close()
 
+    @property
+    def device_key(self):
+        return (self.info_dev or {}).get("serial") or self.path
+
+    def link_info(self):
+        """Transport and the device's boot id / state counter as last seen."""
+        return {"transport": self.transport, "path": self.path, "serial": (self.info_dev or {}).get("serial"),
+                "extended": bool(self.ext), "boot_id": self.boot_id, "state_counter": self.state_counter,
+                "reboots_seen": self.reboots, "last_reboot": self.last_reboot}
+
     # -- raw API call --------------------------------------------------------
 
+    def _transact(self, cdb, alloc, timeout_ms):
+        if self.port is not None:
+            return self.port.api(cdb, alloc, timeout_ms)
+        data, _ = sgio(self._sg(), cdb, SG_DXFER_FROM_DEV, length=alloc, timeout_ms=timeout_ms)
+        return data
+
+    def _note_reply(self, r, op):
+        if not r.ext:
+            return
+        key = self.device_key
+        prev = _LAST_BOOT_ID.get(key, self.boot_id)
+        if prev is not None and prev != r.boot_id:
+            r.rebooted = True
+            self.reboots += 1
+            self.last_reboot = {"old_boot_id": prev, "new_boot_id": r.boot_id, "op": op,
+                                "uptime_ms": r.uptime_ms}
+            if self.on_reboot:
+                self.on_reboot(self.last_reboot)
+        _LAST_BOOT_ID[key] = r.boot_id
+        self.boot_id, self.state_counter = r.boot_id, r.state_counter
+
+    def _send(self, cdb, alloc, timeout_ms, resend):
+        """Send a request; send it once more after an empty or lost reply when
+        that is safe (resend, or the device never ran it)."""
+        try:
+            data = self._transact(cdb, alloc, timeout_ms)
+        except ReplyLost as e:
+            if e.maybe_executed and not resend:
+                raise
+            data, resend = b"", True
+        if not data and resend:
+            # Rarely (seen once in ~500 calls, right after a mount) a reply
+            # arrives with GOOD status and no data.  Read-only ops can simply be
+            # asked again; a state-changing op is sent again with the same
+            # request id, and the firmware answers from its replay store if
+            # the first one ran.
+            self.empty_replies += 1
+            data = self._transact(cdb, alloc, timeout_ms)
+        return data
+
     def call(self, op, args=b"", alloc=4096, timeout_ms=60000, check=False):
+        """One API request.  Uses the extended header when the firmware has it;
+        a state-changing op then carries a fresh request id, so a request whose
+        reply was lost can be sent again without running twice."""
         if isinstance(op, str):
             op = OPS[op]
         args = bytes(args)[:12]
-        cdb = bytes([0xC0, op, ord("A"), ord("B")]) + args + bytes(12 - len(args))
-        data, _ = sgio(self.fd, cdb, SG_DXFER_FROM_DEV, length=alloc, timeout_ms=timeout_ms)
-        if not data and op in RETRY_EMPTY_OPS:
-            # Rarely (seen once in ~500 calls, right after a mount) a reply
-            # arrives with GOOD status and no data.  These ops only read, so
-            # asking again is safe.
-            self.empty_replies += 1
-            data, _ = sgio(self.fd, cdb, SG_DXFER_FROM_DEV, length=alloc, timeout_ms=timeout_ms)
+        args += bytes(12 - len(args))
+        ext = self.ext is not False
+        rid = 0
+        if ext and op in RID_OPS:
+            if any(args[8:12]):
+                raise ValueError("op 0x%02x arguments overlap the request id (bytes 12-15)" % op)
+            rid = random.randrange(1, 1 << 32)
+            args = args[:8] + struct.pack(">I", rid)
+        cdb = bytes([0xC0, op, ord("A"), ord("X") if ext else ord("B")]) + args
+        try:
+            data = self._send(cdb, alloc, timeout_ms, op in RETRY_EMPTY_OPS or rid != 0)
+        except ScsiCheckCondition as e:
+            if ext and self.ext is None and (e.key, e.asc, e.ascq) == (5, 0x24, 0):
+                # Firmware without the extended header refuses the signature
+                # before running anything; use basic requests from now on.
+                self.ext = False
+                return self.call(op, args[:8] if rid else args, alloc, timeout_ms, check)
+            raise
         r = Reply(data)
         if r.proto != API_PROTO:
             raise TransportError("device speaks API protocol %d, this client %d" % (r.proto, API_PROTO))
+        if ext and r.ext:
+            self.ext = True
+        self._note_reply(r, op)
         if check and not r.ok:
             raise ApiError(r)
         return r
@@ -536,7 +864,7 @@ class ATAboy:
         can spend on one READ(10) chunk, so the host doesn't abort a read the
         drive is still retrying.  Never lowers a larger existing timeout.
         Returns the timeout now in effect (s), or None when it can't be set."""
-        if not self.info_dev:
+        if not (self.info_dev and self.info_dev.get("sysfs")):
             return None
         path = self.info_dev["sysfs"] + "/timeout"
         need = self.kernel_timeout_needed(fw_timeout_ms)
@@ -555,7 +883,7 @@ class ATAboy:
         """ensure_kernel_timeout() for the device's current read_timeout_ms, which
         may come from flash or the serial menu rather than set_config().  Uses
         the config in status_json (a STATUS-shaped reply) when present."""
-        if not self.info_dev:
+        if not (self.info_dev and self.info_dev.get("sysfs")):
             return None
         cfg = status_json.get("config") if isinstance(status_json, dict) else None
         if not isinstance(cfg, dict) or "read_timeout_ms" not in cfg:
@@ -598,7 +926,7 @@ class ATAboy:
 
     def rescan(self, wait_s=5.0):
         """Ask the kernel to re-read capacity; returns the new size in sectors."""
-        if not self.info_dev:
+        if not (self.info_dev and self.info_dev.get("sysfs")):
             return None
         try:
             with open(self.info_dev["sysfs"] + "/rescan", "w") as f:
@@ -812,7 +1140,7 @@ class ATAboy:
         and then handed to rescue().  Chunks that fail are re-read sector by
         sector; unreadable sectors are marked '-'."""
         import mmap
-        if not self.info_dev:
+        if not (self.info_dev and self.info_dev.get("block")):
             raise TransportError("imaging needs the block device of a discovered ATAboy")
         st = self.status()
         if not st["mounted"]:
@@ -1066,11 +1394,11 @@ class ATAboy:
         data = b""
         try:
             if data_out is not None:
-                sgio(self.fd, cdb, SG_DXFER_TO_DEV, data=data_out, timeout_ms=timeout_ms)
+                sgio(self._sg(), cdb, SG_DXFER_TO_DEV, data=data_out, timeout_ms=timeout_ms)
             elif data_in:
-                data, _ = sgio(self.fd, cdb, SG_DXFER_FROM_DEV, length=data_in, timeout_ms=timeout_ms)
+                data, _ = sgio(self._sg(), cdb, SG_DXFER_FROM_DEV, length=data_in, timeout_ms=timeout_ms)
             else:
-                sgio(self.fd, cdb, SG_DXFER_NONE, timeout_ms=timeout_ms)
+                sgio(self._sg(), cdb, SG_DXFER_NONE, timeout_ms=timeout_ms)
         except ScsiCheckCondition as e:
             regs = parse_ata_return(e.sense)
             out["sense"] = e.sense.hex()
@@ -1829,15 +2157,19 @@ def cmd_list(args, dev):
 
 
 def cmd_info(args, dev):
-    _emit(args, dev.info(), lambda j: print("%s (%s, proto %d) built %s  board %s %s" % (
-        j["fw"], j["git"], j["proto"], j["built"], j["board"], j["board_id"])))
+    j = dev.info()
+    j["host"] = dev.link_info()
+    _emit(args, j, lambda j: print("%s (%s, proto %d) built %s  board %s %s  via %s%s" % (
+        j["fw"], j["git"], j["proto"], j["built"], j["board"], j["board_id"], j["host"]["transport"],
+        "" if j["host"]["boot_id"] is None else "  boot %08x state %d" % (j["host"]["boot_id"],
+                                                                         j["host"]["state_counter"]))))
     return EXIT_OK
 
 
 def cmd_status(args, dev):
     j = dev.status()
-    if dev.info_dev:
-        j["host"] = {k: dev.info_dev[k] for k in ("block", "sg", "scsi_timeout_s")}
+    j["host"] = {k: (dev.info_dev or {}).get(k) for k in ("block", "sg", "tty", "serial", "scsi_timeout_s")}
+    j["host"].update(dev.link_info())
     _emit(args, j, human_status)
     return EXIT_OK
 
@@ -2018,12 +2350,13 @@ def cmd_arm(args, dev):
 
 def cmd_reboot(args, dev):
     j = dev.reboot(bootsel=args.bootsel)
-    block = dev.info_dev["block"] if dev.info_dev else None
+    block = dev.info_dev.get("block") if dev.info_dev else None
+    gone = "/sys/block/" + os.path.basename(block) if block else (dev.info_dev or {}).get("tty") or None
     dev.close()
     # The firmware reboots ~200 ms after replying; don't return while the old
     # instance is still answering, or a following "wait" would talk to it.
     t0 = time.time()
-    while block and os.path.exists("/sys/block/" + os.path.basename(block)) and time.time() - t0 < 5:
+    while gone and os.path.exists(gone) and time.time() - t0 < 5:
         time.sleep(0.1)
     j["gone_after_s"] = round(time.time() - t0, 2)
     _emit(args, j, lambda j: print(j["message"]))
@@ -2042,14 +2375,15 @@ def cmd_wait(args, dev_unused):
             last_exec = time.time()
         if devs:
             try:
-                if os.geteuid() == 0:
-                    with ATAboy(devs[0]["sg"] or devs[0]["block"]) as d:
+                try:
+                    with ATAboy(serial=devs[0]["serial"] or None, transport=args.transport) as d:
                         info = d.info()
-                else:       # no root: identify from sysfs (INQUIRY revision) only
+                except PermissionError:   # no root, no serial access: sysfs (INQUIRY revision) only
                     info = {"fw": "rev " + devs[0]["rev"], "git": "run as root for details"}
                 _emit(args, {"result": "ok", "device": devs[0], "info": info,
                              "waited_s": round(time.time() - t0, 1)},
-                      lambda o: print("%s is up: %s (%s)" % (o["device"]["block"], o["info"]["fw"], o["info"]["git"])))
+                      lambda o: print("%s is up: %s (%s)" % (o["device"]["block"] or o["device"]["tty"],
+                                                            o["info"]["fw"], o["info"]["git"])))
                 return EXIT_OK
             except (TransportError, ScsiCheckCondition, OSError):
                 pass
@@ -2176,6 +2510,10 @@ def build_parser():
     p.add_argument("-j", "--json", action="store_true", default=os.environ.get("ATABOY_JSON") == "1",
                    help="machine-readable JSON output (env ATABOY_JSON=1)")
     p.add_argument("--compact", action="store_true", help="single-line JSON")
+    p.add_argument("-t", "--transport", choices=["auto", "serial", "sgio"],
+                   default=os.environ.get("ATABOY_TRANSPORT", "auto"),
+                   help="auto (default): the API serial port when it can be opened (no root needed), "
+                        "else SG_IO; serial / sgio: only that (env ATABOY_TRANSPORT)")
     p.add_argument("--no-sudo", action="store_true", help="don't re-run under sudo when not root")
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("--version", action="version", version="ataboy " + __version__)
@@ -2186,6 +2524,8 @@ def build_parser():
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("-d", "--dev", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     common.add_argument("-s", "--serial", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    common.add_argument("-t", "--transport", choices=["auto", "serial", "sgio"], default=argparse.SUPPRESS,
+                        help=argparse.SUPPRESS)
     common.add_argument("-j", "--json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     common.add_argument("--compact", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     common.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
@@ -2312,22 +2652,71 @@ def build_parser():
 
 
 NO_DEVICE_CMDS = {"list", "wait", "whatfile"}
+SG_CMDS = {"ata"}                  # SAT pass-through: SG_IO even on the serial transport
+BLOCK_CMDS = {"image"}             # read /dev/sdX directly
+
+
+def _serial_usable(args):
+    """True when this command can run without root: the API serial port is
+    there and accessible, and the command needs nothing else privileged."""
+    if args.transport == "sgio" or args.cmd in SG_CMDS:
+        return False
+    if args.dev:
+        return is_tty_path(args.dev) and os.access(args.dev, os.R_OK | os.W_OK)
+    try:
+        d = select_device(find_devices(), args.serial)
+    except TransportError:
+        return False
+    if args.cmd in BLOCK_CMDS and not (d["block"] and os.access(d["block"], os.R_OK)):
+        return False
+    return bool(d["tty"]) and os.access(d["tty"], os.R_OK | os.W_OK)
 
 
 def _maybe_sudo(args, argv):
     if os.geteuid() == 0 or args.no_sudo or args.cmd in NO_DEVICE_CMDS:
         return
+    if args.transport == "serial" or _serial_usable(args):
+        return                      # never sudo for the serial port
     script = os.path.abspath(sys.argv[0])
     extra = ["--json"] if args.json and "-j" not in argv and "--json" not in argv else []
     if args.dev is None and os.environ.get("ATABOY_DEV"):
         extra += ["--dev", os.environ["ATABOY_DEV"]]
     if os.environ.get("ATABOY_SERIAL") and args.serial == os.environ["ATABOY_SERIAL"]:
         extra += ["--serial", os.environ["ATABOY_SERIAL"]]      # sudo drops the environment
+    if os.environ.get("ATABOY_TRANSPORT") and args.transport == os.environ["ATABOY_TRANSPORT"]:
+        extra += ["--transport", os.environ["ATABOY_TRANSPORT"]]
     cmd = [sys.executable, script] + extra + argv
     if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0:
         os.execvp("sudo", ["sudo", "-n", "--"] + cmd)
     if sys.stdin.isatty():
         os.execvp("sudo", ["sudo", "--"] + cmd)
+
+
+def _boot_id_file():
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "ataboy", "boot-ids.json")
+
+
+def _load_boot_ids():
+    """Boot ids seen by earlier runs, so 'ataboy status' reports a reboot (or
+    power cycle) since the last command.  Best effort."""
+    try:
+        with open(_boot_id_file()) as f:
+            for k, v in json.load(f).items():
+                _LAST_BOOT_ID.setdefault(k, int(v))
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+
+
+def _save_boot_ids():
+    path = _boot_id_file()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "w") as f:
+            json.dump({k: v for k, v in _LAST_BOOT_ID.items() if isinstance(k, str)}, f)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
 
 
 def main(argv=None):
@@ -2338,7 +2727,11 @@ def main(argv=None):
     dev = None
     try:
         if args.cmd not in NO_DEVICE_CMDS:
-            dev = ATAboy(args.dev, serial=args.serial)
+            dev = ATAboy(args.dev, serial=args.serial, transport=args.transport)
+            _load_boot_ids()
+            dev.on_reboot = lambda e: print("ataboy: the ATAboy rebooted (boot id %08x -> %08x): settings in "
+                                            "RAM, geometry and mount state were reset" %
+                                            (e["old_boot_id"], e["new_boot_id"]), file=sys.stderr)
         return args.fn(args, dev)
     except ApiError as e:
         obj = e.reply.json if isinstance(e.reply.json, dict) else {"result": e.reply.result_name}
@@ -2346,11 +2739,12 @@ def main(argv=None):
         return EXIT_DEVICE
     except PermissionError as e:
         _emit(args, {"result": "permission_denied", "message": str(e)},
-              lambda o: print("error: %s (run as root)" % e, file=sys.stderr))
+              lambda o: print("error: %s (run as root, or get read/write access to the ATAboy API serial "
+                              "port, e.g. group dialout)" % e, file=sys.stderr))
         return EXIT_PERM
     except (TransportError, ScsiCheckCondition) as e:
         if isinstance(e, ScsiCheckCondition) and (e.key, e.asc) == (5, 0x24) and dev and dev.info_dev \
-                and not dev.info_dev["rev"].startswith("api"):
+                and dev.info_dev.get("rev") and not dev.info_dev["rev"].startswith("api"):
             e = TransportError("firmware revision '%s' does not implement the API; flash the API firmware"
                                % dev.info_dev["rev"])
         _emit(args, {"result": "transport_error", "message": str(e)},
@@ -2358,6 +2752,8 @@ def main(argv=None):
         return EXIT_TRANSPORT
     finally:
         if dev:
+            if dev.boot_id is not None:
+                _save_boot_ids()
             dev.close()
 
 

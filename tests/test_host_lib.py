@@ -9,13 +9,16 @@ result block + data).  No hardware, no root.
     python3 tests/test_host_lib.py
 """
 
+import binascii
 import importlib.machinery
 import importlib.util
 import json
 import os
+import socket
 import struct
 import sys
 import tempfile
+import threading
 import unittest
 
 sys.dont_write_bytecode = True          # no __pycache__ next to host/ataboy
@@ -58,7 +61,7 @@ def ecc_of(lba, n):
 class FakeDevice:
     """A Python model of the API firmware, answering at the sgio() boundary."""
 
-    def __init__(self, total=4096, ecc=4, read_timeout_ms=1000):
+    def __init__(self, total=4096, ecc=4, read_timeout_ms=1000, ext=False):
         self.total = total
         self.ecc = ecc
         self.bad = {}                # lba -> mode
@@ -76,24 +79,74 @@ class FakeDevice:
         self.calls = []              # (op, args) of every API call
         self.readlong_count = {}
         self.raise_on = None         # callable(op, args) -> exception to raise, or None
+        # Extended header / request ids (firmware with "ext_header"); off = older firmware
+        self.ext = ext
+        self.boot_id = 0x5EED0001
+        self.state_counter = 0
+        self.rid_store = []          # [(rid, cdb, reply)], newest last, at most RID_CACHE
+        self.replays = 0
+
+    RID_CACHE = 4
+    RID_OPS = {0x03, 0x04, 0x05, 0x10, 0x11, 0x12, 0x13, 0x14, 0x25, 0x31, 0x40, 0x41}
+
+    def reboot(self):
+        """Power cycle: new boot id, replay store and state gone."""
+        self.boot_id += 1
+        self.rid_store = []
+        self.state_counter = 0
+        self.mounted = False
+        self.uptime = 500
 
     # -- transport ------------------------------------------------------------
 
     def sgio(self, fd, cdb, direction, data=None, length=0, timeout_ms=60000):
-        cdb = bytes(cdb)
-        if len(cdb) != 16 or cdb[0] != 0xC0 or cdb[2:4] != b"AB" or length < 256:
-            raise ab.ScsiCheckCondition(bytes([0x70, 0, 5, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0x24, 0]))
         assert direction == ab.SG_DXFER_FROM_DEV
-        op, a = cdb[1], cdb[4:16]
+        reply = self.handle(bytes(cdb), length)
+        return reply, length - len(reply)
+
+    def handle(self, cdb, length):
+        """One API request, as api_dispatch() handles it: reply bytes, or
+        ScsiCheckCondition for a malformed CDB."""
+        sig_ok = cdb[2:4] == b"AB" or (self.ext and cdb[2:4] == b"AX")
+        if len(cdb) != 16 or cdb[0] != 0xC0 or not sig_ok or length < 256:
+            raise ab.ScsiCheckCondition(bytes([0x70, 0, 5, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0x24, 0]))
+        if cdb[3] == ord("B"):
+            return self.execute(cdb[1], cdb[4:16], length)
+        op, a, rid, xf = cdb[1], cdb[4:16], 0, 0
+        if op in self.RID_OPS:
+            rid, = struct.unpack(">I", a[8:12])
+            a, xf = a[:8] + bytes(4), 2
+        for r_id, r_cdb, r_reply in self.rid_store:
+            if rid and r_id == rid:
+                if r_cdb != cdb:
+                    self.uptime += 10
+                    return self.wrap(self.jreply(op, R["request_id_conflict"], message="request id reused"), rid, xf)
+                self.replays += 1
+                out = bytearray(r_reply)
+                out[28] |= 1
+                return bytes(out)
+        reply = self.wrap(self.execute(op, a, length - 16), rid, xf)
+        if rid:
+            self.rid_store = (self.rid_store + [(rid, cdb, reply)])[-self.RID_CACHE:]
+        return reply
+
+    def wrap(self, basic, rid, xf):
+        hdr = bytearray(basic[:16])
+        hdr[13] = 32
+        return bytes(hdr) + struct.pack(">IIIB3x", self.boot_id, self.state_counter, rid, xf) + basic[16:]
+
+    def execute(self, op, a, length):
         self.calls.append((op, a))
         if self.raise_on:
             exc = self.raise_on(op, a)
             if exc is not None:
                 raise exc
         self.uptime += 10
+        if op in self.RID_OPS:
+            self.state_counter += 1
         reply = self.dispatch(op, a, length)
         assert len(reply) <= length, "reply %d > allocation %d" % (len(reply), length)
-        return reply, length - len(reply)
+        return reply
 
     # -- reply builders -------------------------------------------------------
 
@@ -282,12 +335,14 @@ class FakeDevice:
         return self.reply(op, 0, ab.CT_BINARY, blk)
 
 
-def make_dev(fake, info_dev=None):
+def make_dev(fake, info_dev=None, port=None):
     dev = object.__new__(ab.ATAboy)
+    dev._init_state()
     dev.fd = -1
     dev.info_dev = info_dev
     dev.path = "/dev/fake"
-    dev.empty_replies = 0
+    if port is not None:
+        dev.port, dev.transport = port, "serial"
     return dev
 
 
@@ -893,11 +948,319 @@ class EmptyReplyTest(HostTestCase):
         self.assertEqual(self.dev.empty_replies, 1)
 
     def test_state_changing_op_is_not_resent(self):
+        self.dev.ext = False                    # firmware without request ids
         self.blank_first({ab.OPS["mount"]})
         with self.assertRaises(ab.TransportError):
             self.dev.call("mount")
         self.assertEqual(self.dev.empty_replies, 0)
         self.assertEqual(sum(1 for op, _ in self.fake.calls if op == ab.OPS["mount"]), 1)
+
+class FakeSerialFirmware(threading.Thread):
+    """The firmware side of the API serial port (api_serial.c + apiframe.c),
+    on one end of a socketpair: parses request frames, runs them through a
+    FakeDevice and answers with response frames.  Hooks inject faults."""
+
+    def __init__(self, fake, sock):
+        super().__init__(daemon=True)
+        self.fake, self.sock = fake, sock
+        self.buf = b""
+        self.corrupt_next = 0        # flip a bit in the next N responses
+        self.drop_next = 0           # run the next N requests but send nothing back
+        self.bad_frame_next = 0      # pretend the next N requests arrived corrupted (not run)
+        self.junk_before = b""       # sent before every response
+        self.stale_before = False    # send a response with an old tag first
+        self.frames = 0
+
+    def run(self):
+        try:
+            while True:
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    return
+                self.buf += chunk
+                while self.parse_one():
+                    pass
+        except OSError:
+            return
+
+    def parse_one(self):
+        i = self.buf.find(b"\xa5Q")
+        if i < 0:
+            self.buf = self.buf[-1:]
+            return False
+        self.buf = self.buf[i:]
+        if len(self.buf) < 10:
+            return False
+        _, _, ver, _, tag, alloc, n = struct.unpack(">BBBBHHH", self.buf[:10])
+        if len(self.buf) < 10 + n + 4:
+            return False
+        f, self.buf = self.buf[:10 + n + 4], self.buf[10 + n + 4:]
+        self.frames += 1
+        if binascii.crc32(f[:-4]) & 0xFFFFFFFF != struct.unpack(">I", f[-4:])[0] or ver != 1:
+            self.send(ab.frame_response(tag, ab.ST_BAD_FRAME))
+            return True
+        if self.bad_frame_next:
+            self.bad_frame_next -= 1
+            self.send(ab.frame_response(tag, ab.ST_BAD_FRAME))
+            return True
+        try:
+            body, status = self.fake.handle(f[10:10 + 16], alloc or 4096), ab.ST_OK
+        except ab.ScsiCheckCondition as e:
+            body, status = bytes([e.key, e.asc, e.ascq]), ab.ST_CHECK
+        out = ab.frame_response(tag, status, body)
+        if self.drop_next:
+            self.drop_next -= 1
+            return True
+        if self.corrupt_next:
+            self.corrupt_next -= 1
+            out = bytearray(out)
+            out[12] ^= 0x10
+            out = bytes(out)
+        if self.stale_before:
+            self.send(ab.frame_response((tag - 1) & 0xFFFF, ab.ST_OK, body))
+        self.send(self.junk_before + out)
+        return True
+
+    def send(self, data):
+        self.sock.sendall(data)
+
+
+class SerialTestCase(HostTestCase):
+    """The host library over the serial framing, against the simulated firmware."""
+
+    def setUp(self):
+        super().setUp()
+        ab.sgio = self._no_sgio
+        self.fake.ext = True
+        a, b = socket.socketpair()
+        a.setblocking(False)
+        self.host_sock, self.fw_sock = a, b
+        self.fw = FakeSerialFirmware(self.fake, b)
+        self.fw.start()
+        self.port = ab.SerialTransport(fd=a.fileno())
+        self.dev = make_dev(self.fake, port=self.port)
+        self.dev.info_dev = {"serial": "TESTUNIT%d" % id(self), "block": None, "sg": None,
+                             "tty": "/dev/fake-tty", "sysfs": None}
+
+    def tearDown(self):
+        self.host_sock.close()
+        self.fw_sock.close()
+        self.fw.join(1)
+        super().tearDown()
+
+    @staticmethod
+    def _no_sgio(*a, **k):
+        raise AssertionError("SG_IO used on the serial path")
+
+    def count(self, op):
+        return sum(1 for o, _ in self.fake.calls if o == ab.OPS[op])
+
+
+class TestSerialTransport(SerialTestCase):
+    def test_frames_round_trip(self):
+        f = ab.frame_request(0x1234, bytes(range(16)), alloc=512)
+        self.assertEqual(f[:10], bytes([0xA5, ord("Q"), 1, 0, 0x12, 0x34, 0x02, 0x00, 0, 16]))
+        self.assertEqual(struct.unpack(">I", f[-4:])[0], binascii.crc32(f[:-4]) & 0xFFFFFFFF)
+        self.assertEqual(ab.frame_request(1, bytes(16), alloc=8192)[6:8], b"\0\0")   # 0 = 4096
+
+    def test_status_and_read_over_serial(self):
+        st = self.dev.status()
+        self.assertEqual(st["geometry"]["sectors"], self.fake.total)
+        r = self.dev.read(10, 7)
+        self.assertTrue(r.ok)
+        self.assertEqual(r.data, b"".join(sector(10 + i) for i in range(7)))
+        self.assertTrue(self.dev.ext)
+        self.assertEqual(self.dev.boot_id, self.fake.boot_id)
+
+    def test_check_condition_is_relayed(self):
+        with self.assertRaises(ab.ScsiCheckCondition) as cm:
+            self.dev.call("status", alloc=100)
+        self.assertEqual((cm.exception.key, cm.exception.asc), (5, 0x24))
+
+    def test_junk_and_stale_frames_skipped(self):
+        self.fw.junk_before = b"AT\r\n\xa5\xa5R\x07"
+        self.fw.stale_before = True
+        for _ in range(3):
+            self.assertTrue(self.dev.call("status").ok)
+        self.assertEqual(self.port.stale_frames, 3)
+
+    def test_corrupt_reply_resends_read_only(self):
+        self.fw.corrupt_next = 1
+        self.assertTrue(self.dev.call("status").ok)
+        self.assertEqual(self.dev.empty_replies, 1)
+        self.assertEqual(self.count("status"), 2)
+
+    def test_corrupt_reply_state_change_runs_once(self):
+        self.fw.corrupt_next = 1
+        r = self.dev.mount(rescan=False)
+        self.assertTrue(r.ok and r.replayed and r.rid_taken)
+        self.assertEqual(self.count("mount"), 1)
+        self.assertEqual(self.fake.replays, 1)
+
+    def test_lost_reply_state_change_runs_once(self):
+        self.fw.drop_next = 1
+        self.port.SLACK_S = 0.0
+        r = self.dev.call("unmount", timeout_ms=200)
+        self.assertTrue(r.ok and r.replayed)
+        self.assertEqual(self.count("unmount"), 1)
+
+    def test_request_corrupted_on_the_way_is_resent(self):
+        self.fw.bad_frame_next = 1
+        self.dev.ext = None
+        self.assertTrue(self.dev.call("mount").ok)
+        self.assertEqual(self.count("mount"), 1)
+        self.assertEqual(self.fake.replays, 0)
+
+    def test_two_losses_give_up(self):
+        self.fw.drop_next = 2
+        self.port.SLACK_S = 0.0
+        with self.assertRaises(ab.ReplyLost):
+            self.dev.call("status", timeout_ms=100)
+
+
+class TestRequestIds(HostTestCase):
+    def setUp(self):
+        super().setUp()
+        self.fake.ext = True
+
+    def test_ids_only_on_state_changing_ops(self):
+        seen = []
+        real = self.fake.handle
+        def handle(cdb, length):
+            seen.append(bytes(cdb))
+            return real(cdb, length)
+        self.fake.handle = handle
+        self.dev.status()
+        self.dev.set_config("no_retry", 1)
+        self.dev.set_config("no_retry", 1)
+        self.assertEqual([c[2:4] for c in seen], [b"AX"] * 3)
+        self.assertEqual(seen[0][12:16], bytes(4))
+        ids = [struct.unpack(">I", c[12:16])[0] for c in seen[1:]]
+        self.assertTrue(all(ids) and ids[0] != ids[1])          # a fresh id per call
+        self.assertEqual(self.fake.calls[-1][1][8:12], bytes(4))   # the op never sees the id
+
+    def test_empty_reply_state_change_resent_with_same_id(self):
+        state = {"n": 0, "cdbs": []}
+        real = self.fake.handle
+        def handle(cdb, length):
+            state["cdbs"].append(bytes(cdb))
+            reply = real(cdb, length)
+            if cdb[1] == ab.OPS["mount"] and state["n"] == 0:
+                state["n"] += 1
+                return b""                     # it ran, but the reply got lost
+            return reply
+        self.fake.handle = handle
+        r = self.dev.mount(rescan=False)
+        self.assertTrue(r.ok and r.replayed)
+        self.assertEqual(state["cdbs"][0], state["cdbs"][1])
+        self.assertEqual(sum(1 for o, _ in self.fake.calls if o == ab.OPS["mount"]), 1)
+        self.assertEqual(self.dev.empty_replies, 1)
+
+    def test_conflict(self):
+        cdb = bytes([0xC0, 0x12, ord("A"), ord("X")]) + bytes(8) + b"\x00\x00\x00\x09"
+        self.assertEqual(ab.Reply(self.fake.handle(cdb, 4096)).result_name, "ok")
+        other = bytes([0xC0, 0x13, ord("A"), ord("X")]) + bytes(8) + b"\x00\x00\x00\x09"
+        r = ab.Reply(self.fake.handle(other, 4096))
+        self.assertEqual(r.result_name, "request_id_conflict")
+        self.assertTrue(r.ext and r.request_id == 9)
+
+    def test_old_firmware_falls_back_to_basic(self):
+        self.fake.ext = False
+        r = self.dev.mount(rescan=False)
+        self.assertTrue(r.ok and not r.ext and r.boot_id is None)
+        self.assertIs(self.dev.ext, False)
+        self.dev.status()
+        self.assertEqual(sum(1 for o, _ in self.fake.calls if o == ab.OPS["mount"]), 1)
+
+    def test_reboot_detected(self):
+        seen = []
+        self.dev.info_dev = {"serial": "REBOOTUNIT"}
+        self.dev.on_reboot = seen.append
+        r1 = self.dev.call("status")
+        self.assertFalse(r1.rebooted)
+        self.fake.reboot()
+        r2 = self.dev.call("status")
+        self.assertTrue(r2.rebooted)
+        self.assertEqual(self.dev.reboots, 1)
+        self.assertEqual(seen[0]["old_boot_id"], r1.boot_id)
+        self.assertEqual(seen[0]["new_boot_id"], r2.boot_id)
+        # a new instance in the same process notices a reboot since the last one too
+        other = make_dev(self.fake)
+        other.info_dev = {"serial": "REBOOTUNIT"}
+        self.fake.reboot()
+        self.assertTrue(other.call("status").rebooted)
+
+    def test_state_counter(self):
+        a = self.dev.call("status").state_counter
+        self.dev.mount(rescan=False)
+        b = self.dev.call("status").state_counter
+        self.assertGreater(b, a)
+        self.assertEqual(self.dev.link_info()["state_counter"], b)
+
+
+class TestTransportChoice(unittest.TestCase):
+    """ATAboy() picks serial when the API port opens, else SG_IO."""
+
+    def setUp(self):
+        self._orig = (ab.find_devices, ab.SerialTransport, ab.ATAboy._open_sg)
+        self.dev_entry = {"block": "/dev/sdz", "sg": "/dev/sg9", "tty": "/dev/ttyACM7", "serial": "U1"}
+        ab.find_devices = lambda *a, **k: [dict(self.dev_entry)]
+        ab.ATAboy._open_sg = staticmethod(lambda path: 99)
+        self.serial_error = None
+        test = self
+
+        class Port:
+            def __init__(self, path):
+                if test.serial_error:
+                    raise test.serial_error
+                self.path = path
+
+            def close(self):
+                pass
+        ab.SerialTransport = Port
+
+    def tearDown(self):
+        ab.find_devices, ab.SerialTransport, ab.ATAboy._open_sg = self._orig
+
+    def test_auto_prefers_serial(self):
+        d = ab.ATAboy()
+        self.assertEqual((d.transport, d.path, d.fd), ("serial", "/dev/ttyACM7", None))
+
+    def test_auto_falls_back_when_no_permission(self):
+        self.serial_error = PermissionError("denied")
+        d = ab.ATAboy()
+        self.assertEqual((d.transport, d.path, d.fd), ("sgio", "/dev/sg9", 99))
+
+    def test_serial_insists(self):
+        self.serial_error = PermissionError("denied")
+        with self.assertRaises(PermissionError):
+            ab.ATAboy(transport="serial")
+        self.dev_entry["tty"] = None
+        self.serial_error = None
+        with self.assertRaises(ab.TransportError):
+            ab.ATAboy(transport="serial")
+
+    def test_no_sudo_when_serial_usable(self):
+        with tempfile.NamedTemporaryFile() as tty:
+            self.dev_entry["tty"] = tty.name
+            parse = ab.build_parser().parse_args
+            self.assertTrue(ab._serial_usable(parse(["status"])))
+            self.assertFalse(ab._serial_usable(parse(["--transport", "sgio", "status"])))
+            self.assertFalse(ab._serial_usable(parse(["ata", "0xEC", "--read", "1"])))   # SAT needs SG_IO
+            self.assertFalse(ab._serial_usable(parse(["image", "x.img"])))               # /dev/sdz unreadable
+            os.chmod(tty.name, 0)
+            if os.geteuid() != 0:
+                self.assertFalse(ab._serial_usable(parse(["status"])))
+        self.dev_entry["tty"] = None
+        self.assertFalse(ab._serial_usable(ab.build_parser().parse_args(["status"])))
+
+    def test_sgio_and_explicit_paths(self):
+        self.assertEqual(ab.ATAboy(transport="sgio").transport, "sgio")
+        self.assertEqual(ab.ATAboy("/dev/sg9").transport, "sgio")
+        self.assertEqual(ab.ATAboy("/dev/ttyACM7").transport, "serial")
+        with self.assertRaises(ab.TransportError):
+            ab.ATAboy("/dev/ttyACM7", transport="sgio")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
