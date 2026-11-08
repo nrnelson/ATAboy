@@ -222,6 +222,10 @@ OPS = {
     "arm": 0x40, "reboot": 0x41,
 }
 
+# Read-only ops that may be re-sent if a reply comes back empty.
+RETRY_EMPTY_OPS = {OPS[k] for k in ("info", "status", "config_get", "identify",
+                                    "read", "read_long", "verify", "log")}
+
 CONFIG_KEYS = {
     "write_protect": (1, "bool"), "auto_mount": (2, "bool"), "iordy": (3, "bool"),
     "intrq": (4, "bool"), "read_timeout_ms": (5, "int"), "write_timeout_ms": (6, "int"),
@@ -383,6 +387,7 @@ class ATAboy:
 
     def __init__(self, path=None):
         self.info_dev = None
+        self.empty_replies = 0          # empty replies re-sent (see call())
         if path is None:
             devs = find_devices()
             if not devs:
@@ -421,6 +426,12 @@ class ATAboy:
         args = bytes(args)[:12]
         cdb = bytes([0xC0, op, ord("A"), ord("B")]) + args + bytes(12 - len(args))
         data, _ = sgio(self.fd, cdb, SG_DXFER_FROM_DEV, length=alloc, timeout_ms=timeout_ms)
+        if not data and op in RETRY_EMPTY_OPS:
+            # Rarely (seen once in ~500 calls, right after a mount) a reply
+            # arrives with GOOD status and no data.  These ops only read, so
+            # asking again is safe.
+            self.empty_replies += 1
+            data, _ = sgio(self.fd, cdb, SG_DXFER_FROM_DEV, length=alloc, timeout_ms=timeout_ms)
         r = Reply(data)
         if r.proto != API_PROTO:
             raise TransportError("device speaks API protocol %d, this client %d" % (r.proto, API_PROTO))

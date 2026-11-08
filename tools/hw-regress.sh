@@ -37,10 +37,11 @@ echo "firmware: $(echo "$info" | jq_ 'd["fw"], d["git"]')"
 check "status answers" "$A" -j status
 
 # --- detect / mount -----------------------------------------------------------
+"$A" unmount >/dev/null 2>&1   # detect refuses while mounted
 if "$A" -j detect --mount >"$work/out" 2>&1; then pass "detect + mount"
 else
     fail "detect + mount"; sed 's/^/      /' "$work/out" | head -5
-    echo "no drive answering: attach and power a drive, then re-run"; exit $fails
+    echo "detect failed (see above): check the drive is attached and powered"; exit $fails
 fi
 st=$("$A" -j status)
 sectors=$(echo "$st" | jq_ 'd["geometry"]["sectors"]')

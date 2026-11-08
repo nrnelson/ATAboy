@@ -287,6 +287,7 @@ def make_dev(fake, info_dev=None):
     dev.fd = -1
     dev.info_dev = info_dev
     dev.path = "/dev/fake"
+    dev.empty_replies = 0
     return dev
 
 
@@ -776,6 +777,31 @@ class TestMisc(HostTestCase):
             self.dev.image(self.path("x.img"))
         self.assertEqual(cm.exception.reply.result_name, "not_mounted")
 
+
+
+class EmptyReplyTest(HostTestCase):
+    def blank_first(self, ops):
+        real, state = self.fake.sgio, {"n": 0}
+        def sgio(fd, cdb, direction, data=None, length=0, timeout_ms=60000):
+            if cdb[1] in ops and state["n"] == 0:
+                state["n"] += 1
+                self.fake.calls.append((cdb[1], bytes(cdb[4:16])))
+                return b"", length
+            return real(fd, cdb, direction, data, length, timeout_ms)
+        ab.sgio = sgio
+
+    def test_read_only_op_is_resent(self):
+        self.blank_first({ab.OPS["status"]})
+        r = self.dev.call("status")
+        self.assertTrue(r.ok)
+        self.assertEqual(self.dev.empty_replies, 1)
+
+    def test_state_changing_op_is_not_resent(self):
+        self.blank_first({ab.OPS["mount"]})
+        with self.assertRaises(ab.TransportError):
+            self.dev.call("mount")
+        self.assertEqual(self.dev.empty_replies, 0)
+        self.assertEqual(sum(1 for op, _ in self.fake.calls if op == ab.OPS["mount"]), 1)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
