@@ -649,6 +649,14 @@ class ATAboy:
             if r.ok and r.done == 0:
                 break               # no progress and no error: don't spin; next_lba says where
             cur += min(r.done, n)
+            if r.ide_result in ("not_ready", "bus_fault"):
+                # The drive isn't answering at all (absent, unpowered, hung):
+                # this is not a bad sector, and skipping ahead would only spin.
+                return {"result": r.ide_result, "start": lba, "count": count,
+                        "scanned": cur - lba, "next_lba": cur, "complete": False,
+                        "bad": bad, "bad_lbas": [b["lba"] for b in bad],
+                        "status": r.status, "seconds": round(time.time() - t0, 1),
+                        "requests": requests}
             if r.result != "ok":
                 bad.append({"lba": cur, "status": r.status, "error": r.error,
                             "error_bits": bits(r.error, ER_BITS), "ide_result": r.ide_result})

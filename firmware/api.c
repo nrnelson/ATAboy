@@ -633,6 +633,7 @@ static int32_t op_verify(uint8_t *buf, uint32_t cap, const uint8_t *a) {
         r = verify_chunk(&c, lba + done, n, tmo);
         if (r == IDE_OK) { done += n; continue; }
         if (r == IDE_PROTOCOL && c.command == 0) break;          // address not expressible
+        if (r == IDE_NOT_READY || r == IDE_BUS_FAULT) break;     // no drive answering: localizing is pointless
 
         uint32_t fl;
         if (ide_cmd_result_lba(&c, &fl) && fl >= lba + done && fl < lba + done + n) {
