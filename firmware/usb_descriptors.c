@@ -1,4 +1,5 @@
 #include "tusb.h"
+#include "pico/unique_id.h"
 #include <string.h>
 
 #define USB_VID   0xCafe
@@ -59,7 +60,7 @@ char const *string_desc_arr[] = {
     (const char[]){0x09, 0x04},   // 0: English
     "Obsolete Tech",               // 1: Manufacturer
     "ATAboy",                      // 2: Product
-    "654321",                      // 3: Serial
+    NULL,                          // 3: Serial: the chip's unique board id (below)
     "ATAboy CDC",                  // 4: CDC Interface
     "ATAboy Storage",              // 5: MSC Interface
 };
@@ -75,7 +76,15 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
         chr_count = 1;
     } else {
         if (!(index < sizeof(string_desc_arr) / sizeof(string_desc_arr[0]))) return NULL;
+        // Every unit used to report "654321", so a host could not tell two
+        // ATAboys apart.  The RP2350's unique board id (16 hex digits) is the
+        // same on every power-up and different on every unit.
+        char serial[2 * PICO_UNIQUE_BOARD_ID_SIZE_BYTES + 1];
         const char *str = string_desc_arr[index];
+        if (index == 3) {
+            pico_get_unique_board_id_string(serial, sizeof(serial));
+            str = serial;
+        }
         chr_count = strlen(str);
         if (chr_count > 31) chr_count = 31;
         for (uint8_t i = 0; i < chr_count; i++) _desc_str[1 + i] = str[i];
