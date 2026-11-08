@@ -462,6 +462,9 @@ static int32_t op_config_set(uint8_t *buf, uint32_t cap, const uint8_t *a) {
 static const char *mount_message(int r) {
     switch (r) {
     case R_NO_GEOMETRY:  return "detect or set geometry first";
+    case R_NO_DRIVE:     return "no drive answers on the bus (force to mount anyway)";
+    case R_NOT_READY:    return "drive not ready (BSY, or no DRDY) after 3 s; check power and cabling "
+                                "(force to mount anyway)";
     case R_GEO_MISMATCH: return "the geometry was set up for another drive (see geometry.owner); "
                                 "detect again, or force to mount anyway";
     default:             return NULL;

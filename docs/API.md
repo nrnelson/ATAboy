@@ -182,7 +182,12 @@ when the geometry was forced without IDENTIFY data or saved by older
 firmware). MOUNT (and DETECT with bit1, the menu's Mount, and Auto Mount at
 power-up) checks, unless forced:
 
-1. If the drive hasn't been identified since power-up (and wasn't forced),
+1. Something answers on the bus (status not FFh), else `no_drive`.
+2. The drive is ready (BSY clear, DRDY set) within 3 s, else `not_ready`.
+   USB reads need DRDY; a drive that never gets ready would make each of
+   them wait out a 5 s timeout, which stalls core 0's USB task and with it
+   the serial menu.
+3. If the drive hasn't been identified since power-up (and wasn't forced),
    it is sent IDENTIFY. If IDENTIFY then shows a different model or serial
    than `geometry.owner`, the result is `geometry_mismatch`. With no owner
    recorded, geometry that came from IDENTIFY (normal, large, lba) must

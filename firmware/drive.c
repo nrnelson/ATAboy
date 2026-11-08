@@ -218,11 +218,38 @@ int drive_detect(uint8_t only_dev, uint8_t geo_mode, uint16_t c, uint8_t h, uint
     return r;
 }
 
-// Before exposing the drive, the geometry must belong to it.  A drive not
+#define MOUNT_READY_MS 3000
+
+// Before exposing the drive: something must answer on the bus, it must be
+// ready within MOUNT_READY_MS (a drive that never gets ready would stall
+// every USB read, and with it the serial menu), and the geometry must
+// belong to it.  A drive not
 // identified since boot is asked for IDENTIFY first, so a mount straight
 // after power-up compares the saved geometry with the drive really attached.
 static int mount_checks(void) {
     ide_lock();
+    uint8_t dev = ide_selected_device();
+    ide_write_reg(6, dev);
+    busy_wait_us_32(50);
+    uint8_t st = ide_read_alt_status();
+    if (st == 0xFF) {                                 // floating bus
+        drive.present = false;
+        ide_unlock();
+        return R_NO_DRIVE;
+    }
+    // USB reads are issued with IDE_F_NEED_DRDY: without BSY=0 + DRDY=1 every
+    // one of them would wait out its 5 s ready timeout and fail.
+    uint32_t t0 = to_ms_since_boot(get_absolute_time());
+    while ((st & (ATA_ST_BSY | ATA_ST_DRDY)) != ATA_ST_DRDY) {
+        if (to_ms_since_boot(get_absolute_time()) - t0 >= MOUNT_READY_MS) {
+            ide_unlock();
+            return R_NOT_READY;
+        }
+        busy_wait_us_32(1000);
+        st = ide_read_alt_status();
+    }
+    drive.present = true;
+
     if (!drive.identified && !drive.forced) {
         uint16_t id[256];
         ide_cmd_t ic = {0};

@@ -81,6 +81,7 @@ class FakeDevice:
         self.settings = {"load": "ok", "field": None}
         self.owner = {"model": "FAKE DRIVE", "serial": "1"}
         self.model, self.serial = "FAKE DRIVE", "1"
+        self.ready = True            # BSY clear + DRDY within the mount check's 3 s
 
     # -- transport ------------------------------------------------------------
 
@@ -169,6 +170,8 @@ class FakeDevice:
         """Firmware mount checks (drive_mount_ex): owner mismatch refuses unless forced."""
         if not self.geometry_valid:
             return R["no_geometry"], "detect or set geometry first"
+        if not force and not self.mounted and not self.ready:
+            return R["not_ready"], "drive not ready (BSY, or no DRDY) after 3 s"
         if not force and not self.mounted and self.identity() == "mismatch":
             return R["geometry_mismatch"], "the geometry was set up for another drive"
         self.mounted = True
@@ -896,6 +899,13 @@ class TestGeometryOwner(HostTestCase):
         r = self.dev.detect(mount=True)
         self.assertTrue(r.ok)
         self.assertEqual(r.json["geometry"]["owner"]["model"], "WDC WD10EZEX-00BN5A0")
+
+    def test_not_ready_drive_is_not_mounted(self):
+        self.fake.ready = False
+        r = self.dev.mount(rescan=False)
+        self.assertEqual(r.result_name, "not_ready")
+        self.assertFalse(self.fake.mounted)
+        self.assertTrue(self.dev.mount(rescan=False, force=True).ok)
 
     def test_human_status_shows_mismatch(self):
         self.swap_drive()

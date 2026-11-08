@@ -1056,7 +1056,7 @@ void core1_entry(void) {
                     else {
                         current_screen = SCREEN_MAIN;
                         show_notice(r == R_NO_DRIVE ? "No drive answers: not mounted" :
-                                    r == R_NOT_READY ? "Drive stays busy - check power" : "Mount failed");
+                                    r == R_NOT_READY ? "Drive not ready - check power" : "Mount failed");
                         trigger_overlay = true;
                     }
                 }
