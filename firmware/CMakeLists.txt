@@ -46,6 +46,10 @@ add_executable(ATAboy
         sense.c
         json.c
         api.c
+        crc32.c
+        rid_cache.c
+        apiframe.c
+        api_serial.c
         menus.c
         usb.c
         msc_rw.c
@@ -96,6 +100,7 @@ target_link_libraries(ATAboy
         hardware_sha256
         pico_bootrom
         pico_unique_id
+        pico_rand
         tinyusb_device
         tinyusb_board
         )

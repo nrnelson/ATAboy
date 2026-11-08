@@ -2,7 +2,9 @@
 #define _TUSB_CONFIG_H_
 
 #define CFG_TUSB_RHPORT0_MODE    OPT_MODE_DEVICE
-#define CFG_TUD_CDC              1
+// Two CDC serial ports: instance 0 = setup UI (interface 0), instance 1 =
+// the API port (interface 3).  The buffer sizes below apply to each.
+#define CFG_TUD_CDC              2
 #define CFG_TUD_MSC              1
 // MSC buffer = sectors per ATA command on the USB-disk path.  Measured
 // imaging a CHS drive over full-speed USB: 4 KiB 464 kB/s, 8 KiB 425 kB/s,

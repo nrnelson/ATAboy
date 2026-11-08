@@ -22,9 +22,19 @@ static uint8_t *msc_buf = NULL;
 static uint32_t poison_seq = 0;
 static const char poison_magic[12] = "ATABOY-NODAT";
 
-void usbbuf_note(uint8_t *buf) { if (buf) msc_buf = buf; }
+static volatile bool     msc_active = false;
+static volatile uint32_t msc_seq = 0;
+
+void usbbuf_note(uint8_t *buf) {
+    if (buf) msc_buf = buf;
+    msc_active = true;
+    msc_seq++;
+}
+
+bool usbbuf_msc_active(uint32_t *seq) { *seq = msc_seq; return msc_active; }
 
 void usbbuf_poison(void) {
+    msc_active = false;
     if (!msc_buf) return;
     poison_seq++;
     memcpy(msc_buf, poison_magic, 12);
