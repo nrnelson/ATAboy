@@ -23,6 +23,9 @@
 > smartctl -d sat -a /dev/sdX           # standard tools via SAT ATA pass-through
 > ```
 >
+> To make `smartctl` work without `-d sat`, install the drive database entry:
+> `sudo cp tools/smart_drivedb.h /etc/smart_drivedb.h`.
+>
 > Changes for recovery use: the read timeout is adjustable and persistent (stock
 > resets the drive after 1 s, mid-retry), real ATA errors reach the host instead
 > of "medium not present", failed sectors can be read through the error, and the
