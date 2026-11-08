@@ -849,7 +849,8 @@ class ATAboy:
         if key == "read_timeout_ms":
             self.ensure_kernel_timeout(v)
         if key == "write_protect" and j.get("config") and self.info_dev:
-            self.rescan(wait_s=1.0)       # kernel re-reads the WP bit (sysfs ro)
+            # wait until the kernel shows the new WP bit (sysfs ro)
+            self.rescan(wait_s=3.0, want_ro=bool(j["config"].get("write_protect")))
         return j["config"]
 
     def save(self):
@@ -936,29 +937,33 @@ class ATAboy:
             self.rescan()
         return r
 
-    def rescan(self, wait_s=5.0):
-        """Ask the kernel to re-read capacity; returns the new size in sectors."""
-        if not (self.info_dev and self.info_dev.get("sysfs")):
+    def rescan(self, wait_s=5.0, want_ro=None):
+        """Get the kernel to notice a mount/unmount or write-protect change and
+        wait until it has; returns the new size in sectors.  Writing sysfs
+        'rescan' needs root; without it (serial transport as a normal user) the
+        kernel still notices on its own via media-event polling (~1-2 s), so
+        just wait for /sys/block/X/size (and ro, if want_ro is given)."""
+        if not (self.info_dev and self.info_dev.get("sysfs") and self.info_dev.get("block")):
             return None
-        try:
-            with open(self.info_dev["sysfs"] + "/rescan", "w") as f:
-                f.write("1")
-        except OSError:
-            return None
-        blk = "/sys/block/" + os.path.basename(self.info_dev["block"]) + "/size"
-        t0 = time.time()
-        size = int(_read(blk) or 0)
-        st = self.status()
-        want = st["geometry"]["sectors"] if st["mounted"] else 0
-        while size != want and time.time() - t0 < wait_s:
-            time.sleep(0.25)
+        def poke():
             try:
                 with open(self.info_dev["sysfs"] + "/rescan", "w") as f:
                     f.write("1")
             except OSError:
-                pass
-            size = int(_read(blk) or 0)
-        return size
+                pass                      # not root: rely on the kernel's own polling
+        base = "/sys/block/" + os.path.basename(self.info_dev["block"])
+        st = self.status()
+        want = st["geometry"]["sectors"] if st["mounted"] else 0
+        def done():
+            if int(_read(base + "/size") or 0) != want:
+                return False
+            return want_ro is None or not want or (_read(base + "/ro") or "").strip() == str(int(want_ro))
+        t0 = time.time()
+        poke()
+        while not done() and time.time() - t0 < wait_s:
+            time.sleep(0.25)
+            poke()
+        return int(_read(base + "/size") or 0)
 
     def reset(self, hard=False):
         # firmware worst case: 31 s wait + RESET-line fallback with another 31 s
