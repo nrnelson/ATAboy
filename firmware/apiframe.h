@@ -65,4 +65,27 @@ bool     af_rx_idle(const af_rx_t *rx);
 // AF_HDR_LEN: writes the header and the CRC.  Returns the frame length.
 uint32_t af_response(uint8_t *frame, uint16_t tag, uint8_t status, uint32_t body_len);
 
+// --- Host side (the firmware doesn't call these; the host library does) ---
+
+// Build a request frame for a 16-byte CDB with no data-out into frame
+// (AF_HDR_LEN + AF_CDB_LEN + AF_CRC_LEN bytes).  alloc >= AF_MAX_BODY is sent
+// as 0 (= AF_MAX_BODY).  Returns the frame length.
+uint32_t af_request(uint8_t *frame, uint16_t tag, uint32_t alloc, const uint8_t cdb[AF_CDB_LEN]);
+
+typedef struct {
+    uint8_t        status;    // AF_ST_*
+    uint16_t       tag;
+    const uint8_t *body;      // points into the scanned buffer
+    uint16_t       len;
+    bool           crc_ok;
+} af_frame_t;
+
+// Look for the next response frame at the start of buf[0..n).  Returns how
+// many bytes the caller should drop from the front of its buffer:
+//  - *found true: a whole frame was there (f is set; check f->crc_ok); the
+//    return value covers the frame and anything before it.
+//  - *found false: the return value is garbage that can't start a frame;
+//    keep the rest and read more.
+size_t af_scan_response(const uint8_t *buf, size_t n, af_frame_t *f, bool *found);
+
 #endif

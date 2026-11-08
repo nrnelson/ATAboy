@@ -32,48 +32,12 @@
 #include <string.h>
 #include <stddef.h>
 
-// Sub-operations
-#define OP_INFO          0x00
-#define OP_STATUS        0x01
-#define OP_CONFIG_GET    0x02
-#define OP_CONFIG_SET    0x03
-#define OP_CONFIG_SAVE   0x04
-#define OP_CONFIG_DEFAULTS 0x05
-#define OP_DETECT        0x10
-#define OP_GEOMETRY      0x11
-#define OP_MOUNT         0x12
-#define OP_UNMOUNT       0x13
-#define OP_RESET         0x14
-#define OP_PARK          0x15
-#define OP_IDENTIFY      0x20
-#define OP_TASKFILE      0x21
-#define OP_READ          0x22
-#define OP_READ_LONG     0x23
-#define OP_VERIFY        0x24
-#define OP_CORRUPT       0x25
-#define OP_HASHES        0x26
-#define OP_LOG           0x30
-#define OP_LOG_CLEAR     0x31
-#define OP_ARM           0x40
-#define OP_REBOOT        0x41
+// The engine results in the binary result block are ide.h's values.
+_Static_assert(APIIDE_OK == IDE_OK && APIIDE_ATA_ERROR == IDE_ATA_ERROR && APIIDE_TIMEOUT == IDE_TIMEOUT &&
+               APIIDE_NOT_READY == IDE_NOT_READY && APIIDE_BUS_FAULT == IDE_BUS_FAULT &&
+               APIIDE_PROTOCOL == IDE_PROTOCOL, "api_proto.h engine results must match ide.h");
 
-// Config keys (OP_CONFIG_SET)
-#define KEY_WRITE_PROTECT 1
-#define KEY_AUTO_MOUNT    2
-#define KEY_IORDY         3
-#define KEY_INTRQ         4
-#define KEY_READ_TIMEOUT  5
-#define KEY_WRITE_TIMEOUT 6
-#define KEY_ECC_LEN       7
-#define KEY_NO_RETRY      8
-#define KEY_DEVICE        9
-
-#define HDR_LEN     16
-#define EXT_HDR_LEN 32           // 'A' 'X' requests: HDR_LEN + boot id, state counter, request id
-#define RES_LEN     32           // binary ATA result block
-#define CT_NONE     0
-#define CT_JSON     1
-#define CT_BINARY   2
+// Sub-operation numbers, config keys, reply layout: api_proto.h
 
 #define ARM_WINDOW_MS   10000
 #define VERIFY_BUDGET_US 10000000u   // one VERIFY request runs at most ~10 s
@@ -160,17 +124,6 @@ static uint32_t be32(const uint8_t *p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
 }
 
-static const char *result_name(int r) {
-    if (r == R_ID_CONFLICT) return "request_id_conflict";
-    static const char *const names[] = {
-        "ok", "bad_subop", "bad_arg", "no_drive", "not_mounted", "write_protected",
-        "not_armed", "ata_error", "timeout", "not_ready", "bus_fault", "no_geometry",
-        "mounted", "identify_failed", "unsupported", "protocol", "alloc_too_small",
-        "geometry_mismatch",
-    };
-    return (r >= 0 && r < (int)(sizeof(names) / sizeof(names[0]))) ? names[r] : "unknown";
-}
-
 static const char *geo_name(uint8_t m) {
     switch (m) {
     case GEO_NORMAL: return "normal";
@@ -196,21 +149,10 @@ static const char *op_name(uint8_t op) {
     }
 }
 
-static const char *ide_result_name(int r) {
-    switch (r) {
-    case IDE_OK:        return "ok";
-    case IDE_ATA_ERROR: return "ata_error";
-    case IDE_TIMEOUT:   return "timeout";
-    case IDE_NOT_READY: return "not_ready";
-    case IDE_BUS_FAULT: return "bus_fault";
-    default:            return "protocol";
-    }
-}
-
 static uint8_t hdr_flags(void) {
-    return (is_mounted ? 0x01 : 0) | (config.drive_write_protected ? 0x02 : 0) |
-           (drive.identified ? 0x04 : 0) | (api_is_armed() ? 0x08 : 0) |
-           (drive_geometry_valid() ? 0x10 : 0);
+    return (is_mounted ? HF_MOUNTED : 0) | (config.drive_write_protected ? HF_WRITE_PROTECT : 0) |
+           (drive.identified ? HF_IDENTIFIED : 0) | (api_is_armed() ? HF_ARMED : 0) |
+           (drive_geometry_valid() ? HF_GEOMETRY_VALID : 0);
 }
 
 static int32_t finish(uint8_t *buf, int result, uint8_t ctype, uint32_t payload_len);
@@ -293,7 +235,7 @@ static void json_log_entry(json_t *j, const char *key, const errlog_entry_t *e) 
     j_uint(j, "t_ms", e->t_ms);
     j_str(j, "op", op_name(e->op));
     j_uint(j, "cmd", e->cmd);
-    j_str(j, "result", ide_result_name(e->result));
+    j_str(j, "result", api_ide_result_name(e->result));
     j_uint(j, "lba", e->lba);
     j_uint(j, "count", e->count);
     j_uint(j, "done", e->done);
@@ -416,7 +358,7 @@ static int32_t reply_status(uint8_t *buf, uint32_t cap, int result, const char *
     json_t j;
     j_init(&j, (char *)buf + HDR_LEN, cap - HDR_LEN);
     j_obj(&j, NULL);
-    j_str(&j, "result", result_name(result));
+    j_str(&j, "result", api_result_name(result));
     if (msg) j_str(&j, "message", msg);
     json_status_body(&j);
     j_end(&j);
@@ -427,7 +369,7 @@ static int32_t reply_msg(uint8_t *buf, uint32_t cap, int result, const char *msg
     json_t j;
     j_init(&j, (char *)buf + HDR_LEN, cap - HDR_LEN);
     j_obj(&j, NULL);
-    j_str(&j, "result", result_name(result));
+    j_str(&j, "result", api_result_name(result));
     if (msg) j_str(&j, "message", msg);
     j_end(&j);
     return finish_json(buf, result, &j);
@@ -437,7 +379,7 @@ static int32_t reply_config(uint8_t *buf, uint32_t cap, int result, const char *
     json_t j;
     j_init(&j, (char *)buf + HDR_LEN, cap - HDR_LEN);
     j_obj(&j, NULL);
-    j_str(&j, "result", result_name(result));
+    j_str(&j, "result", api_result_name(result));
     if (msg) j_str(&j, "message", msg);
     json_config(&j, "config");
     j_end(&j);
@@ -450,26 +392,26 @@ static int32_t reply_config(uint8_t *buf, uint32_t cap, int result, const char *
 
 static uint32_t put_result(uint8_t *p, const ide_cmd_t *c, uint32_t lba, uint32_t count, bool partial) {
     memset(p, 0, RES_LEN);
-    put_be32(&p[0], lba);
-    put_be16(&p[4], (uint16_t)count);
-    put_be16(&p[6], (uint16_t)c->done);
-    p[8]  = c->status;
-    p[9]  = c->error;
-    p[10] = c->command;
-    p[11] = (c->result == IDE_TIMEOUT ? 0x01 : 0) | (c->err_data ? 0x02 : 0) |
-            (c->tf_valid ? 0x04 : 0) | (c->recovered ? 0x08 : 0) |
-            (c->result == IDE_BUS_FAULT ? 0x10 : 0) | (c->result == IDE_NOT_READY ? 0x20 : 0) |
-            (partial ? 0x40 : 0);
-    put_be32(&p[12], c->elapsed_us);
+    put_be32(&p[RES_LBA], lba);
+    put_be16(&p[RES_COUNT], (uint16_t)count);
+    put_be16(&p[RES_DONE], (uint16_t)c->done);
+    p[RES_STATUS]  = c->status;
+    p[RES_ERROR]   = c->error;
+    p[RES_COMMAND] = c->command;
+    p[RES_FLAGS] = (c->result == IDE_TIMEOUT ? RF_TIMED_OUT : 0) | (c->err_data ? RF_ERR_DATA : 0) |
+                   (c->tf_valid ? RF_TF_VALID : 0) | (c->recovered ? RF_RECOVERED : 0) |
+                   (c->result == IDE_BUS_FAULT ? RF_BUS_FAULT : 0) |
+                   (c->result == IDE_NOT_READY ? RF_NOT_READY : 0) | (partial ? RF_PARTIAL : 0);
+    put_be32(&p[RES_ELAPSED_US], c->elapsed_us);
     uint32_t fl;
     if (c->result != IDE_OK) {
         if (!ide_cmd_result_lba(c, &fl)) fl = lba + c->done;
     } else fl = 0xFFFFFFFF;
-    put_be32(&p[16], fl);
-    p[20] = c->out_count; p[21] = c->out_lba_lo; p[22] = c->out_lba_mid;
-    p[23] = c->out_lba_hi; p[24] = c->out_device;
-    p[25] = c->ecc_len;
-    p[26] = (uint8_t)(int8_t)c->result;
+    put_be32(&p[RES_FAIL_LBA], fl);
+    p[RES_TF + 0] = c->out_count; p[RES_TF + 1] = c->out_lba_lo; p[RES_TF + 2] = c->out_lba_mid;
+    p[RES_TF + 3] = c->out_lba_hi; p[RES_TF + 4] = c->out_device;
+    p[RES_ECC_LEN] = c->ecc_len;
+    p[RES_IDE_RESULT] = (uint8_t)(int8_t)c->result;
     return RES_LEN;
 }
 
@@ -477,14 +419,13 @@ static uint32_t put_result(uint8_t *p, const ide_cmd_t *c, uint32_t lba, uint32_
 //  Sub-operation handlers
 // ---------------------------------------------------------------------------
 
-static bool op_takes_rid(uint8_t op);
 
 // INFO fields for the extended header, request ids and the API serial port.
 static void json_ext_info(json_t *j) {
     j_uint(j, "boot_id", boot_id);
     j_uint(j, "state_counter", api_state_counter());
     j_arr(j, "rid_ops");
-    for (int op = 0; op < 256; op++) if (op_takes_rid((uint8_t)op)) j_uint(j, NULL, (uint64_t)op);
+    for (int op = 0; op < 256; op++) if (api_op_takes_rid((uint8_t)op)) j_uint(j, NULL, (uint64_t)op);
     j_end(j);
     j_uint(j, "rid_cache", RID_CACHE_ENTRIES);
     j_arr(j, "transports");
@@ -634,7 +575,7 @@ static void json_park_cmd(json_t *j, const char *key, const ide_cmd_t *c) {
     char sb[48], eb[48];
     j_obj(j, key);
     j_uint(j, "command", c->command);
-    j_str(j, "result", ide_result_name(c->result));
+    j_str(j, "result", api_ide_result_name(c->result));
     j_uint(j, "status", c->status);
     j_str(j, "status_bits", ata_status_bits(c->status, sb));
     j_uint(j, "error", c->error);
@@ -651,7 +592,7 @@ static int32_t op_park(uint8_t *buf, uint32_t cap, const uint8_t *a) {
     json_t j;
     j_init(&j, (char *)buf + HDR_LEN, cap - HDR_LEN);
     j_obj(&j, NULL);
-    j_str(&j, "result", result_name(r));
+    j_str(&j, "result", api_result_name(r));
     if (r == R_OK) j_str(&j, "message", "heads parked, drive in standby; power off now (any command spins it up again)");
     else if (p.seek_issued && p.seek.result != IDE_OK) j_str(&j, "message", "SEEK to the landing zone failed (STANDBY still sent, see standby)");
     else j_str(&j, "message", "STANDBY IMMEDIATE failed");
@@ -845,7 +786,7 @@ static int32_t op_verify(uint8_t *buf, uint32_t cap, const uint8_t *a) {
     c.done = done;
     c.elapsed_us = time_us_32() - t0;
     put_result(buf + HDR_LEN, &c, lba, count > 0xFFFF ? 0xFFFF : count, partial);
-    put_be32(buf + HDR_LEN + 28, done);           // full 32-bit verified count
+    put_be32(buf + HDR_LEN + RES_DONE32, done);   // full 32-bit verified count
     put_be32(buf + HDR_LEN + 12, c.elapsed_us);
     put_be32(buf + HDR_LEN + 16, r != IDE_OK ? lba + done : 0xFFFFFFFFu);
     return finish(buf, drive_result_from_ide(r), CT_BINARY, RES_LEN);
@@ -1000,22 +941,6 @@ static int32_t run_op(const uint8_t *cdb, uint8_t *buf, uint32_t cap) {
     }
 }
 
-// Ops that change state take a run-once request id (CDB bytes 12-15) in an
-// extended request; their arguments never use those bytes.  INFO lists them
-// as "rid_ops".
-static bool op_takes_rid(uint8_t op) {
-    switch (op) {
-    case OP_CONFIG_SET: case OP_CONFIG_SAVE: case OP_CONFIG_DEFAULTS:
-    case OP_DETECT: case OP_GEOMETRY: case OP_MOUNT: case OP_UNMOUNT: case OP_RESET:
-    case OP_CORRUPT: case OP_LOG_CLEAR: case OP_ARM: case OP_REBOOT: case OP_PARK:
-        return true;
-    default:
-        return false;
-    }
-}
-
-#define XF_REPLAYED  0x01        // stored reply to an earlier request with this id; not run again
-#define XF_RID       0x02        // the request id was taken (op is in rid_ops)
 
 // Turn a basic reply built at buf + HDR_LEN into an extended one at buf.
 static int32_t wrap_ext(uint8_t *buf, int32_t n, uint32_t rid, uint8_t xflags) {
@@ -1042,7 +967,7 @@ int32_t api_dispatch(const uint8_t *cdb, uint8_t *buf, uint32_t cap, uint8_t sen
     memcpy(req, cdb, 16);
     uint32_t rid = 0;
     uint8_t xflags = 0;
-    if (op_takes_rid(cdb[1])) {
+    if (api_op_takes_rid(cdb[1])) {
         rid = be32(&cdb[12]);
         memset(&req[12], 0, 4);            // the op never sees the id
         xflags = XF_RID;

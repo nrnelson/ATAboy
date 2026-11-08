@@ -33,7 +33,7 @@ jobs:
         run: |
           cc -Wall -Wextra -Werror -I firmware -o "$RUNNER_TEMP/test_host" \
             tests/test_host.c firmware/ata_policy.c firmware/json.c firmware/config_check.c \
-            firmware/crc32.c firmware/rid_cache.c firmware/apiframe.c
+            firmware/crc32.c firmware/rid_cache.c firmware/apiframe.c firmware/api_proto.c
           "$RUNNER_TEMP/test_host"
 
       - name: Data path tests (USB disk, sector hashes)

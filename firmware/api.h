@@ -5,11 +5,8 @@
 #include <stdbool.h>
 
 // Vendor SCSI command 0xC0: the ATAboy automation API (docs/API.md).
-#define API_OPCODE 0xC0
-
-// Result code for a run-once request id reused with a different request
-// (the codes 0..16 are in drive.h; 17 is left for the next drive result).
-#define R_ID_CONFLICT 18
+// Protocol constants and names: api_proto.h (shared with the host library).
+#include "api_proto.h"
 
 // Call once at boot, before USB starts: picks the random boot id.
 void api_init(void);

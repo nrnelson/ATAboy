@@ -3,7 +3,7 @@
 // CRC-32, the run-once request-id cache and the API serial-port framing.
 //   cc -I firmware -o /tmp/t tests/test_host.c firmware/ata_policy.c firmware/json.c
 //      firmware/config_check.c firmware/crc32.c firmware/rid_cache.c
-//      firmware/apiframe.c && /tmp/t
+//      firmware/apiframe.c firmware/api_proto.c && /tmp/t
 #include <stdio.h>
 #include <string.h>
 #include <stddef.h>
@@ -14,6 +14,7 @@
 #include "crc32.h"
 #include "rid_cache.h"
 #include "apiframe.h"
+#include "api_proto.h"
 
 static int failures = 0;
 #define CHECK(cond) do { if (!(cond)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); failures++; } } while (0)
@@ -303,6 +304,62 @@ static void test_apiframe(void) {
     CHECK(f[n - 4] == (uint8_t)(c >> 24) && f[n - 1] == (uint8_t)c);
 }
 
+// Host half of the framing against the firmware half, both directions.
+static void test_apiframe_host(void) {
+    static uint8_t f[AF_HDR_LEN + AF_MAX_BODY + AF_CRC_LEN + 64];
+    const uint8_t cdb[16] = {0xC0, 0x22, 'A', 'X', 0, 0, 1, 0, 0, 7, 0, 0, 0, 0, 0x3A, 0x98};
+    af_rx_t rx;
+    af_event_t ev;
+    af_rx_reset(&rx);
+    size_t n = af_request(f, 0xA55A, 4096, cdb);
+    CHECK(n == AF_HDR_LEN + AF_CDB_LEN + AF_CRC_LEN);
+    CHECK(af_rx_feed(&rx, f, n, &ev) == n && ev.kind == AF_EV_REQUEST && ev.tag == 0xA55A);
+    CHECK(ev.alloc == 0 && memcmp(ev.cdb, cdb, 16) == 0);
+    n = af_request(f, 1, 300, cdb);
+    af_rx_feed(&rx, f, n, &ev);
+    CHECK(ev.kind == AF_EV_REQUEST && ev.alloc == 300);
+
+    // response scan: garbage, a lone magic, a fake "A5 Q", then the frame
+    const uint8_t g[] = {'x', AF_MAGIC, AF_MAGIC, AF_REQ, 0};
+    memcpy(f, g, sizeof(g));
+    for (unsigned i = 0; i < 300; i++) f[sizeof(g) + AF_HDR_LEN + i] = (uint8_t)i;
+    size_t fl = af_response(f + sizeof(g), 0x0102, AF_ST_OK, 300);
+    n = sizeof(g) + fl;
+    af_frame_t fr;
+    bool found;
+    // every truncation: never a frame, never drops a byte that could start one
+    for (size_t cut = 0; cut < n; cut++) {
+        size_t drop = af_scan_response(f, cut, &fr, &found);
+        CHECK(!found && drop <= sizeof(g) && drop <= cut);
+    }
+    size_t drop = af_scan_response(f, n, &fr, &found);
+    CHECK(found && drop == n && fr.crc_ok && fr.tag == 0x0102 && fr.status == AF_ST_OK && fr.len == 300);
+    CHECK(fr.body == f + sizeof(g) + AF_HDR_LEN && fr.body[299] == (uint8_t)299);
+    // flipped body bit: found, CRC bad
+    f[sizeof(g) + AF_HDR_LEN + 10] ^= 4;
+    af_scan_response(f, n, &fr, &found);
+    CHECK(found && !fr.crc_ok);
+    // oversized length field: skipped as not-a-frame
+    fl = af_response(f, 9, AF_ST_OK, 0);
+    f[8] = 0x20; f[9] = 0x01;                   // 8193 > AF_MAX_BODY
+    drop = af_scan_response(f, fl, &fr, &found);
+    CHECK(!found && drop == fl);
+}
+
+static void test_api_proto(void) {
+    CHECK(strcmp(api_result_name(R_OK), "ok") == 0);
+    CHECK(strcmp(api_result_name(R_GEO_MISMATCH), "geometry_mismatch") == 0);
+    CHECK(strcmp(api_result_name(R_ID_CONFLICT), "request_id_conflict") == 0);
+    CHECK(strcmp(api_result_name(99), "unknown") == 0 && strcmp(api_result_name(-1), "unknown") == 0);
+    CHECK(strcmp(api_ide_result_name(APIIDE_TIMEOUT), "timeout") == 0);
+    CHECK(api_op_by_name("hashes") == OP_HASHES && api_op_by_name("nope") == -1);
+    CHECK(strcmp(api_op_name(OP_PARK), "park") == 0 && strcmp(api_op_name(0xEE), "unknown") == 0);
+    for (int op = 0; op < 256; op++)                   // an op is never both
+        CHECK(!(api_op_takes_rid((uint8_t)op) && api_op_read_only((uint8_t)op)));
+    CHECK(api_op_takes_rid(OP_PARK) && api_op_takes_rid(OP_REBOOT) && !api_op_takes_rid(OP_READ));
+    CHECK(api_op_read_only(OP_HASHES) && !api_op_read_only(OP_CORRUPT) && !api_op_takes_rid(OP_CORRUPT) == false);
+}
+
 int main(void) {
     test_policy();
     test_json();
@@ -310,6 +367,8 @@ int main(void) {
     test_crc32();
     test_rid_cache();
     test_apiframe();
+    test_apiframe_host();
+    test_api_proto();
     if (failures) { printf("%d failure(s)\n", failures); return 1; }
     printf("all host tests passed\n");
     return 0;

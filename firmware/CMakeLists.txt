@@ -57,7 +57,8 @@ add_executable(ATAboy
         sha256_hw.c
         usb_descriptors.c
         config.c
-        config_check.c)
+        config_check.c
+        api_proto.c)
 
 # Version string reported by the API comes from version.h; the git hash is
 # baked in so a host can tell exactly which build is flashed.  It is taken at

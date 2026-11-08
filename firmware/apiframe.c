@@ -77,3 +77,47 @@ uint32_t af_response(uint8_t *frame, uint16_t tag, uint8_t status, uint32_t body
     c[0] = (uint8_t)(crc >> 24); c[1] = (uint8_t)(crc >> 16); c[2] = (uint8_t)(crc >> 8); c[3] = (uint8_t)crc;
     return AF_HDR_LEN + body_len + AF_CRC_LEN;
 }
+
+static uint32_t get_be32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+uint32_t af_request(uint8_t *frame, uint16_t tag, uint32_t alloc, const uint8_t cdb[AF_CDB_LEN]) {
+    uint16_t a = alloc >= AF_MAX_BODY ? 0 : (uint16_t)alloc;
+    frame[0] = AF_MAGIC;
+    frame[1] = AF_REQ;
+    frame[2] = AF_VERSION;
+    frame[3] = 0;
+    frame[4] = (uint8_t)(tag >> 8); frame[5] = (uint8_t)tag;
+    frame[6] = (uint8_t)(a >> 8);   frame[7] = (uint8_t)a;
+    frame[8] = 0;                   frame[9] = AF_CDB_LEN;
+    memcpy(frame + AF_HDR_LEN, cdb, AF_CDB_LEN);
+    uint32_t crc = crc32_update(0, frame, AF_HDR_LEN + AF_CDB_LEN);
+    uint8_t *c = frame + AF_HDR_LEN + AF_CDB_LEN;
+    c[0] = (uint8_t)(crc >> 24); c[1] = (uint8_t)(crc >> 16); c[2] = (uint8_t)(crc >> 8); c[3] = (uint8_t)crc;
+    return AF_HDR_LEN + AF_CDB_LEN + AF_CRC_LEN;
+}
+
+size_t af_scan_response(const uint8_t *buf, size_t n, af_frame_t *f, bool *found) {
+    *found = false;
+    size_t i = 0;
+    while (i < n) {
+        if (buf[i] != AF_MAGIC) { i++; continue; }
+        if (i + 1 >= n) return i;                     // maybe a frame start: wait for more
+        if (buf[i + 1] != AF_RSP) { i++; continue; }
+        if (n - i < AF_HDR_LEN) return i;
+        const uint8_t *h = buf + i;
+        uint32_t len = ((uint32_t)h[8] << 8) | h[9];
+        if (h[2] != AF_VERSION || len > AF_MAX_BODY) { i++; continue; }   // not a frame: hunt on
+        size_t end = AF_HDR_LEN + len + AF_CRC_LEN;
+        if (n - i < end) return i;
+        f->status = h[3];
+        f->tag = (uint16_t)((h[4] << 8) | h[5]);
+        f->body = h + AF_HDR_LEN;
+        f->len = (uint16_t)len;
+        f->crc_ok = crc32_update(0, h, AF_HDR_LEN + len) == get_be32(h + AF_HDR_LEN + len);
+        *found = true;
+        return i + end;
+    }
+    return n;
+}

@@ -68,25 +68,8 @@ typedef struct {
 
 extern drive_stats_t drive_stats;
 
-// --- result codes shared with the API (docs/API.md "Result codes") ---
-#define R_OK               0
-#define R_BAD_SUBOP        1
-#define R_BAD_ARG          2
-#define R_NO_DRIVE         3
-#define R_NOT_MOUNTED      4
-#define R_WRITE_PROTECTED  5
-#define R_NOT_ARMED        6
-#define R_ATA_ERROR        7
-#define R_TIMEOUT          8
-#define R_NOT_READY        9
-#define R_BUS_FAULT       10
-#define R_NO_GEOMETRY     11
-#define R_MOUNTED         12
-#define R_IDENTIFY_FAILED 13
-#define R_UNSUPPORTED     14
-#define R_PROTOCOL        15
-#define R_ALLOC_TOO_SMALL 16
-#define R_GEO_MISMATCH    17   // configured geometry belongs to another drive
+// --- result codes shared with the API (docs/API.md "Result codes"): R_* ---
+#include "api_proto.h"
 
 int      drive_result_from_ide(int ide_result);
 
