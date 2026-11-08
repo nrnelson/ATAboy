@@ -46,6 +46,23 @@ bool    ide_set_geometry(uint8_t heads, uint8_t spt);
 void    ide_drain_sector(void);
 
 int32_t ide_read_sectors(uint32_t lba, uint32_t count, uint8_t *buf);
+
+// --- Recovery additions ---
+typedef struct {
+    uint32_t lba;          // failing LBA
+    uint8_t  cmd;          // ATA command (0x20/0x24 READ, 0x22/0x23 READ LONG)
+    uint8_t  status;       // status register at failure
+    uint8_t  error;        // error register at failure (0 if timed out)
+    bool     timed_out;    // true = gave up waiting (drive still busy)
+    uint32_t elapsed_ms;   // command start -> failure
+    uint32_t timeout_ms;   // timeout in force
+    uint8_t  tf_sn, tf_cl, tf_ch, tf_dh;   // address registers at failure
+} ide_error_t;
+
+extern volatile uint32_t ide_read_timeout_ms;
+extern ide_error_t ide_last_error;
+int32_t ide_read_long(uint32_t lba, bool retries, uint8_t ecc_len,
+                      uint8_t *buf, uint8_t *st_end);
 int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf);
 
 // Read task file registers 1-7 into tf[1]..tf[7] (tf[0] unused).

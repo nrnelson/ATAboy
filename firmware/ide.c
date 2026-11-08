@@ -273,15 +273,22 @@ void ide_drain_sector(void) {
 //  Sector I/O — LBA28, single-sector loop
 // ---------------------------------------------------------------------------
 
-int32_t ide_read_sectors(uint32_t lba, uint32_t count, uint8_t *buf) {
-    if (count == 0) return -1;
-    if (!ide_wait_until_ready(5000)) return -1;
+// ---------------------------------------------------------------------------
+//  Recovery additions: adjustable read timeout + last-error capture
+// ---------------------------------------------------------------------------
 
+// Per-sector DRQ wait for reads.  Default ~= stock (100000 x 10us polls).
+volatile uint32_t ide_read_timeout_ms = 1000;
+
+// Snapshot of the last failed read, taken BEFORE the soft reset clears it.
+ide_error_t ide_last_error;
+
+// Program sector count + address registers (LBA28/LBA48/CHS) for 'count' sectors.
+static bool ide_setup_address(uint32_t lba, uint32_t count) {
     bool use_lba48 = config.use_lba_mode && (config.lba_sectors > 0x0FFFFFFF);
 
     if (config.use_lba_mode) {
         if (use_lba48) {
-            // LBA48: HOB (high bytes) first, then LOB (low bytes)
             ide_write_reg(2, 0);                               // sector count high
             ide_write_reg(3, (lba >> 24) & 0xFF);              // LBA 24-31
             ide_write_reg(4, 0);                               // LBA 32-39 (0 for uint32_t)
@@ -309,23 +316,86 @@ int32_t ide_read_sectors(uint32_t lba, uint32_t count, uint8_t *buf) {
         ide_write_reg(5, (cyl >> 8) & 0xFF);
         ide_write_reg(6, dev_base | (head & 0x0F));
     }
+    return use_lba48;
+}
 
-    ide_write_reg(7, use_lba48 ? 0x24 : 0x20);            // READ SECTORS EXT / READ SECTORS
+// Wait for DRQ (data ready) or ERR, up to ide_read_timeout_ms.
+// Returns 1 = DRQ, 0 = ERR, -1 = timeout.  *st_out = last status seen.
+// prefer_data: if ERR and DRQ are both set, take the data (READ LONG).
+static int ide_wait_drq(uint8_t *st_out, bool prefer_data) {
+    uint32_t start = time_us_32();
+    uint32_t limit_us = ide_read_timeout_ms * 1000u;
+    uint8_t st = 0;
+    for (;;) {
+        if (config.intrq_enabled && gpio_get(IDE_INTRQ)) ide_read_reg(7);  // clear INTRQ
+        st = ide_read_reg(7);
+        if (!(st & 0x80)) {                               // BSY=0: status bits valid
+            if (prefer_data && (st & 0x08)) { *st_out = st; return 1; }
+            if (st & 0x01) { *st_out = st; return 0; }    // ERR
+            if (st & 0x08) { *st_out = st; return 1; }    // DRQ
+        }
+        if ((uint32_t)(time_us_32() - start) >= limit_us) { *st_out = st; return -1; }
+        busy_wait_us_32(10);
+    }
+}
+
+// Record the failure (status/error/address registers) before any reset.
+static void ide_capture_error(uint8_t cmd, uint32_t lba, uint8_t st,
+                              bool timed_out, uint32_t t0_us) {
+    ide_last_error.lba       = lba;
+    ide_last_error.cmd       = cmd;
+    ide_last_error.status    = st;
+    ide_last_error.error     = timed_out ? 0 : ide_read_reg(1);
+    ide_last_error.timed_out = timed_out;
+    ide_last_error.elapsed_ms = (time_us_32() - t0_us) / 1000u;
+    ide_last_error.timeout_ms = ide_read_timeout_ms;
+    ide_last_error.tf_sn = ide_read_reg(3);
+    ide_last_error.tf_cl = ide_read_reg(4);
+    ide_last_error.tf_ch = ide_read_reg(5);
+    ide_last_error.tf_dh = ide_read_reg(6);
+}
+
+// Soft-reset to abort any stuck command, then restore CHS geometry.
+static void ide_abort_and_recover(void) {
+    ide_write_control(0x04);
+    busy_wait_us_32(10);
+    ide_write_control(0x00);
+    ide_wait_until_ready(2000);
+    // SRST clears INITIALIZE DRIVE PARAMETERS — restore CHS geometry
+    if (!config.use_lba_mode)
+        ide_set_geometry(config.heads, config.spt);
+}
+
+static void ide_capture_not_ready(uint8_t cmd, uint32_t lba) {
+    ide_last_error = (ide_error_t){0};
+    ide_last_error.lba = lba;
+    ide_last_error.cmd = cmd;
+    ide_last_error.status = ide_read_reg(7);
+    ide_last_error.timed_out = true;
+    ide_last_error.elapsed_ms = 5000;
+    ide_last_error.timeout_ms = 5000;
+}
+
+int32_t ide_read_sectors(uint32_t lba, uint32_t count, uint8_t *buf) {
+    if (count == 0) return -1;
+    if (!ide_wait_until_ready(5000)) { ide_capture_not_ready(0x00, lba); return -1; }
+
+    uint32_t t0 = time_us_32();
+    bool use_lba48 = ide_setup_address(lba, count);
+    uint8_t cmd = use_lba48 ? 0x24 : 0x20;               // READ SECTORS EXT / READ SECTORS
+    ide_write_reg(7, cmd);
 
     uint16_t *wbuf = (uint16_t *)buf;
 
     for (uint32_t s = 0; s < count; s++) {
-        // Poll for DRQ — INTRQ provides early-exit if enabled, otherwise pure polling
-        for (uint32_t t = 0; t < 100000; t++) {
-            if (config.intrq_enabled && gpio_get(IDE_INTRQ)) ide_read_reg(7);  // clear INTRQ
-            uint8_t st = ide_read_reg(7);
-            if (st & 0x01) goto read_err;
-            if (!(st & 0x80) && (st & 0x08)) goto drq_read;
-            busy_wait_us_32(10);
+        uint8_t st;
+        int r = ide_wait_drq(&st, false);
+        if (r <= 0) {
+            ide_capture_error(cmd, lba + s, st, r < 0, t0);
+            ide_abort_and_recover();
+            return -1;
         }
-        goto read_err;
 
-    drq_read:
         set_address(0);
         xcvr_read();
         sio_hw->gpio_clr = (1 << IDE_CS0);
@@ -337,17 +407,53 @@ int32_t ide_read_sectors(uint32_t lba, uint32_t count, uint8_t *buf) {
     }
 
     return (int32_t)(count * 512);
+}
 
-read_err:
-    // Soft-reset to abort any stuck command (drive may be retrying internally)
-    ide_write_control(0x04);
-    busy_wait_us_32(10);
-    ide_write_control(0x00);
-    ide_wait_until_ready(2000);
-    // SRST clears INITIALIZE DRIVE PARAMETERS — restore CHS geometry
-    if (!config.use_lba_mode)
-        ide_set_geometry(config.heads, config.spt);
-    return -1;
+// READ LONG (ATA-1): 512 data bytes + 'ecc_len' vendor ECC bytes, returned
+// WITHOUT ECC correction — so a sector that fails READ SECTORS with UNC may
+// still yield its raw (possibly bit-damaged) contents.
+// cmd 0x22 = with drive retries, 0x23 = without.  Returns 0 on data transfer,
+// -1 on ERR/timeout (details in ide_last_error).  *st_end = final status.
+int32_t ide_read_long(uint32_t lba, bool retries, uint8_t ecc_len,
+                      uint8_t *buf, uint8_t *st_end) {
+    if (!ide_wait_until_ready(5000)) {
+        ide_capture_not_ready(0x00, lba);
+        *st_end = ide_last_error.status;
+        return -1;
+    }
+
+    uint32_t t0 = time_us_32();
+    ide_setup_address(lba, 1);
+    uint8_t cmd = retries ? 0x22 : 0x23;
+    ide_write_reg(7, cmd);
+
+    uint8_t st;
+    int r = ide_wait_drq(&st, true);
+    if (r <= 0) {
+        ide_capture_error(cmd, lba, st, r < 0, t0);
+        ide_abort_and_recover();
+        *st_end = st;
+        return -1;
+    }
+
+    set_address(0);
+    xcvr_read();
+    sio_hw->gpio_clr = (1 << IDE_CS0);
+    ide_pio_read(256, (uint16_t *)buf);
+    sio_hw->gpio_set = (1 << IDE_CS0);
+    bus_idle();
+
+    // ECC bytes are transferred as 8-bit accesses on DD0-7
+    for (uint8_t i = 0; i < ecc_len; i++) {
+        buf[512 + i] = ide_read_reg(0);
+    }
+
+    busy_wait_us_32(5);
+    *st_end = ide_read_reg(7);
+    // Record the outcome too (ERR here means drive flagged the read, data still raw)
+    ide_capture_error(cmd, lba, *st_end, false, t0);
+    if (*st_end & 0x08) ide_abort_and_recover();          // leftover DRQ: wrong ECC length
+    return 0;
 }
 
 int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
