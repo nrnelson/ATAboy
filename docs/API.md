@@ -35,6 +35,7 @@ ataboy image disk.img               # resumable imager with a ddrescue-compatibl
 ataboy rescue disk.img disk.img.map # retry just the failed sectors, patch image + map
 ataboy whatfile disk.img --from-map disk.img.map  # which files/dirs/FAT the bad sectors hit
 smartctl -d sat -a /dev/sdX         # standard tools via SAT pass-through
+ataboy park --landing-zone 1023     # park the heads before power-off (stepper drives)
 ataboy reboot --bootsel             # UF2 bootloader for a firmware update
 ```
 
@@ -117,6 +118,7 @@ before parsing.
 | 14 | `unsupported` | the drive lacks the feature (e.g. LBA) |
 | 15 | `protocol` | the drive's data phase didn't match (e.g. wrong READ LONG ECC length) |
 | 16 | `alloc_too_small` | allocation length too small for this reply |
+| 17 | `geometry_mismatch` | the configured geometry was set up for another drive (see MOUNT) |
 
 ## Sub-operations
 
@@ -128,11 +130,12 @@ before parsing.
 | 03 | CONFIG_SET | [4] key, [8-11] value | JSON config (not saved) |
 | 04 | CONFIG_SAVE | — | JSON config; writes flash |
 | 05 | CONFIG_DEFAULTS | — | JSON config (not saved; refused while mounted) |
-| 10 | DETECT | [4] device 0 auto / 1 master / 2 slave · [5] geometry 0 auto / 1 normal / 2 large / 3 lba / 4 manual / 5 keep · [6-7] cyls · [8] heads · [9] spt · [10] flags: bit0 skip probe, bit1 mount, bit2 force | JSON status |
-| 11 | GEOMETRY | [5] mode 1 normal / 2 large / 3 lba / 4 manual · [6-7] cyls · [8] heads · [9] spt | JSON status |
-| 12 | MOUNT | — | JSON status |
+| 10 | DETECT | [4] device 0 auto / 1 master / 2 slave · [5] geometry 0 auto / 1 normal / 2 large / 3 lba / 4 manual / 5 keep · [6-7] cyls · [8] heads · [9] spt · [10] flags: bit0 skip probe, bit1 mount, bit2 force, bit3 mount without the mount checks | JSON status |
+| 11 | GEOMETRY | [5] mode 1 normal / 2 large / 3 lba / 4 manual · [6-7] cyls · [8] heads · [9] spt (manual: 1..65535 / 1..16 / 1..63) | JSON status |
+| 12 | MOUNT | [4] bit0 force (skip the mount checks) | JSON status |
 | 13 | UNMOUNT | — | JSON status |
 | 14 | RESET | [4] 0 soft (SRST) / 1 hard (RESET line, recalibrate) | JSON status; `not_ready` if the drive didn't come back (see [Resets](#resets)) |
+| 15 | PARK | [4] bit0 seek to the landing zone first · [6-7] landing-zone cylinder | JSON (below); refused while mounted |
 | 20 | IDENTIFY | [4] bit0 cached (no bus access) | binary: 512 bytes of IDENTIFY DEVICE data |
 | 21 | TASKFILE | — | JSON registers (`valid` false while BSY) |
 | 22 | READ | [4-7] LBA · [8-9] count (1..`max_read_sectors`) · [10] flags: bit0 no retry (0x21), bit1 read-through-error · [12-15] per-sector timeout ms (0 = config) | binary: result block + data |
@@ -151,12 +154,14 @@ before parsing.
 {
   "result": "ok", "fw": "0.6f3-api1", "uptime_ms": 81234,
   "mounted": true, "write_protect": true, "armed": false,
+  "settings": {"load": "ok", "field": null},
   "drive": {"present": true, "identified": true, "forced": false, "device": "master",
             "model": "IBM-H2172-A2", "serial": "...", "firmware": "...",
             "default_chs": [989, 10, 34], "lba": false, "lba28_sectors": 0,
             "lba48": false, "lba48_sectors": 0, "ecc_bytes": 4, "ata_major": 0},
   "geometry": {"valid": true, "mode": "normal", "addressing": "chs",
-               "cyls": 989, "heads": 10, "spt": 34, "sectors": 336260},
+               "cyls": 989, "heads": 10, "spt": 34, "sectors": 336260,
+               "owner": {"model": "IBM-H2172-A2", "serial": "..."}, "identity": "match"},
   "bus": {"status": 80, "status_bits": "DRDY|DSC", "pio_faults": 0,
           "resets": {"soft": 1, "soft_failed": 0, "hard": 0, "hard_failed": 0,
                      "geometry_failed": 0, "last": "ok", "last_ms": 412},
@@ -175,6 +180,35 @@ before parsing.
 Register values are plain integers; `*_bits` fields decode them
 (`"DRDY|DSC|DRQ|ERR"`, `"UNC"`).
 
+### MOUNT checks and the geometry owner
+
+Geometry is saved with the settings, so after a power cycle it applies to
+whatever drive is attached. To keep the previous drive's geometry off a new
+one, the firmware remembers which drive the geometry was set up for
+(`geometry.owner`: IDENTIFY model and serial, saved with CONFIG_SAVE; empty
+when the geometry was forced without IDENTIFY data or saved by older
+firmware). MOUNT (and DETECT with bit1, the menu's Mount, and Auto Mount at
+power-up) checks, unless forced:
+
+1. Something answers on the bus (status not FFh), else `no_drive`.
+2. The drive is ready (BSY clear, DRDY set) within 3 s, else `not_ready`.
+   USB reads need DRDY; a drive that never gets ready would make each of
+   them wait out a 5 s timeout, which stalls core 0's USB task and with it
+   the serial menu.
+3. If the drive hasn't been identified since power-up (and wasn't forced),
+   it is sent IDENTIFY. If IDENTIFY then shows a different model or serial
+   than `geometry.owner`, the result is `geometry_mismatch`. With no owner
+   recorded, geometry that came from IDENTIFY (normal, large, lba) must
+   still agree with this drive's IDENTIFY data; manual geometry without an
+   owner, and drives that don't answer IDENTIFY, mount on the saved geometry.
+
+`geometry.identity` shows the comparison from the data already known, without
+bus access: `match`, `mismatch` or `unknown` (no IDENTIFY data yet, or manual
+geometry without an owner). Detecting with any geometry mode except keep sets
+the owner to the drive just identified. Auto Mount does the same checks; it
+also mounts a drive that doesn't answer IDENTIFY when the saved geometry was
+forced for one (manual, no owner).
+
 ### Config keys (CONFIG_SET)
 
 | Key | Name | Values | Default |
@@ -192,6 +226,22 @@ Register values are plain integers; `*_bits` fields decode them
 Settings live in RAM until CONFIG_SAVE. The saved block extends the stock
 firmware's, so settings saved by stock v0.6f3 still load (the new fields take
 their defaults).
+
+**Saved settings are checked at boot.** The block carries a CRC-32, and every
+field is range-checked (booleans 0/1, device, timeouts, `ecc_len`, geometry:
+CHS 1..65535 / 1..16 / 1..63 or all zero, LBA 1..2^48-1). STATUS
+`settings.load` says what happened:
+
+| `load` | Meaning |
+|---|---|
+| `ok` | CRC matched, all fields in range |
+| `legacy` | saved by stock or older API firmware (no CRC yet), all fields in range; the next save adds the CRC |
+| `none` | nothing saved: defaults |
+| `crc_error` | the CRC didn't match (torn write, flash corruption): **defaults loaded** |
+| `invalid` | a field was out of range, named in `settings.field`: **defaults loaded** |
+
+The serial menu shows a notice for `crc_error` and `invalid`. Saving writes
+the CRC; nothing is rewritten until you save.
 
 **Long timeouts and the host.** While the firmware waits on a sector, the USB
 command is outstanding. The Linux SCSI timeout for `/dev/sdX`
@@ -304,7 +354,7 @@ that stops at a bad sector hashes only the sectors before it.
 
 The ring holds the last 64 failures. A page holds as many entries as fit in
 4 KiB; fetch `start = next` until `next` is null. `op` is `read` (USB disk),
-`write`, `read_diag` (API READ), `read_long`, `verify`, `passthrough` or `identify`.
+`write`, `read_diag` (API READ), `read_long`, `verify`, `passthrough`, `identify` or `park`.
 `events` lists what happened around the command, `|`-separated: `hw_reset`
 (the recovery soft reset failed and the RESET line was pulsed), `reset_failed`
 (the drive didn't come back even then), `self_reset` (CHS: the drive had
@@ -314,6 +364,36 @@ not issued and failed `not_ready`). See [CHS self-reset check](#chs-self-reset-c
 logged for its events alone: the command itself succeeded.
 `tf` is null when the drive was still BSY. While BSY is set, every register
 reads back as STATUS, so those values would be garbage.
+
+### PARK
+
+For drives that don't park their heads on power loss (stepper-motor drives
+with a landing zone): optionally SEEK (70h) to the landing-zone cylinder in
+CHS (head 0, sector 1, whatever the configured addressing), then STANDBY
+IMMEDIATE (E0h). A drive that aborts E0h gets the ATA-1 opcode 94h. Power
+the drive off afterwards; any command spins it up again. The landing zone
+is on the drive label or in its data sheet, not in IDENTIFY data. A cylinder
+beyond the drive's logical geometry is usually aborted (IDNF/ABRT); STANDBY
+is still sent, and the reply says what each command got.
+
+The commands are non-destructive (read class in the pass-through policy), so
+PARK works with write protect on and needs no ARM, like RESET. It is refused
+while mounted (`mounted`): unmount first. The firmware allows 10 s for the
+seek and 30 s for each STANDBY; the USB task waits meanwhile.
+
+```json
+{"result": "ok", "message": "heads parked, drive in standby; power off now ...",
+ "seek": {"command": 112, "result": "ok", "status": 80, "status_bits": "DRDY|DSC",
+          "error": 0, "error_bits": "", "elapsed_ms": 18, "cylinder": 1023},
+ "standby": {"command": 224, "result": "ok", "status": 80, "status_bits": "DRDY|DSC",
+             "error": 0, "error_bits": "", "elapsed_ms": 2104},
+ "fallback": false}
+```
+
+`seek` is null without bit0. With `fallback` true, `standby` is the 94h
+command and `e0_status` / `e0_error` say what E0h got. The result code is
+the first failure (the seek's, if it failed), else the STANDBY's.
+The serial menu has the same as "Park Heads for Power-Off".
 
 ### Testing recovery tools: CORRUPT
 

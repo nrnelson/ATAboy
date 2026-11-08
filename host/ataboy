@@ -210,7 +210,8 @@ def bits(v, table):
 
 RESULTS = ["ok", "bad_subop", "bad_arg", "no_drive", "not_mounted", "write_protected",
            "not_armed", "ata_error", "timeout", "not_ready", "bus_fault", "no_geometry",
-           "mounted", "identify_failed", "unsupported", "protocol", "alloc_too_small"]
+           "mounted", "identify_failed", "unsupported", "protocol", "alloc_too_small",
+           "geometry_mismatch"]
 IDE_RESULTS = {0: "ok", -1: "ata_error", -2: "timeout", -3: "not_ready", -4: "bus_fault", -5: "protocol"}
 
 CT_NONE, CT_JSON, CT_BINARY = 0, 1, 2
@@ -218,7 +219,7 @@ CT_NONE, CT_JSON, CT_BINARY = 0, 1, 2
 OPS = {
     "info": 0x00, "status": 0x01, "config_get": 0x02, "config_set": 0x03,
     "config_save": 0x04, "config_defaults": 0x05, "detect": 0x10, "geometry": 0x11,
-    "mount": 0x12, "unmount": 0x13, "reset": 0x14, "identify": 0x20, "taskfile": 0x21,
+    "mount": 0x12, "unmount": 0x13, "reset": 0x14, "park": 0x15, "identify": 0x20, "taskfile": 0x21,
     "read": 0x22, "read_long": 0x23, "verify": 0x24, "corrupt": 0x25, "hashes": 0x26,
     "log": 0x30, "log_clear": 0x31,
     "arm": 0x40, "reboot": 0x41,
@@ -526,14 +527,16 @@ class ATAboy:
 
     # -- drive setup -----------------------------------------------------------
 
-    def detect(self, device="auto", geometry="auto", chs=None, probe=True, force=False, mount=False):
+    def detect(self, device="auto", geometry="auto", chs=None, probe=True, force=False, mount=False,
+               force_mount=False):
         dev = {"auto": 0, "master": 1, "slave": 2}[device]
         geo = GEOMETRY_MODES[geometry]
         c, h, s = chs or (0, 0, 0)
-        flags = (0 if probe else 1) | (2 if mount else 0) | (4 if force else 0)
+        flags = (0 if probe else 1) | (2 if mount or force_mount else 0) | (4 if force else 0) | \
+            (8 if force_mount else 0)
         r = self.call("detect", struct.pack(">BBHBBB", dev, geo, c, h, s, flags), timeout_ms=120000)
         self.sync_kernel_timeout(r.json)      # before the rescan makes the kernel read the disk
-        if r.ok and mount:
+        if r.ok and (mount or force_mount):
             self.rescan()
         return r
 
@@ -541,8 +544,11 @@ class ATAboy:
         c, h, s = chs or (0, 0, 0)
         return self.call("geometry", struct.pack(">BBHBB", 0, GEOMETRY_MODES[mode], c, h, s))
 
-    def mount(self, rescan=True):
-        r = self.call("mount")
+    def mount(self, rescan=True, force=False):
+        """force skips the firmware's checks: a drive must answer, not stay
+        busy, and own the configured geometry (else no_drive / not_ready /
+        geometry_mismatch)."""
+        r = self.call("mount", bytes([1 if force else 0]))
         self.sync_kernel_timeout(r.json)
         if r.ok and rescan:
             self.rescan()
@@ -580,6 +586,15 @@ class ATAboy:
 
     def reset(self, hard=False):
         return self.call("reset", bytes([1 if hard else 0]), timeout_ms=60000)
+
+    def park(self, cylinder=None):
+        """SEEK to the landing-zone cylinder (if given), then STANDBY IMMEDIATE.
+        Refused while mounted.  The firmware allows 10 s for the seek and 30 s
+        for each STANDBY command (E0h, then 94h if E0h is aborted)."""
+        if cylinder is not None and not 0 <= cylinder <= 65535:
+            raise ValueError("landing-zone cylinder must be 0..65535")
+        args = struct.pack(">BxH", 1 if cylinder is not None else 0, cylinder or 0)
+        return self.call("park", args, timeout_ms=90000)
 
     # -- data / diagnostics ------------------------------------------------------
 
@@ -1796,6 +1811,10 @@ def _int(s):
 def human_status(j):
     d, g = j["drive"], j["geometry"]
     print("firmware   %s  (uptime %.1f s)" % (j["fw"], j["uptime_ms"] / 1000))
+    st = j.get("settings") or {}
+    if st.get("load") in ("crc_error", "invalid"):
+        print("settings   SAVED SETTINGS REJECTED (%s%s): defaults loaded" % (
+            st["load"], ", field " + st["field"] if st.get("field") else ""))
     if d["identified"] or d["forced"]:
         print("drive      %s  serial %s  fw %s  [%s]" % (d["model"], d["serial"] or "-", d["firmware"] or "-", d["device"]))
     else:
@@ -1803,6 +1822,10 @@ def human_status(j):
     if g["valid"]:
         print("geometry   %s %s  %d/%d/%d  %d sectors (%.1f MB)" % (
             g["mode"], g["addressing"], g["cyls"], g["heads"], g["spt"], g["sectors"], g["sectors"] * 512 / 1e6))
+        owner = g.get("owner") or {}
+        if g.get("identity") == "mismatch":
+            print("           MISMATCH: set up for %s (serial %s), not the drive attached; detect again" % (
+                owner.get("model") or "a drive with different IDENTIFY data", owner.get("serial") or "-"))
     else:
         print("geometry   not set")
     c = j["config"]
@@ -1889,7 +1912,8 @@ def _status_reply(args, r, what):
 
 def cmd_detect(args, dev):
     r = dev.detect(device=args.device, geometry=args.geometry, chs=args.chs,
-                   probe=not args.no_probe, force=args.force, mount=args.mount)
+                   probe=not args.no_probe, force=args.force, mount=args.mount,
+                   force_mount=args.force_mount)
     return _status_reply(args, r, "detect")
 
 
@@ -1898,7 +1922,7 @@ def cmd_geometry(args, dev):
 
 
 def cmd_mount(args, dev):
-    r = dev.mount(rescan=not args.no_rescan)
+    r = dev.mount(rescan=not args.no_rescan, force=args.force)
     return _status_reply(args, r, "mount")
 
 
@@ -1908,6 +1932,25 @@ def cmd_unmount(args, dev):
 
 def cmd_reset(args, dev):
     return _status_reply(args, dev.reset(hard=args.hard), "reset")
+
+
+def human_park(j):
+    print("park: %s%s" % (j.get("result"), (" - " + j["message"]) if j.get("message") else ""))
+    for key in ("seek", "standby"):
+        c = j.get(key)
+        if c:
+            print("  %-8s cmd %02X %-9s st %02X[%s] err %02X[%s] %d ms%s" % (
+                key, c["command"], c["result"], c["status"], c["status_bits"], c["error"], c["error_bits"],
+                c["elapsed_ms"], "  cylinder %d" % c["cylinder"] if "cylinder" in c else ""))
+    if j.get("fallback"):
+        print("  E0h was aborted (st %02X err %02X); sent the ATA-1 STANDBY IMMEDIATE 94h" % (
+            j.get("e0_status", 0), j.get("e0_error", 0)))
+
+
+def cmd_park(args, dev):
+    r = dev.park(args.landing_zone)
+    _emit(args, r.json or {"result": r.result_name}, human_park)
+    return EXIT_OK if r.ok else EXIT_DEVICE
 
 
 def cmd_identify(args, dev):
@@ -2246,15 +2289,24 @@ def build_parser():
     x.add_argument("--no-probe", action="store_true", help="skip bus reset/probe; just IDENTIFY")
     x.add_argument("--force", action="store_true", help="accept manual geometry if IDENTIFY fails")
     x.add_argument("--mount", action="store_true", help="mount on success")
+    x.add_argument("--force-mount", action="store_true",
+                   help="mount on success even if the kept geometry belongs to another drive")
     x = add("geometry", cmd_geometry, "set geometry from cached IDENTIFY data or manual C/H/S")
     x.add_argument("mode", choices=["normal", "large", "lba", "manual"])
     x.add_argument("--chs", type=_chs)
     x = add("mount", cmd_mount, "expose the drive as USB mass storage (and rescan the host disk)")
     x.add_argument("--no-rescan", action="store_true")
+    x.add_argument("--force", action="store_true",
+                   help="mount even if no drive answers, it stays busy, or the geometry was set up "
+                        "for another drive")
     x = add("unmount", cmd_unmount, "detach the drive from USB mass storage")
     x.add_argument("--no-rescan", action="store_true")
     x = add("reset", cmd_reset, "soft reset (SRST); --hard pulses the RESET line and recalibrates")
     x.add_argument("--hard", action="store_true")
+    x = add("park", cmd_park, "park the heads before power-off: optional SEEK to a landing-zone cylinder, "
+                              "then STANDBY IMMEDIATE (unmount first)")
+    x.add_argument("--landing-zone", type=_int, metavar="CYL",
+                   help="seek to this cylinder first (CHS, head 0), for stepper drives without auto-park")
     x = add("identify", cmd_identify, "IDENTIFY DEVICE, decoded")
     x.add_argument("--cached", action="store_true", help="use data from the last detect, no bus access")
     x.add_argument("--raw", metavar="FILE", help="also write the 512 raw bytes")

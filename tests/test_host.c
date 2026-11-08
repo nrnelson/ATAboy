@@ -1,11 +1,14 @@
 // Host-side unit tests for the hardware-independent firmware modules:
-// the pass-through safety classifier and the JSON writer.
-//   cc -I firmware -o /tmp/t tests/test_host.c firmware/ata_policy.c firmware/json.c && /tmp/t
+// the pass-through safety classifier, the JSON writer and the settings checks.
+//   cc -I firmware -o /tmp/t tests/test_host.c firmware/ata_policy.c firmware/json.c
+//      firmware/config_check.c && /tmp/t
 #include <stdio.h>
 #include <string.h>
+#include <stddef.h>
 #include "ata_policy.h"
 #include "json.h"
 #include "ide.h"
+#include "config.h"
 
 static int failures = 0;
 #define CHECK(cond) do { if (!(cond)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); failures++; } } while (0)
@@ -93,9 +96,95 @@ static void test_json(void) {
     CHECK(strlen(ide_event_bits(0xFF, evb)) < sizeof(evb));
 }
 
+static void good_config(config_t *c) {
+    memset(c, 0, sizeof(*c));
+    c->magic = CONFIG_MAGIC;
+    c->drive_write_protected = true;
+    c->dev_base = 0xA0;
+    c->ext_magic = CONFIG_EXT_MAGIC;
+    c->read_timeout_ms = c->write_timeout_ms = 1000;
+    c->ext2_magic = CONFIG_EXT2_MAGIC;
+}
+
+static void test_config(void) {
+    CHECK(config_crc32("123456789", 9) == 0xCBF43926u);
+    CHECK(config_crc32("", 0) == 0);
+
+    config_t c;
+    good_config(&c);
+    CHECK(config_validate(&c, true) == NULL);               // defaults, no geometry
+    c.cyls = 989; c.heads = 10; c.spt = 34; c.geo_mode = GEO_NORMAL;
+    CHECK(config_validate(&c, true) == NULL);
+    c.heads = 17;  CHECK(config_validate(&c, true) && !strcmp(config_validate(&c, true), "chs"));
+    c.heads = 16; c.spt = 64; CHECK(config_validate(&c, true) != NULL);
+    c.spt = 63; c.cyls = 0; CHECK(config_validate(&c, true) != NULL);   // partial CHS
+    c.cyls = 65535; CHECK(config_validate(&c, true) == NULL);
+    good_config(&c);
+    c.use_lba_mode = true; CHECK(config_validate(&c, true) && !strcmp(config_validate(&c, true), "lba_sectors"));
+    c.lba_sectors = 1953525168ULL; CHECK(config_validate(&c, true) == NULL);
+    c.lba_sectors = 1ULL << 48; CHECK(config_validate(&c, true) != NULL);
+    good_config(&c);
+    memset(&c.auto_mount, 2, 1); CHECK(config_validate(&c, true) && !strcmp(config_validate(&c, true), "auto_mount"));
+    good_config(&c); c.dev_base = 0x00;   CHECK(config_validate(&c, true) != NULL);
+    good_config(&c); c.read_timeout_ms = 49; CHECK(config_validate(&c, true) != NULL);
+    good_config(&c); c.write_timeout_ms = 600001; CHECK(config_validate(&c, true) != NULL);
+    good_config(&c); c.ecc_len = 65; CHECK(config_validate(&c, true) != NULL);
+    good_config(&c); c.geo_mode = 5; CHECK(config_validate(&c, true) != NULL);
+    good_config(&c); memset(c.geo_model, 'A', sizeof(c.geo_model));
+    CHECK(config_validate(&c, true) != NULL);               // unterminated owner string
+    CHECK(config_validate(&c, false) == NULL);              // ...ignored for older layouts
+
+    CHECK(config_chs_valid(1, 1, 1) && config_chs_valid(65535, 16, 63));
+    CHECK(!config_chs_valid(0, 1, 1) && !config_chs_valid(65536, 1, 1));
+    CHECK(!config_chs_valid(1, 0, 1) && !config_chs_valid(1, 17, 1));
+    CHECK(!config_chs_valid(1, 1, 0) && !config_chs_valid(1, 1, 64));
+
+    // CRC as config_save stores it: over every byte before 'crc'
+    good_config(&c);
+    uint32_t crc = config_crc32(&c, (uint32_t)offsetof(config_t, crc));
+    c.cyls = 1;
+    CHECK(config_crc32(&c, (uint32_t)offsetof(config_t, crc)) != crc);
+    CHECK(sizeof(config_t) <= 256);                         // one flash page
+
+    // geometry owner
+    uint16_t id[256];
+    memset(id, 0, sizeof(id));
+    id[1] = 989; id[3] = 10; id[6] = 34;
+    good_config(&c);
+    c.cyls = 989; c.heads = 10; c.spt = 34; c.geo_mode = GEO_NORMAL;
+    strcpy(c.geo_model, "IBM-H2172-A2"); strcpy(c.geo_serial, "S1");
+    CHECK(config_geo_identity(&c, "IBM-H2172-A2", "S1", id) == GEO_ID_MATCH);
+    CHECK(config_geo_identity(&c, "IBM-H2172-A2", "S2", id) == GEO_ID_MISMATCH);
+    CHECK(config_geo_identity(&c, "WDC WD10EZEX", "S1", id) == GEO_ID_MISMATCH);
+    CHECK(config_geo_identity(&c, "x", "y", NULL) == GEO_ID_UNKNOWN);   // no IDENTIFY data
+    // owner unknown (older settings): IDENTIFY-derived geometry must agree
+    c.geo_model[0] = c.geo_serial[0] = '\0';
+    CHECK(config_geo_identity(&c, "IBM-H2172-A2", "S1", id) == GEO_ID_MATCH);
+    uint16_t big[256];
+    memset(big, 0, sizeof(big));
+    big[1] = 16383; big[3] = 16; big[6] = 63; big[49] = 0x0200; big[83] = 1 << 10;
+    big[60] = 0xFFFF; big[61] = 0x0FFF;
+    big[100] = 0x6DB0; big[101] = 0x7470;                    // 1953525168 sectors
+    CHECK(config_geo_identity(&c, "WDC WD10EZEX", "S9", big) == GEO_ID_MISMATCH);   // the 336260-sector case
+    c.geo_mode = GEO_LBA; c.use_lba_mode = true; c.lba_sectors = 1953525168ULL;
+    CHECK(config_geo_identity(&c, "WDC WD10EZEX", "S9", big) == GEO_ID_MATCH);
+    c.lba_sectors = 268435455ULL;
+    CHECK(config_geo_identity(&c, "WDC WD10EZEX", "S9", big) == GEO_ID_MISMATCH);
+    c.geo_mode = GEO_LARGE; c.use_lba_mode = false; c.cyls = 989; c.heads = 10; c.spt = 34;
+    CHECK(config_geo_identity(&c, "IBM-H2172-A2", "S1", id) == GEO_ID_MATCH);
+    c.geo_mode = GEO_MANUAL; c.cyls = 1000;
+    CHECK(config_geo_identity(&c, "IBM-H2172-A2", "S1", id) == GEO_ID_UNKNOWN);
+    CHECK(!strcmp(config_geo_identity_name(GEO_ID_MISMATCH), "mismatch"));
+
+    uint16_t lc; uint8_t lh;
+    config_large_chs(16383, 16, &lc, &lh);
+    CHECK(lc == 16383 && lh == 16);
+}
+
 int main(void) {
     test_policy();
     test_json();
+    test_config();
     if (failures) { printf("%d failure(s)\n", failures); return 1; }
     printf("all host tests passed\n");
     return 0;

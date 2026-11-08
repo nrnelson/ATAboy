@@ -16,6 +16,8 @@ import json
 import os
 import struct
 import sys
+import contextlib
+import io
 import tempfile
 import unittest
 
@@ -80,6 +82,10 @@ class FakeDevice:
         self.hash_records = []       # (seq, lba, source, flags, digest) of every sector read
         self.hash_newest = 0
         self.hash_capacity = 1024
+        self.settings = {"load": "ok", "field": None}
+        self.owner = {"model": "FAKE DRIVE", "serial": "1"}
+        self.model, self.serial = "FAKE DRIVE", "1"
+        self.ready = True            # BSY clear + DRDY within the mount check's 3 s
 
     # -- transport ------------------------------------------------------------
 
@@ -139,19 +145,41 @@ class FakeDevice:
     def status_json(self):
         return {"fw": "fake-api1", "uptime_ms": self.uptime, "mounted": self.mounted,
                 "write_protect": self.config["write_protect"], "armed": False,
+                "settings": dict(self.settings),
                 "drive": {"present": True, "identified": self.identified, "forced": False,
-                          "device": "master", "model": "FAKE DRIVE", "serial": "1", "firmware": "1",
+                          "device": "master", "model": self.model, "serial": self.serial, "firmware": "1",
                           "default_chs": [0, 0, 0], "lba": True, "lba28_sectors": min(self.total, (1 << 28) - 1),
                           "lba48": self.total >= (1 << 28), "lba48_sectors": self.total,
                           "ecc_bytes": self.ecc, "ata_major": 0},
                 "geometry": {"valid": self.geometry_valid, "mode": "lba", "addressing": "lba",
-                             "cyls": 0, "heads": 0, "spt": 0, "sectors": self.total},
+                             "cyls": 0, "heads": 0, "spt": 0, "sectors": self.total,
+                             "owner": dict(self.owner), "identity": self.identity()},
                 "bus": {"status": 0x50, "status_bits": "DRDY|DSC", "pio_faults": 0},
                 "config": dict(self.config),
-                "stats": {}, "errors": {"total": len(self.log), "retained": len(self.log),
+                "stats": {k: 0 for k in ("read_cmds", "read_sectors", "read_errors", "write_cmds",
+                                         "write_sectors", "write_errors", "timeouts", "recoveries",
+                                         "passthru_cmds", "passthru_errors", "passthru_blocked",
+                                         "api_cmds")},
+                "errors": {"total": len(self.log), "retained": len(self.log),
                                         "last": self.log[-1] if self.log else None}}
 
     # -- firmware model -------------------------------------------------------
+
+    def identity(self):
+        if not self.identified or not (self.owner["model"] or self.owner["serial"]):
+            return "unknown"
+        return "match" if (self.owner["model"], self.owner["serial"]) == (self.model, self.serial) else "mismatch"
+
+    def mount(self, force):
+        """Firmware mount checks (drive_mount_ex): owner mismatch refuses unless forced."""
+        if not self.geometry_valid:
+            return R["no_geometry"], "detect or set geometry first"
+        if not force and not self.mounted and not self.ready:
+            return R["not_ready"], "drive not ready (BSY, or no DRDY) after 3 s"
+        if not force and not self.mounted and self.identity() == "mismatch":
+            return R["geometry_mismatch"], "the geometry was set up for another drive"
+        self.mounted = True
+        return 0, None
 
     def fails(self, lba, no_retry):
         mode = self.bad.get(lba)
@@ -167,15 +195,21 @@ class FakeDevice:
                                        "board": "fake", "board_id": "0",
                                        "max_read_sectors": (4096 - 48) // 512})
         if op in (0x01, 0x10, 0x11, 0x12, 0x13, 0x14):
+            res, msg = 0, None
             if op == 0x12:
-                self.mounted = True
+                res, msg = self.mount(bool(a[0] & 1))
             elif op == 0x13:
                 self.mounted = False
-            elif op == 0x10 and a[6] & 2:
-                self.mounted = True
-            return self.jreply(op, 0, self.status_json())
+            elif op == 0x10:
+                if a[1] != 5:                    # any geometry but "keep": owner = this drive
+                    self.owner = {"model": self.model, "serial": self.serial}
+                if a[6] & 2:
+                    res, msg = self.mount(bool(a[6] & 8))
+            return self.jreply(op, res, self.status_json(), msg)
         if op == 0x02:
             return self.jreply(op, 0, {"config": dict(self.config)})
+        if op == 0x15:
+            return self.op_park(op, a)
         if op == 0x03:
             key, value = struct.unpack(">B3xI", a[:8])
             names = {v[0]: (k, v[1]) for k, v in ab.CONFIG_KEYS.items()}
@@ -203,6 +237,30 @@ class FakeDevice:
             return self.jreply(op, 0, {"total": len(self.log), "retained": len(self.log), "start": start,
                                        "returned": len(page), "next": nxt, "entries": page})
         return self.jreply(op, R["bad_subop"], message="unknown sub-operation")
+
+    park_e0_aborts = False
+    park_seek_fails = False
+
+    def op_park(self, op, a):
+        if self.mounted:
+            return self.jreply(op, R["mounted"], self.status_json(), "unmount first")
+        seek, cyl = a[0] & 1, struct.unpack(">H", a[2:4])[0]
+        self.park_calls = getattr(self, "park_calls", []) + [(seek, cyl)]
+
+        def cmd(command, ok, err=0x04):
+            return {"command": command, "result": "ok" if ok else "ata_error",
+                    "status": 0x50 if ok else 0x51, "status_bits": "DRDY|DSC" if ok else "DRDY|DSC|ERR",
+                    "error": 0 if ok else err, "error_bits": "" if ok else "ABRT", "elapsed_ms": 5}
+        o = {"seek": None, "fallback": self.park_e0_aborts}
+        res = 0
+        if seek:
+            o["seek"] = dict(cmd(0x70, not self.park_seek_fails), cylinder=cyl)
+            if self.park_seek_fails:
+                res = R["ata_error"]
+        o["standby"] = cmd(0x94 if self.park_e0_aborts else 0xE0, True)
+        if self.park_e0_aborts:
+            o.update(e0_status=0x51, e0_error=0x04)
+        return self.jreply(op, res, o, "heads parked" if res == 0 else "SEEK to the landing zone failed")
 
     def op_read(self, op, a, alloc):
         lba, count, flags, tmo = struct.unpack(">IHBxI", a)
@@ -935,6 +993,140 @@ class EmptyReplyTest(HostTestCase):
             self.dev.call("mount")
         self.assertEqual(self.dev.empty_replies, 0)
         self.assertEqual(sum(1 for op, _ in self.fake.calls if op == ab.OPS["mount"]), 1)
+
+class TestGeometryOwner(HostTestCase):
+    def swap_drive(self):
+        self.fake.model, self.fake.serial = "WDC WD10EZEX-00BN5A0", "WD-WCC3F0000000"
+
+    def test_mount_refused_after_swap(self):
+        self.swap_drive()
+        r = self.dev.mount(rescan=False)
+        self.assertEqual(r.result_name, "geometry_mismatch")
+        self.assertFalse(self.fake.mounted)
+        self.assertEqual(r.json["geometry"]["identity"], "mismatch")
+        self.assertEqual(self.fake.calls[-1], (ab.OPS["mount"], bytes(12)))
+
+    def test_force_mount(self):
+        self.swap_drive()
+        r = self.dev.mount(rescan=False, force=True)
+        self.assertTrue(r.ok)
+        self.assertEqual(self.fake.calls[-1][1][0], 1)
+        self.assertTrue(self.fake.mounted)
+
+    def test_detect_sets_owner_keep_does_not(self):
+        self.swap_drive()
+        r = self.dev.detect(geometry="keep", mount=True)
+        self.assertEqual(r.result_name, "geometry_mismatch")
+        r = self.dev.detect(geometry="keep", force_mount=True)
+        self.assertTrue(r.ok)
+        self.assertEqual(self.fake.calls[-1][1][6], 2 | 8)
+        self.fake.mounted = False
+        r = self.dev.detect(mount=True)
+        self.assertTrue(r.ok)
+        self.assertEqual(r.json["geometry"]["owner"]["model"], "WDC WD10EZEX-00BN5A0")
+
+    def test_forced_manual_detect_and_mount_cdb(self):
+        # A drive that doesn't answer IDENTIFY: manual CHS + force + mount in one DETECT.
+        r = self.dev.detect(geometry="manual", chs=(615, 4, 17), force=True, mount=True)
+        self.assertTrue(r.ok)
+        a = [args for op, args in self.fake.calls if op == 0x10][-1]
+        self.assertEqual(a[:7], bytes([0, 4]) + struct.pack(">H", 615) + bytes([4, 17, 2 | 4]))
+
+    def test_not_ready_drive_is_not_mounted(self):
+        self.fake.ready = False
+        r = self.dev.mount(rescan=False)
+        self.assertEqual(r.result_name, "not_ready")
+        self.assertFalse(self.fake.mounted)
+        self.assertTrue(self.dev.mount(rescan=False, force=True).ok)
+
+    def test_human_status_shows_mismatch(self):
+        self.swap_drive()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ab.human_status(self.dev.status())
+        self.assertIn("MISMATCH: set up for FAKE DRIVE (serial 1)", buf.getvalue())
+
+    def test_cli_mount_force_exit_codes(self):
+        self.swap_drive()
+        orig = ab.ATAboy
+        ab.ATAboy = lambda path=None: self.dev
+        self.dev.close = lambda: None
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(ab.main(["--no-sudo", "-j", "mount", "--no-rescan"]), ab.EXIT_DEVICE)
+                self.assertEqual(ab.main(["--no-sudo", "-j", "mount", "--no-rescan", "--force"]), ab.EXIT_OK)
+        finally:
+            ab.ATAboy = orig
+
+
+class TestPark(HostTestCase):
+    def test_standby_only(self):
+        r = self.dev.park()
+        self.assertTrue(r.ok)
+        self.assertEqual(self.fake.calls[-1], (0x15, bytes(12)))
+        self.assertIsNone(r.json["seek"])
+        self.assertEqual(r.json["standby"]["command"], 0xE0)
+
+    def test_landing_zone_and_fallback(self):
+        self.fake.park_e0_aborts = True
+        r = self.dev.park(cylinder=1023)
+        self.assertTrue(r.ok)
+        self.assertEqual(self.fake.calls[-1][1][:4], bytes([1, 0, 0x03, 0xFF]))
+        self.assertEqual(r.json["seek"]["cylinder"], 1023)
+        self.assertEqual(r.json["standby"]["command"], 0x94)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ab.human_park(r.json)
+        self.assertIn("sent the ATA-1 STANDBY IMMEDIATE 94h", buf.getvalue())
+        self.assertIn("cylinder 1023", buf.getvalue())
+
+    def test_refused_while_mounted_and_bad_cylinder(self):
+        self.fake.mounted = True
+        self.assertEqual(self.dev.park().result_name, "mounted")
+        with self.assertRaises(ValueError):
+            self.dev.park(cylinder=70000)
+
+    def test_cli(self):
+        self.fake.park_seek_fails = True
+        orig = ab.ATAboy
+        ab.ATAboy = lambda path=None: self.dev
+        self.dev.close = lambda: None
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(ab.main(["--no-sudo", "park", "--landing-zone", "0x3ff"]), ab.EXIT_DEVICE)
+            self.assertIn("SEEK to the landing zone failed", out.getvalue())
+            self.assertEqual(self.fake.park_calls[-1], (1, 1023))
+            self.fake.park_seek_fails = False
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(ab.main(["--no-sudo", "-j", "park"]), ab.EXIT_OK)
+        finally:
+            ab.ATAboy = orig
+
+
+class TestSettingsStatus(HostTestCase):
+    def human(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ab.human_status(self.dev.status())
+        return buf.getvalue()
+
+    def test_ok_settings_are_quiet(self):
+        self.assertNotIn("settings", self.human())
+        self.fake.settings = {"load": "legacy", "field": None}
+        self.assertNotIn("REJECTED", self.human())
+
+    def test_rejected_settings_are_reported(self):
+        self.fake.settings = {"load": "invalid", "field": "chs"}
+        self.assertIn("SAVED SETTINGS REJECTED (invalid, field chs): defaults loaded", self.human())
+        self.fake.settings = {"load": "crc_error", "field": None}
+        self.assertIn("REJECTED (crc_error)", self.human())
+
+    def test_old_firmware_without_settings(self):
+        self.fake.status_json = lambda orig=self.fake.status_json: {
+            k: v for k, v in orig().items() if k != "settings"}
+        self.assertIn("firmware", self.human())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

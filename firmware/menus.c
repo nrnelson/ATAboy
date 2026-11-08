@@ -106,6 +106,7 @@ static bool     use_lba_mode = false;
 static uint32_t seen_api_gen = 0;      // drive.api_gen the menu last synced to
 static bool show_detect_result = false;
 static bool force_detect = false;
+static bool error_is_notice = false;   // error box is informational: dismissing it changes nothing
 static int  confirm_type = 0;
 
 #define RESET       "\033[0m"
@@ -125,6 +126,7 @@ static int  confirm_type = 0;
 #define KEY_ENTER 13
 #define KEY_ESC   27
 #define KEY_F10   1010
+#define KEY_CTRL_L 12     // redraw the whole screen
 
 typedef enum {
     SCREEN_MAIN,
@@ -156,11 +158,6 @@ static int visible_strlen(const char *s) {
         } else { len++; s++; }
     }
     return len;
-}
-
-static void sanitize_identify_model(char *s) {
-    int len = strlen(s);
-    while (len > 0 && s[len - 1] == ' ') s[--len] = '\0';
 }
 
 static void decode_ata_string(uint16_t *buf, int offset, int len_words, char *out) {
@@ -223,8 +220,10 @@ static void print_help(const char *text) {
 // ---------------------------------------------------------------------------
 
 static void draw_bios_frame(void) {
-    cdc_printf(BG_BLUE FG_WHITE CLR_SCR HIDE_CUR "\033[H");
-    cdc_printf("\033[1;1H%80s", "");
+    cdc_printf(RESET BG_BLUE FG_WHITE CLR_SCR HIDE_CUR "\033[H");
+    // Paint every cell blue: terminals without background-color erase
+    // (screen, some serial terminals) clear to their default colour.
+    for (int r = 1; r <= 24; r++) cdc_printf("\033[%d;1H%80s", r, "");
     cdc_printf("\033[1;8H" FG_WHITE "ATAboy Setup Utility v" FW_VERSION " - Copyright (C) 2026 obsoletetech.us");
 
     bool feat = (current_screen == SCREEN_FEATURES);
@@ -283,12 +282,15 @@ static void draw_hdd_status(void) {
     int dev_len = (hdd_model_raw[0] && !is_error) ? (int)strlen(dev_label) : 0;
     int start_x = (80 - (label_len + text_len + dev_len)) / 2;
 
+    // Blank both status rows with spaces rather than erase-to-end-of-line,
+    // which clears to the terminal's default colour without bce.
+    cdc_printf(RESET BG_BLUE FG_WHITE "\033[22;2H%78s\033[23;2H%78s", "", "");
     draw_at(start_x, 22, FG_WHITE "Current HDD: ");
-    if (is_error)        cdc_printf("\033[91;1m%s" RESET BG_BLUE FG_WHITE "\033[K", display);
-    else if (hdd_model_raw[0]) cdc_printf("\033[32;1m%s" FG_YELLOW "%s" RESET BG_BLUE FG_WHITE "\033[K", display, dev_label);
-    else                 cdc_printf(FG_YELLOW "%s" RESET BG_BLUE FG_WHITE "\033[K", display);
+    if (is_error)        cdc_printf("\033[91;1m%s" RESET BG_BLUE FG_WHITE, display);
+    else if (hdd_model_raw[0]) cdc_printf("\033[32;1m%s" FG_YELLOW "%s" RESET BG_BLUE FG_WHITE, display, dev_label);
+    else                 cdc_printf(FG_YELLOW "%s" RESET BG_BLUE FG_WHITE, display);
 
-    cdc_puts(RESET BG_BLUE FG_WHITE "\033[K");
+    cdc_puts(RESET BG_BLUE FG_WHITE);
     cdc_puts("\033[22;78H  " BOX_VH);
 
     char geo_vals[64];
@@ -307,7 +309,7 @@ static void draw_hdd_status(void) {
                     (!use_lba_mode && cur_cyls > 0 && cur_heads > 0 && cur_spt > 0);
     cdc_printf(is_valid ? "\033[92;1m%s" : "\033[91;1m%s", geo_vals);
 
-    cdc_puts(RESET BG_BLUE FG_WHITE "\033[K");
+    cdc_puts(RESET BG_BLUE FG_WHITE);
     cdc_puts("\033[23;78H  " BOX_VH);
     cdc_puts("\033[24;79H");
     cdc_flush();
@@ -323,12 +325,13 @@ static void update_main_menu(void) {
         "  Mount HDD to USB Mass Storage",     // 1 — left,  row 8
         BOX_ARROW " ATAboy Features Setup",    // 2 — right, row 6
         "  Load Setup Defaults",               // 3 — right, row 8
-        "  Save Setup to EEPROM"               // 4 — right, row 10
+        "  Save Setup to EEPROM",              // 4 — right, row 10
+        "  Park Heads for Power-Off"           // 5 — left,  row 10
     };
 
-    for (int i = 0; i < 5; i++) {
-        int col = (i < 2) ? 4 : 43;
-        int row = 6 + (i < 2 ? i : (i - 2)) * 2;
+    for (int i = 0; i < 6; i++) {
+        int col = (i < 2 || i == 5) ? 4 : 43;
+        int row = (i == 5) ? 10 : 6 + (i < 2 ? i : (i - 2)) * 2;
         cdc_printf("\033[%d;%dH", row, col);
         if (i == config.main_selected)
             cdc_printf(SEL_RED " %-28s " RESET BG_BLUE FG_WHITE, items[i]);
@@ -465,6 +468,8 @@ static void draw_confirm_box(const char *message) {
 //  Error box — 52 wide, 7 tall
 // ---------------------------------------------------------------------------
 
+static const char *error_title = "ERROR!";
+
 static void draw_error_box(const char *error_msg, bool show_force) {
     int box_w = 52, start_col = 14, start_row = 9;
 
@@ -475,7 +480,8 @@ static void draw_error_box(const char *error_msg, bool show_force) {
     cdc_printf("\033[%d;%dH", start_row, start_col);
     cdc_puts(BOX_TL); emit_n(BOX_HH, 50); cdc_puts(BOX_TR);
 
-    cdc_printf("\033[%d;%dH" BOX_VH "                      ERROR!                      " BOX_VH, start_row+1, start_col);
+    int tl = (int)strlen(error_title), tp = (50 - tl) / 2;
+    cdc_printf("\033[%d;%dH" BOX_VH "%*s%s%*s" BOX_VH, start_row+1, start_col, tp, "", error_title, 50 - tl - tp, "");
 
     cdc_printf("\033[%d;%dH", start_row+2, start_col);
     cdc_puts(BOX_MLD); emit_n(BOX_HH, 50); cdc_puts(BOX_MRD);
@@ -504,7 +510,7 @@ static void draw_error_box(const char *error_msg, bool show_force) {
 //  Geometry selection overlay — 64 wide, 14 tall
 // ---------------------------------------------------------------------------
 
-static void draw_selection_menu_ex(uint16_t *id, int selected_idx, bool force_mode) {
+static void draw_selection_menu_ex(const uint16_t *id, int selected_idx, bool force_mode, const char *note) {
     int box_w = 64, start_col = 9, start_row = 5;
 
     uint16_t n_cyl = id[1];
@@ -601,7 +607,10 @@ static void draw_selection_menu_ex(uint16_t *id, int selected_idx, bool force_mo
     cdc_puts(BOX_MLD); emit_n(BOX_HH, 62); cdc_puts(BOX_MRD);
 
     cdc_printf("\033[%d;%dH" BOX_VH "  " BOX_ARRU " " BOX_ARRD ": Mode    TAB: Change CHS     Enter: Select    Esc: Quit " BOX_VH, start_row+11, start_col);
-    cdc_printf("\033[%d;%dH" BOX_VH "  \033[33m   LBA Recommended for modern drives; NORMAL for legacy.    \033[0m" SEL_RED BOX_VH, start_row+12, start_col);
+    if (note && note[0])
+        cdc_printf("\033[%d;%dH" BOX_VH "\033[93;1m%-62.62s\033[0m" SEL_RED BOX_VH, start_row+12, start_col, note);
+    else
+        cdc_printf("\033[%d;%dH" BOX_VH "  \033[33m   LBA Recommended for modern drives; NORMAL for legacy.    \033[0m" SEL_RED BOX_VH, start_row+12, start_col);
 
     // Row 13: bottom
     cdc_printf("\033[%d;%dH", start_row+13, start_col);
@@ -611,8 +620,110 @@ static void draw_selection_menu_ex(uint16_t *id, int selected_idx, bool force_mo
     cdc_flush();
 }
 
-static void draw_selection_menu(uint16_t *id, int selected_idx) {
-    draw_selection_menu_ex(id, selected_idx, false);
+// ---------------------------------------------------------------------------
+//  Geometry picker + manual CHS entry (Auto Detect and F: Force)
+// ---------------------------------------------------------------------------
+
+#define PICK_ROW 14                       // MANUAL row of the selection box
+
+// Ctrl+L inside an overlay on the main screen: repaint what's underneath;
+// the caller repaints its overlay.
+static void redraw_main_underlay(void) {
+    draw_bios_frame();
+    update_main_menu();
+}
+
+static const int chs_col[3]    = {9+26, 9+38, 9+48};
+static const int chs_digits[3] = {5, 2, 2};
+
+static bool api_took_over(void) {
+    return drive.api_gen != seen_api_gen || is_mounted;
+}
+
+// Ask for C/H/S on the MANUAL row.  Returns 1 with valid values in *c/*h/*s,
+// 0 when aborted (Esc, or the API took over): nothing is applied either way.
+// An out-of-range value leaves a message in 'note' and returns -1.
+static int manual_chs_entry(const uint16_t *id, bool force_mode, uint16_t *c, uint8_t *h, uint8_t *s,
+                            char *note, size_t note_len) {
+    long mf[3] = {detect_cyls, detect_heads, detect_spt};
+    for (int f = 0; f < 3; f++) {
+        char ib[8] = {0};
+        int p = 0;
+        draw_at(chs_col[f], PICK_ROW, "\033[103;30m     \033[0m");
+        cdc_printf("\033[103;30m\033[%d;%dH", PICK_ROW, chs_col[f]);
+        while (true) {
+            int k = get_input();
+            if (api_took_over()) return 0;
+            if (k == -1) { tight_loop_contents(); continue; }
+            if (k == KEY_CTRL_L) {
+                redraw_main_underlay();
+                draw_selection_menu_ex(id, 3, force_mode, note);
+                for (int i = 0; i < f; i++) { draw_at(chs_col[i], PICK_ROW, SEL_RED); cdc_printf("%-5ld", mf[i]); }
+                ib[p] = '\0';
+                draw_at(chs_col[f], PICK_ROW, "\033[103;30m     ");
+                cdc_printf("\033[%d;%dH%s", PICK_ROW, chs_col[f], ib);
+                continue;
+            }
+            if (k >= '0' && k <= '9' && p < chs_digits[f]) { ib[p++] = (char)k; cdc_putchar((char)k); }
+            else if ((k == 8 || k == 127) && p > 0) { p--; cdc_printf("\b \b\033[%d;%dH", PICK_ROW, chs_col[f] + p); }
+            else if (k == KEY_ENTER || k == '\t') {
+                if (p > 0) mf[f] = atol(ib);
+                draw_at(chs_col[f], PICK_ROW, RESET SEL_RED);
+                cdc_printf("%-5ld", mf[f]);
+                break;
+            }
+            else if (k == KEY_ESC) { cdc_puts(RESET); return 0; }
+        }
+    }
+    cdc_puts(RESET);
+    if (mf[0] < 1 || mf[0] > 65535) { snprintf(note, note_len, "  Cylinders must be 1..65535"); return -1; }
+    if (mf[1] < 1 || mf[1] > 16)    { snprintf(note, note_len, "  Heads must be 1..16"); return -1; }
+    if (mf[2] < 1 || mf[2] > 63)    { snprintf(note, note_len, "  Sectors per track must be 1..63"); return -1; }
+    detect_cyls = (uint16_t)mf[0]; detect_heads = (uint8_t)mf[1]; detect_spt = (uint8_t)mf[2];
+    *c = detect_cyls; *h = detect_heads; *s = detect_spt;
+    return 1;
+}
+
+// Geometry selection for the drive in drive.id[] (force_mode: no IDENTIFY
+// data, MANUAL only).  Returns true once a geometry has been applied.
+static bool run_geometry_picker(const uint16_t *id, bool force_mode) {
+    bool ls = !force_mode && (id[49] & 0x0200);
+    int geo_idx = force_mode ? 3 : (ls ? 2 : 0);
+    bool sd = true;
+    char note[64] = "";
+
+    while (true) {
+        if (sd) { draw_selection_menu_ex(id, geo_idx, force_mode, note); sd = false; }
+        int ch = get_input();
+        if (api_took_over()) return false;
+        if (ch == -1) { tight_loop_contents(); continue; }
+        if (ch == KEY_CTRL_L) { redraw_main_underlay(); sd = true; continue; }
+
+        if (!force_mode && ch == KEY_UP && geo_idx > 0)   { geo_idx--; if (!ls && geo_idx == 2) geo_idx--; sd = true; }
+        else if (!force_mode && ch == KEY_DOWN && geo_idx < 3) { geo_idx++; if (!ls && geo_idx == 2) geo_idx++; sd = true; }
+        else if (ch == KEY_ESC) return false;
+        else if (ch == '\t' || (ch == KEY_ENTER && geo_idx == 3)) {
+            geo_idx = 3;
+            note[0] = '\0';
+            draw_selection_menu_ex(id, geo_idx, force_mode, note);
+            uint16_t c; uint8_t h, sp;
+            int m = manual_chs_entry(id, force_mode, &c, &h, &sp, note, sizeof(note));
+            if (api_took_over()) return false;
+            if (m == 1) {
+                int r = drive_apply_geometry(GEO_MANUAL, c, h, sp);
+                if (r == R_OK) return true;
+                snprintf(note, sizeof(note), "  Geometry rejected (error %d)", r);
+            }
+            sd = true;
+        } else if (ch == KEY_ENTER) {
+            uint8_t mode = geo_idx == 0 ? GEO_NORMAL : geo_idx == 1 ? GEO_LARGE : GEO_LBA;
+            int r = drive_apply_geometry(mode, 0, 0, 0);
+            if (r == R_OK) return true;
+            snprintf(note, sizeof(note), r == R_UNSUPPORTED ? "  Not supported by this drive"
+                                                            : "  Not usable here (needs 1..16 heads); try MANUAL");
+            sd = true;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -740,7 +851,13 @@ static void run_seek_test(void) {
 
     double x = 0;
     while (true) {
-        if (cdc_getchar_timeout_us(0) == 27) break;
+        int k = cdc_getchar_timeout_us(0);
+        if (k == 27) break;
+        if (k == KEY_CTRL_L) {
+            draw_bios_frame();
+            draw_debug_overlay();
+            debug_print(0, FG_YELLOW, "Seek Test Running...  (Esc stops)");
+        }
         double pos = (sin(x)*0.45)+0.5;
         uint32_t target = (uint32_t)(pos*(max_range-1));
 
@@ -785,6 +902,8 @@ static void sync_from_api(void) {
         hdd_model_raw[0] = '\0';
     }
     show_detect_result = false;
+    error_is_notice = false;
+    error_title = "ERROR!";
     hdd_status_text[0] = '\0';
     if (is_mounted) current_screen = SCREEN_MOUNTED;
     else if (current_screen == SCREEN_MOUNTED || current_screen == SCREEN_CONFIRM) current_screen = SCREEN_MAIN;
@@ -795,12 +914,17 @@ static void sync_from_api(void) {
 //  Auto-mount — runs on core 1 so IDE ops never block USB on core 0
 // ---------------------------------------------------------------------------
 
+static void show_notice(const char *msg) {
+    error_title = "NOTICE";
+    snprintf(hdd_status_text, sizeof(hdd_status_text), "\033[91;1m%s", msg);
+    show_detect_result = true;
+    error_is_notice = true;
+    force_detect = false;
+}
+
 static void try_auto_mount(void) {
     if (!config.auto_mount) return;
-
-    bool has_geo = (config.use_lba_mode && config.lba_sectors > 0) ||
-                   (!config.use_lba_mode && config.cyls > 0 && config.heads > 0 && config.spt > 0);
-    if (!has_geo) return;
+    if (!drive_geometry_valid()) return;
 
     // Wait for drive to spin up
     sleep_ms(5000);
@@ -819,21 +943,73 @@ static void try_auto_mount(void) {
     if (!ready) return;
 
     uint16_t id_buf[256];
-    if (!ide_identify(id_buf)) return;
-
-    // Fill model string for display
-    for (int i = 0; i < 20; i++) {
-        uint16_t val = id_buf[27+i];
-        hdd_model_raw[i*2] = (char)(val>>8); hdd_model_raw[i*2+1] = (char)(val&0xFF);
+    if (ide_identify(id_buf)) {
+        drive_note_identify(id_buf);
+    } else if (config.geo_mode == GEO_MANUAL && !config.geo_model[0] && !config.geo_serial[0]) {
+        drive_note_forced();      // geometry was forced for a drive that doesn't answer IDENTIFY
+        drive.present = true;
+    } else {
+        return;
     }
-    hdd_model_raw[40] = '\0'; sanitize_identify_model(hdd_model_raw);
-    drive_note_identify(id_buf);
+    strncpy(hdd_model_raw, drive.model, sizeof(hdd_model_raw) - 1);
+    hdd_model_raw[sizeof(hdd_model_raw) - 1] = '\0';
 
     if (!config.use_lba_mode)
         ide_set_geometry(config.heads, config.spt);
 
-    is_mounted = true;
-    media_changed_waiting = true;
+    int r = drive_mount_ex(0);    // refuses geometry saved for a different drive
+    if (r == R_GEO_MISMATCH) show_notice("Saved geometry is for another drive: not mounted");
+    else if (r == R_NOT_READY) show_notice("Drive not ready: not mounted");
+}
+
+// ---------------------------------------------------------------------------
+//  Park heads (power-off preparation for drives without automatic parking)
+// ---------------------------------------------------------------------------
+
+static void draw_park_box(const char *digits) {
+    draw_confirm_box("Park heads: landing-zone cylinder?");
+    cdc_printf(SEL_RED "\033[11;16H Optional, for stepper drives.  Enter = none ");
+    cdc_printf("\033[13;16H Esc = cancel   Cylinder: \033[103;30m%-5s\033[0m" SEL_RED, digits);
+    cdc_printf("\033[13;%dH", 42 + (int)strlen(digits));
+}
+
+static void run_park_dialog(void) {
+    char ib[8] = {0};
+    int p = 0;
+    draw_park_box(ib);
+    while (true) {
+        int k = get_input();
+        if (api_took_over()) return;
+        if (k == -1) { tight_loop_contents(); continue; }
+        if (k == KEY_ESC) { cdc_puts(RESET); return; }
+        if (k == KEY_CTRL_L) { redraw_main_underlay(); draw_park_box(ib); continue; }
+        if (k >= '0' && k <= '9' && p < 5) { ib[p++] = (char)k; ib[p] = '\0'; draw_park_box(ib); }
+        else if ((k == 8 || k == 127) && p > 0) { ib[--p] = '\0'; draw_park_box(ib); }
+        else if (k == KEY_ENTER) {
+            long cyl = p ? atol(ib) : -1;
+            if (cyl > 65535) { p = 0; ib[0] = '\0'; draw_park_box(ib); continue; }
+            draw_confirm_box(cyl >= 0 ? "Seeking to landing zone, then STANDBY..." : "Sending STANDBY IMMEDIATE...");
+            cdc_puts(RESET);
+            drive_park_t r;
+            int res = drive_park(cyl >= 0, cyl >= 0 ? (uint16_t)cyl : 0, &r);
+            sync_from_api();
+            char msg[64];
+            if (res == R_MOUNTED)
+                snprintf(msg, sizeof(msg), "Unmount first");
+            else if (res == R_OK)
+                snprintf(msg, sizeof(msg), "%sParked (%02Xh OK). Power off now.", r.seek_issued ? "Seek OK. " : "",
+                         r.standby.command);
+            else if (r.seek_issued && r.seek.result != IDE_OK)
+                snprintf(msg, sizeof(msg), "SEEK failed (ST %02X ER %02X); STANDBY %s", r.seek.status, r.seek.error,
+                         r.standby.result == IDE_OK ? "OK" : "failed");
+            else
+                snprintf(msg, sizeof(msg), "STANDBY %02Xh failed (ST %02X ER %02X)", r.standby.command,
+                         r.standby.status, r.standby.error);
+            show_notice(msg);
+            error_title = res == R_OK ? "PARKED" : "PARK FAILED";
+            return;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -843,6 +1019,13 @@ static void try_auto_mount(void) {
 void core1_entry(void) {
     multicore_lockout_victim_init();   // core 0 may save config to flash
     sync_from_config();
+    if (config_load_status == CONFIG_LOAD_CRC_ERROR || config_load_status == CONFIG_LOAD_INVALID) {
+        // Defaults are already in effect (no geometry, nothing to mount): just say so.
+        strcpy(hdd_status_text, "\033[91;1mSaved settings corrupt - defaults loaded");
+        show_detect_result = true;
+        error_is_notice = true;
+        force_detect = false;
+    }
     try_auto_mount();
     bool trigger_overlay = false;
 
@@ -887,6 +1070,7 @@ void core1_entry(void) {
                 else if (confirm_type == 1) draw_confirm_box("Save Current Setup to EEPROM (Y/N)?");
                 else if (confirm_type == 3) draw_confirm_box("Are you sure you want to mount the drive (Y/N)?");
                 else if (confirm_type == 4) draw_confirm_box("Are you sure you want to unmount (Y/N)?");
+                else if (confirm_type == 5) draw_confirm_box("Geometry is from another drive! Mount (Y/N)?");
                 trigger_overlay = false;
             }
         } else if (current_screen == SCREEN_MOUNTED) {
@@ -902,58 +1086,28 @@ void core1_entry(void) {
         int k = get_input();
         if (k == -1) { tight_loop_contents(); continue; }
         if (drive.api_gen != seen_api_gen) { sync_from_api(); continue; }   // state changed under us
+        if (k == KEY_CTRL_L) { needs_full_redraw = true; continue; }        // every screen and overlay
 
         if (show_detect_result) {
             if (k == KEY_ENTER || k == KEY_ESC) {
-                show_detect_result = false; hdd_status_text[0] = '\0'; hdd_model_raw[0] = '\0';
-                cur_cyls = 0; cur_heads = 0; cur_spt = 0;
-                total_lba_sectors = 0; use_lba_mode = false; is_mounted = false;
-                sync_to_config(); needs_full_redraw = true;
+                show_detect_result = false; hdd_status_text[0] = '\0';
+                if (!error_is_notice) {
+                    // A failed detect leaves no usable drive: forget the geometry too.
+                    hdd_model_raw[0] = '\0';
+                    drive_unmount();                     // flags the media change if it was mounted
+                    drive_clear_geometry();
+                    sync_from_config();
+                }
+                error_is_notice = false;
+                error_title = "ERROR!";
+                needs_full_redraw = true;
             } else if (force_detect && (k == 'f' || k == 'F')) {
                 show_detect_result = false; hdd_status_text[0] = '\0';
                 force_detect = false;
                 strcpy(hdd_model_raw, "Manually Forced Drive");
                 drive_note_forced();
-
-                // Force geometry — manual entry only, no IDENTIFY data
-                uint16_t dummy_id[256];
-                memset(dummy_id, 0, sizeof(dummy_id));
-                int geo_idx = 3;
-                bool waiting = true, sd = true;
-
-                while (waiting) {
-                    if (sd) { draw_selection_menu_ex(dummy_id, geo_idx, true); sd = false; }
-                    int ch = get_input();
-                    if (drive.api_gen != seen_api_gen || is_mounted) { waiting = false; break; }   // API took over
-                    if (ch == -1) { tight_loop_contents(); continue; }
-                    if (ch == KEY_ESC) { waiting = false; }
-                    else if (ch == '\t' || ch == KEY_ENTER) {
-                        geo_idx = 3; draw_selection_menu_ex(dummy_id, geo_idx, true);
-                        int mf[3] = {detect_cyls, detect_heads, detect_spt};
-                        int mc[3] = {9+26, 9+38, 9+48};
-                        for (int f = 0; f < 3; f++) {
-                            char ib[7] = {0}; int p = 0;
-                            draw_at(mc[f], 14, "\033[103;30m     \033[0m");
-                            cdc_printf("\033[%d;%dH", 14, mc[f]);
-                            while (true) {
-                                int c = get_input();
-                                if (c >= '0' && c <= '9' && p < 5) { ib[p++] = (char)c; cdc_putchar(c); }
-                                else if ((c == 8 || c == 127) && p > 0) { p--; cdc_printf("\b \b\033[%d;%dH", 14, mc[f]+p); }
-                                else if (c == KEY_ENTER || c == '\t') { ib[p] = '\0'; if (p > 0) mf[f] = atoi(ib); draw_at(mc[f], 14, RESET "\033[41;37;1m"); cdc_printf("%-5d", mf[f]); break; }
-                                else if (c == KEY_ESC) { f = 3; break; }
-                                tight_loop_contents();
-                            }
-                        }
-                        detect_cyls = (uint16_t)mf[0]; detect_heads = (uint8_t)mf[1]; detect_spt = (uint8_t)mf[2];
-                        if (detect_cyls > 0 && detect_heads > 0 && detect_spt > 0) {
-                            use_lba_mode = false;
-                            cur_cyls = detect_cyls; cur_heads = detect_heads; cur_spt = detect_spt;
-                            ide_set_geometry(cur_heads, cur_spt);
-                            config.geo_mode = GEO_MANUAL;
-                            sync_to_config(); waiting = false;
-                        } else { sd = true; }
-                    }
-                }
+                // Manual entry only, no IDENTIFY data
+                if (run_geometry_picker(drive.id, true)) sync_from_config();
                 needs_full_redraw = true;
             }
             continue;
@@ -984,8 +1138,19 @@ void core1_entry(void) {
             if (k == 'y' || k == 'Y') {
                 if (confirm_type == 0) { config_defaults(); sync_from_config(); config_save(); current_screen = SCREEN_MAIN; }
                 else if (confirm_type == 1) { sync_to_config(); config_save(); current_screen = confirm_return_screen; }
-                else if (confirm_type == 3) { is_mounted = true; media_changed_waiting = true; current_screen = SCREEN_MOUNTED; }
-                else if (confirm_type == 4) { is_mounted = false; media_changed_waiting = true; current_screen = SCREEN_MAIN; }
+                else if (confirm_type == 3 || confirm_type == 5) {
+                    int r = drive_mount_ex(confirm_type == 5 ? MOUNT_FORCE : 0);
+                    sync_from_api();             // the mount may have identified the drive
+                    if (r == R_OK) current_screen = SCREEN_MOUNTED;
+                    else if (r == R_GEO_MISMATCH) { current_screen = SCREEN_CONFIRM; confirm_type = 5; trigger_overlay = true; }
+                    else {
+                        current_screen = SCREEN_MAIN;
+                        show_notice(r == R_NO_DRIVE ? "No drive answers: not mounted" :
+                                    r == R_NOT_READY ? "Drive not ready - check power" : "Mount failed");
+                        trigger_overlay = true;
+                    }
+                }
+                else if (confirm_type == 4) { drive_unmount(); current_screen = SCREEN_MAIN; }
                 needs_full_redraw = true;
             } else if (k == 'n' || k == 'N' || k == KEY_ESC) {
                 current_screen = (confirm_type == 1) ? confirm_return_screen :
@@ -998,18 +1163,16 @@ void core1_entry(void) {
         if (k == KEY_F10) { confirm_return_screen = current_screen; current_screen = SCREEN_CONFIRM; confirm_type = 1; trigger_overlay = true; needs_full_redraw = true; continue; }
 
         if (current_screen == SCREEN_MAIN) {
-            if (k == KEY_UP) {
-                if (config.main_selected == 1 || config.main_selected == 3 || config.main_selected == 4) config.main_selected--;
-            } else if (k == KEY_DOWN) {
-                if (config.main_selected == 0 || config.main_selected == 2 || config.main_selected == 3) config.main_selected++;
-            } else if (k == KEY_RIGHT) {
-                if (config.main_selected == 0) config.main_selected = 2;
-                else if (config.main_selected == 1) config.main_selected = 3;
-            } else if (k == KEY_LEFT) {
-                if (config.main_selected == 2) config.main_selected = 0;
-                else if (config.main_selected == 3) config.main_selected = 1;
-                else if (config.main_selected == 4) config.main_selected = 1;
-            }
+            // Left column 0, 1, 5; right column 2, 3, 4 (rows 6, 8, 10)
+            static const uint8_t up[6]    = {0, 0, 2, 2, 3, 1};
+            static const uint8_t down[6]  = {1, 5, 3, 4, 4, 5};
+            static const uint8_t right[6] = {2, 3, 2, 3, 4, 4};
+            static const uint8_t left[6]  = {0, 1, 0, 1, 5, 5};
+            if (config.main_selected > 5) config.main_selected = 0;
+            if (k == KEY_UP)         config.main_selected = up[config.main_selected];
+            else if (k == KEY_DOWN)  config.main_selected = down[config.main_selected];
+            else if (k == KEY_RIGHT) config.main_selected = right[config.main_selected];
+            else if (k == KEY_LEFT)  config.main_selected = left[config.main_selected];
             else if (k == KEY_ENTER) {
                 if (config.main_selected == 0) {
                     // Auto Detect — single reset, probe master then slave
@@ -1025,68 +1188,11 @@ void core1_entry(void) {
                     if (detected) drive_note_identify(id_buf); else drive_clear_identity();
                     if (!detected) ide_select_device(config.dev_base);
                     if (detected) {
-                            for (int i = 0; i < 20; i++) {
-                                uint16_t val = id_buf[27+i];
-                                hdd_model_raw[i*2] = (char)(val>>8); hdd_model_raw[i*2+1] = (char)(val&0xFF);
-                            }
-                            hdd_model_raw[40] = '\0'; sanitize_identify_model(hdd_model_raw);
-
-                            bool ls = (id_buf[49] & 0x0200);
-                            int geo_idx = ls ? 2 : 0;
-                            bool waiting = true, sd = true;
-
-                            while (waiting) {
-                                if (sd) { draw_selection_menu(id_buf, geo_idx); sd = false; }
-                                int ch = get_input();
-                                if (drive.api_gen != seen_api_gen || is_mounted) { waiting = false; break; }   // API took over
-                                if (ch == -1) { tight_loop_contents(); continue; }
-
-                                if (ch == KEY_UP && geo_idx > 0) { geo_idx--; if (!ls && geo_idx == 2) geo_idx--; sd = true; }
-                                else if (ch == KEY_DOWN && geo_idx < 3) { geo_idx++; if (!ls && geo_idx == 2) geo_idx++; sd = true; }
-                                else if (ch == KEY_ESC) { waiting = false; }
-                                else if (ch == '\t' || (ch == KEY_ENTER && geo_idx == 3)) {
-                                    geo_idx = 3; draw_selection_menu(id_buf, geo_idx);
-                                    int mf[3] = {detect_cyls, detect_heads, detect_spt};
-                                    int mc[3] = {9+26, 9+38, 9+48};
-                                    for (int f = 0; f < 3; f++) {
-                                        char ib[7] = {0}; int p = 0;
-                                        draw_at(mc[f], 14, "\033[103;30m     \033[0m");
-                                        cdc_printf("\033[%d;%dH", 14, mc[f]);
-                                        while (true) {
-                                            int c = get_input();
-                                            if (c >= '0' && c <= '9' && p < 5) { ib[p++] = (char)c; cdc_putchar(c); }
-                                            else if ((c == 8 || c == 127) && p > 0) { p--; cdc_printf("\b \b\033[%d;%dH", 14, mc[f]+p); }
-                                            else if (c == KEY_ENTER || c == '\t') { ib[p] = '\0'; if (p > 0) mf[f] = atoi(ib); draw_at(mc[f], 14, RESET "\033[41;37;1m"); cdc_printf("%-5d", mf[f]); break; }
-                                            else if (c == KEY_ESC) { f = 3; break; }
-                                            tight_loop_contents();
-                                        }
-                                    }
-                                    detect_cyls = (uint16_t)mf[0]; detect_heads = (uint8_t)mf[1]; detect_spt = (uint8_t)mf[2];
-                                    if (detect_cyls > 0 && detect_heads > 0 && detect_spt > 0) {
-                                        use_lba_mode = false;
-                                        cur_cyls = detect_cyls; cur_heads = detect_heads; cur_spt = detect_spt;
-                                        ide_set_geometry(cur_heads, cur_spt);
-                                        config.geo_mode = GEO_MANUAL;
-                                        sync_to_config(); waiting = false;
-                                    } else { sd = true; }
-                                } else if (ch == KEY_ENTER) {
-                                    bool valid = false;
-                                    if (geo_idx == 0) { use_lba_mode = false; cur_cyls = id_buf[1]; cur_heads = (uint8_t)id_buf[3]; cur_spt = (uint8_t)id_buf[6]; valid = true; }
-                                    else if (geo_idx == 1) { use_lba_mode = false; get_large_geometry(id_buf[1],(uint8_t)id_buf[3],(uint8_t)id_buf[6],&cur_cyls,&cur_heads); cur_spt = (uint8_t)id_buf[6]; valid = true; }
-                                    else if (geo_idx == 2 && ls) {
-                                        use_lba_mode = true; cur_cyls = id_buf[1]; cur_heads = (uint8_t)id_buf[3]; cur_spt = (uint8_t)id_buf[6];
-                                        uint64_t l48 = ((uint64_t)id_buf[103]<<48)|((uint64_t)id_buf[102]<<32)|((uint64_t)id_buf[101]<<16)|((uint64_t)id_buf[100]);
-                                        total_lba_sectors = l48; if (!total_lba_sectors) total_lba_sectors = id_buf[60]|((uint32_t)id_buf[61]<<16);
-                                        valid = true;
-                                    }
-
-                                    if (valid) {
-                                        config.geo_mode = geo_idx == 0 ? GEO_NORMAL : geo_idx == 1 ? GEO_LARGE : GEO_LBA;
-                                        if (!use_lba_mode) ide_set_geometry(cur_heads, cur_spt);
-                                        sync_to_config(); waiting = false;
-                                    }
-                                }
-                            }
+                        strncpy(hdd_model_raw, drive.model, sizeof(hdd_model_raw) - 1);
+                        hdd_model_raw[sizeof(hdd_model_raw) - 1] = '\0';
+                        if (!run_geometry_picker(id_buf, false) && !config.use_lba_mode && config.heads && config.spt)
+                            ide_set_geometry(config.heads, config.spt);   // kept: the probe's reset cleared INIT PARAMS
+                        sync_from_config();
                     } else {
                         if (found) {
                             strcpy(hdd_status_text, "\033[91;1mIDENTIFY failed");
@@ -1111,6 +1217,7 @@ void core1_entry(void) {
                     current_screen = SCREEN_FEATURES; config.feat_selected = 0; needs_full_redraw = true;
                 } else if (config.main_selected == 3) { current_screen = SCREEN_CONFIRM; confirm_type = 0; trigger_overlay = true; needs_full_redraw = true; }
                 else if (config.main_selected == 4) { current_screen = SCREEN_CONFIRM; confirm_type = 1; trigger_overlay = true; needs_full_redraw = true; }
+                else if (config.main_selected == 5) { run_park_dialog(); needs_full_redraw = true; }
             }
         } else if (current_screen == SCREEN_FEATURES) {
             if (k == KEY_UP && config.feat_selected > 0) config.feat_selected--;

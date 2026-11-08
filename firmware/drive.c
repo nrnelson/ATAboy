@@ -84,12 +84,21 @@ int drive_result_from_ide(int r) {
 //  Geometry / detect / mount
 // ---------------------------------------------------------------------------
 
-static void large_geometry(uint16_t n_cyl, uint8_t n_hd, uint16_t *l_cyl, uint8_t *l_hd) {
-    uint32_t total = (uint32_t)n_cyl * n_hd;
-    uint8_t heads = n_hd ? n_hd : 1;
-    while (heads < 255 && (total / heads) > 65535) heads++;
-    *l_hd = heads;
-    *l_cyl = (uint16_t)(total / heads);
+// Remember which drive the configured geometry belongs to ("" when there is
+// no IDENTIFY data, e.g. forced manual geometry).
+static void set_geometry_owner(void) {
+    _Static_assert(sizeof(config.geo_model) == sizeof(drive.model) &&
+                   sizeof(config.geo_serial) == sizeof(drive.serial), "owner fields must match drive_state_t");
+    memset(config.geo_model, 0, sizeof(config.geo_model));
+    memset(config.geo_serial, 0, sizeof(config.geo_serial));
+    if (drive.identified) {                           // both NUL-terminated by ata_string()
+        memcpy(config.geo_model, drive.model, sizeof(config.geo_model));
+        memcpy(config.geo_serial, drive.serial, sizeof(config.geo_serial));
+    }
+}
+
+int drive_geo_identity(void) {
+    return config_geo_identity(&config, drive.model, drive.serial, drive.identified ? drive.id : NULL);
 }
 
 int drive_apply_geometry(uint8_t mode, uint16_t c, uint8_t h, uint8_t s) {
@@ -104,7 +113,7 @@ int drive_apply_geometry(uint8_t mode, uint16_t c, uint8_t h, uint8_t s) {
         break;
     case GEO_LARGE:
         if (!drive.identified) return R_IDENTIFY_FAILED;
-        large_geometry(id[1], (uint8_t)id[3], &c, &h);
+        config_large_chs(id[1], (uint8_t)id[3], &c, &h);
         s = (uint8_t)id[6];
         break;
     case GEO_LBA: {
@@ -120,6 +129,7 @@ int drive_apply_geometry(uint8_t mode, uint16_t c, uint8_t h, uint8_t s) {
         break;
     }
     case GEO_MANUAL:
+        if (!config_chs_valid(c, h, s)) return R_BAD_ARG;
         break;
     default:
         return R_BAD_ARG;
@@ -134,9 +144,22 @@ int drive_apply_geometry(uint8_t mode, uint16_t c, uint8_t h, uint8_t s) {
     config.heads = h;
     config.spt = s;
     config.geo_mode = mode;
+    set_geometry_owner();
     if (!lba) ide_set_geometry(h, s);   // INITIALIZE DEVICE PARAMETERS
     ide_unlock();
     return R_OK;
+}
+
+void drive_clear_geometry(void) {
+    ide_lock();
+    config.use_lba_mode = false;
+    config.lba_sectors = 0;
+    config.cyls = 0;
+    config.heads = 0;
+    config.spt = 0;
+    config.geo_mode = GEO_NONE;
+    set_geometry_owner();
+    ide_unlock();
 }
 
 int drive_detect(uint8_t only_dev, uint8_t geo_mode, uint16_t c, uint8_t h, uint8_t s, uint8_t flags) {
@@ -192,17 +215,82 @@ int drive_detect(uint8_t only_dev, uint8_t geo_mode, uint16_t c, uint8_t h, uint
         ide_set_geometry(config.heads, config.spt);   // the probe's RESET cleared INIT PARAMS
     ide_unlock();
 
-    if (r == R_OK && (flags & DETECT_MOUNT)) r = drive_mount();
+    if (r == R_OK && (flags & DETECT_MOUNT)) r = drive_mount_ex((flags & DETECT_MOUNT_FORCE) ? MOUNT_FORCE : 0);
     return r;
 }
 
-int drive_mount(void) {
-    if (!drive_geometry_valid()) return R_NO_GEOMETRY;
-    if (!is_mounted) {
-        is_mounted = true;
-        media_changed_waiting = true;
+#define MOUNT_READY_MS 3000
+
+// Before exposing the drive: something must answer on the bus, it must be
+// ready within MOUNT_READY_MS (a drive that never gets ready would stall
+// every USB read, and with it the serial menu), and the geometry must
+// belong to it.  A drive not identified since boot is asked for IDENTIFY
+// first, so a mount straight after power-up compares the saved geometry with
+// the drive really attached.
+static int mount_checks(void) {
+    ide_lock();
+    uint8_t dev = ide_selected_device();
+    ide_write_reg(6, dev);
+    busy_wait_us_32(50);
+    uint8_t st = ide_read_alt_status();
+    if (st == 0xFF) {                                 // floating bus
+        drive.present = false;
+        ide_unlock();
+        return R_NO_DRIVE;
     }
+    // USB reads are issued with IDE_F_NEED_DRDY: without BSY=0 + DRDY=1 every
+    // one of them would wait out its 5 s ready timeout and fail.
+    uint32_t t0 = to_ms_since_boot(get_absolute_time());
+    while ((st & (ATA_ST_BSY | ATA_ST_DRDY)) != ATA_ST_DRDY) {
+        if (to_ms_since_boot(get_absolute_time()) - t0 >= MOUNT_READY_MS) {
+            ide_unlock();
+            return R_NOT_READY;
+        }
+        busy_wait_us_32(1000);
+        st = ide_read_alt_status();
+    }
+    drive.present = true;
+
+    if (!drive.identified && !drive.forced) {
+        static uint16_t id[256];                      // under ide_lock; keeps 512 bytes off both stacks
+        ide_cmd_t ic = {0};
+        ic.command = 0xEC;
+        ic.proto = IDE_PROTO_PIO_IN;
+        ic.buf = (uint8_t *)id;
+        ic.sectors = 1;
+        ic.flags = IDE_F_NEED_DRDY;
+        ic.ready_ms = 1000;
+        ic.timeout_ms = 5000;
+        if (ide_exec(&ic) == IDE_OK) {
+            drive_note_identify(id);
+            drive.api_gen++;
+        }
+        drive_record(LOGOP_IDENTIFY, &ic, 0, 1);
+        // No IDENTIFY: nothing to compare against; mount on the saved geometry.
+    }
+    ide_unlock();
+
+    int idv = drive_geo_identity();
+    if (idv == GEO_ID_MISMATCH) return R_GEO_MISMATCH;
+    if (idv == GEO_ID_MATCH && !config.geo_model[0] && !config.geo_serial[0])
+        set_geometry_owner();                         // older settings: owner confirmed now
     return R_OK;
+}
+
+int drive_mount_ex(uint8_t flags) {
+    if (!drive_geometry_valid()) return R_NO_GEOMETRY;
+    if (is_mounted) return R_OK;
+    if (!(flags & MOUNT_FORCE)) {
+        int r = mount_checks();
+        if (r != R_OK) return r;
+    }
+    is_mounted = true;
+    media_changed_waiting = true;
+    return R_OK;
+}
+
+int drive_mount(void) {
+    return drive_mount_ex(0);
 }
 
 int drive_unmount(void) {
@@ -211,6 +299,62 @@ int drive_unmount(void) {
         media_changed_waiting = true;
     }
     return R_OK;
+}
+
+// ---------------------------------------------------------------------------
+//  Park
+// ---------------------------------------------------------------------------
+
+#define PARK_SEEK_MS     10000
+#define PARK_STANDBY_MS  30000     // STANDBY IMMEDIATE returns once the spindle has stopped
+
+static int park_standby(ide_cmd_t *c, uint8_t command) {
+    memset(c, 0, sizeof(*c));
+    c->command = command;
+    c->proto = IDE_PROTO_NONDATA;
+    c->flags = IDE_F_NEED_DRDY | IDE_F_NO_RECOVER;   // no SRST afterwards
+    c->timeout_ms = PARK_STANDBY_MS;
+    int r = ide_exec(c);
+    drive_record(LOGOP_PARK, c, 0, 0);
+    return r;
+}
+
+int drive_park(bool seek, uint16_t cylinder, drive_park_t *p) {
+    memset(p, 0, sizeof(*p));
+    if (is_mounted) return R_MOUNTED;
+    int result = R_OK;
+
+    ide_lock();
+    if (seek) {
+        ide_cmd_t *c = &p->seek;
+        c->command = 0x70;                            // SEEK, CHS: cylinder, head 0, sector 1
+        c->proto = IDE_PROTO_NONDATA;
+        c->lba_lo = 1;
+        c->lba_mid = (uint8_t)cylinder;
+        c->lba_hi = (uint8_t)(cylinder >> 8);
+        c->device = 0x00;
+        c->flags = IDE_F_NEED_DRDY;
+        c->timeout_ms = PARK_SEEK_MS;
+        int r = ide_exec(c);
+        drive_record(LOGOP_PARK, c, cylinder, 0);
+        p->seek_issued = true;
+        p->cylinder = cylinder;
+        if (r != IDE_OK) result = drive_result_from_ide(r);
+        // Carry on: STANDBY parks the heads on drives that do it themselves.
+    }
+
+    int r = park_standby(&p->standby, 0xE0);          // STANDBY IMMEDIATE
+    if (r == IDE_ATA_ERROR && (p->standby.error & 0x04)) {
+        p->fallback = true;                           // ABRT: ATA-1 drive, try 94h
+        p->e0_status = p->standby.status;
+        p->e0_error = p->standby.error;
+        r = park_standby(&p->standby, 0x94);
+    }
+    ide_unlock();
+
+    if (result == R_OK) result = drive_result_from_ide(r);
+    drive.api_gen++;
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -242,7 +386,8 @@ void drive_record(uint8_t op, const ide_cmd_t *c, uint32_t lba, uint32_t count) 
     x->elapsed_ms = c->elapsed_us / 1000u;
     x->timeout_ms = c->timeout_ms;
     uint32_t fl;
-    x->fail_lba   = (op != LOGOP_IDENTIFY && op != LOGOP_PASSTHRU && ide_cmd_result_lba(c, &fl)) ? fl : lba + c->done;
+    x->fail_lba   = (op != LOGOP_IDENTIFY && op != LOGOP_PASSTHRU && op != LOGOP_PARK &&
+                     ide_cmd_result_lba(c, &fl)) ? fl : lba + c->done;
     if (c->tf_valid) {
         x->tf[0] = c->out_count;  x->tf[1] = c->out_lba_lo; x->tf[2] = c->out_lba_mid;
         x->tf[3] = c->out_lba_hi; x->tf[4] = c->out_device;

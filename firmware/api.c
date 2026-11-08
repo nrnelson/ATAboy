@@ -35,6 +35,7 @@
 #define OP_MOUNT         0x12
 #define OP_UNMOUNT       0x13
 #define OP_RESET         0x14
+#define OP_PARK          0x15
 #define OP_IDENTIFY      0x20
 #define OP_TASKFILE      0x21
 #define OP_READ          0x22
@@ -112,6 +113,7 @@ static const char *result_name(int r) {
         "ok", "bad_subop", "bad_arg", "no_drive", "not_mounted", "write_protected",
         "not_armed", "ata_error", "timeout", "not_ready", "bus_fault", "no_geometry",
         "mounted", "identify_failed", "unsupported", "protocol", "alloc_too_small",
+        "geometry_mismatch",
     };
     return (r >= 0 && r < (int)(sizeof(names) / sizeof(names[0]))) ? names[r] : "unknown";
 }
@@ -136,6 +138,7 @@ static const char *op_name(uint8_t op) {
     case LOGOP_IDENTIFY:  return "identify";
     case LOGOP_READ_DIAG: return "read_diag";
     case LOGOP_WRITE_LONG: return "write_long";
+    case LOGOP_PARK:      return "park";
     default:           return "unknown";
     }
 }
@@ -272,6 +275,12 @@ static void json_status_body(json_t *j) {
     j_bool(j, "write_protect", config.drive_write_protected);
     j_bool(j, "armed", api_is_armed());
 
+    j_obj(j, "settings");
+    j_str(j, "load", config_load_name(config_load_status));
+    if (config_load_detail) j_str(j, "field", config_load_detail);
+    else j_null(j, "field");
+    j_end(j);
+
     j_obj(j, "drive");
     j_bool(j, "present", drive.present);
     j_bool(j, "identified", drive.identified);
@@ -306,6 +315,11 @@ static void json_status_body(json_t *j) {
     j_uint(j, "heads", config.heads);
     j_uint(j, "spt", config.spt);
     j_uint(j, "sectors", drive_total_sectors());
+    j_obj(j, "owner");
+    j_str(j, "model", config.geo_model);
+    j_str(j, "serial", config.geo_serial);
+    j_end(j);
+    j_str(j, "identity", config_geo_identity_name(drive_geo_identity()));
     j_end(j);
 
     j_obj(j, "bus");
@@ -433,7 +447,8 @@ static int32_t op_info(uint8_t *buf, uint32_t cap) {
     j_uint(&j, "config_save", OP_CONFIG_SAVE); j_uint(&j, "config_defaults", OP_CONFIG_DEFAULTS);
     j_uint(&j, "detect", OP_DETECT);       j_uint(&j, "geometry", OP_GEOMETRY);
     j_uint(&j, "mount", OP_MOUNT);         j_uint(&j, "unmount", OP_UNMOUNT);
-    j_uint(&j, "reset", OP_RESET);         j_uint(&j, "identify", OP_IDENTIFY);
+    j_uint(&j, "reset", OP_RESET);         j_uint(&j, "park", OP_PARK);
+    j_uint(&j, "identify", OP_IDENTIFY);
     j_uint(&j, "taskfile", OP_TASKFILE);   j_uint(&j, "read", OP_READ);
     j_uint(&j, "read_long", OP_READ_LONG); j_uint(&j, "verify", OP_VERIFY);
     j_uint(&j, "corrupt", OP_CORRUPT);    j_uint(&j, "hashes", OP_HASHES);
@@ -447,6 +462,8 @@ static int32_t op_info(uint8_t *buf, uint32_t cap) {
     j_str(&j, NULL, "persistent_timeouts"); j_str(&j, NULL, "no_retry_reads");
     j_str(&j, NULL, "corrupt_sector"); j_str(&j, NULL, "last_fault");
     if (hash_enabled()) j_str(&j, NULL, "sector_hashes");
+    j_str(&j, NULL, "park");
+    j_str(&j, NULL, "geometry_owner"); j_str(&j, NULL, "settings_crc");
     j_end(&j);
     j_end(&j);
     return finish_json(buf, R_OK, &j);
@@ -489,6 +506,18 @@ static int32_t op_config_set(uint8_t *buf, uint32_t cap, const uint8_t *a) {
     return reply_config(buf, cap, R_OK, NULL);
 }
 
+static const char *mount_message(int r) {
+    switch (r) {
+    case R_NO_GEOMETRY:  return "detect or set geometry first";
+    case R_NO_DRIVE:     return "no drive answers on the bus (force to mount anyway)";
+    case R_NOT_READY:    return "drive not ready (BSY, or no DRDY) after 3 s; check power and cabling "
+                                "(force to mount anyway)";
+    case R_GEO_MISMATCH: return "the geometry was set up for another drive (see geometry.owner); "
+                                "detect again, or force to mount anyway";
+    default:             return NULL;
+    }
+}
+
 static int32_t op_detect(uint8_t *buf, uint32_t cap, const uint8_t *a) {
     uint8_t dev = a[0] == 1 ? 0xA0 : a[0] == 2 ? 0xB0 : 0;
     if (a[0] > 2) return reply_msg(buf, cap, R_BAD_ARG, "device must be 0 (auto), 1 (master) or 2 (slave)");
@@ -509,7 +538,8 @@ static int32_t op_detect(uint8_t *buf, uint32_t cap, const uint8_t *a) {
     else if (r == R_NO_DRIVE) msg = "no device answered on the selected position(s)";
     else if (r == R_IDENTIFY_FAILED) msg = "device present but IDENTIFY failed; retry, or use force with manual geometry";
     else if (r == R_UNSUPPORTED) msg = "drive does not support LBA";
-    else if (r == R_BAD_ARG) msg = "invalid manual geometry (heads 1..16, cyls/spt > 0)";
+    else if (mount_message(r)) msg = mount_message(r);
+    else if (r == R_BAD_ARG) msg = "invalid manual geometry (cyls 1..65535, heads 1..16, spt 1..63)";
     return reply_status(buf, cap, r, msg);
 }
 
@@ -528,6 +558,49 @@ static int32_t op_reset(uint8_t *buf, uint32_t cap, const uint8_t *a) {
     if (rr == IDE_RST_FAILED)
         return reply_status(buf, cap, R_NOT_READY, "drive did not come back from reset (or refused the CHS geometry)");
     return reply_status(buf, cap, R_OK, (a[0] != 1 && rr == IDE_RST_HW) ? "soft reset failed; hardware reset recovered the drive" : NULL);
+}
+
+static void json_park_cmd(json_t *j, const char *key, const ide_cmd_t *c) {
+    char sb[48], eb[48];
+    j_obj(j, key);
+    j_uint(j, "command", c->command);
+    j_str(j, "result", ide_result_name(c->result));
+    j_uint(j, "status", c->status);
+    j_str(j, "status_bits", ata_status_bits(c->status, sb));
+    j_uint(j, "error", c->error);
+    j_str(j, "error_bits", ata_error_bits(c->error, eb));
+    j_uint(j, "elapsed_ms", c->elapsed_us / 1000u);
+}
+
+// PARK: optional SEEK to a landing-zone cylinder, then STANDBY IMMEDIATE, so
+// a drive without automatic parking can be powered off safely.
+static int32_t op_park(uint8_t *buf, uint32_t cap, const uint8_t *a) {
+    if (is_mounted) return reply_status(buf, cap, R_MOUNTED, "unmount first");
+    static drive_park_t p;               // two ide_cmd_t: keep them off core 0's stack
+    int r = drive_park(a[0] & 1, be16(&a[2]), &p);
+    json_t j;
+    j_init(&j, (char *)buf + HDR_LEN, cap - HDR_LEN);
+    j_obj(&j, NULL);
+    j_str(&j, "result", result_name(r));
+    if (r == R_OK) j_str(&j, "message", "heads parked, drive in standby; power off now (any command spins it up again)");
+    else if (p.seek_issued && p.seek.result != IDE_OK) j_str(&j, "message", "SEEK to the landing zone failed (STANDBY still sent, see standby)");
+    else j_str(&j, "message", "STANDBY IMMEDIATE failed");
+    if (p.seek_issued) {
+        json_park_cmd(&j, "seek", &p.seek);
+        j_uint(&j, "cylinder", p.cylinder);
+        j_end(&j);
+    } else {
+        j_null(&j, "seek");
+    }
+    json_park_cmd(&j, "standby", &p.standby);
+    j_bool(&j, "fallback", p.fallback);
+    if (p.fallback) {
+        j_uint(&j, "e0_status", p.e0_status);
+        j_uint(&j, "e0_error", p.e0_error);
+    }
+    j_end(&j);
+    j_end(&j);
+    return finish_json(buf, r, &j);
 }
 
 static int32_t op_identify(uint8_t *buf, uint32_t cap, const uint8_t *a) {
@@ -825,15 +898,16 @@ int32_t api_handle(uint8_t lun, const uint8_t *cdb, uint8_t *buf, uint32_t cap) 
     case OP_DETECT:     return op_detect(buf, cap, a);
     case OP_GEOMETRY:   return op_geometry(buf, cap, a);
     case OP_MOUNT: {
-        int r = drive_mount();
+        int r = drive_mount_ex((a[0] & 1) ? MOUNT_FORCE : 0);
         drive.api_gen++;
-        return reply_status(buf, cap, r, r == R_NO_GEOMETRY ? "detect or set geometry first" : NULL);
+        return reply_status(buf, cap, r, mount_message(r));
     }
     case OP_UNMOUNT:
         drive_unmount();
         drive.api_gen++;
         return reply_status(buf, cap, R_OK, NULL);
     case OP_RESET:      return op_reset(buf, cap, a);
+    case OP_PARK:       return op_park(buf, cap, a);
     case OP_IDENTIFY:   return op_identify(buf, cap, a);
     case OP_TASKFILE:   return op_taskfile(buf, cap);
     case OP_READ:       return op_read(buf, cap, a);

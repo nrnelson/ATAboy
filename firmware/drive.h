@@ -33,6 +33,7 @@ extern volatile bool media_changed_waiting;
 #define LOGOP_IDENTIFY  6
 #define LOGOP_READ_DIAG 7
 #define LOGOP_WRITE_LONG 8
+#define LOGOP_PARK      9
 
 typedef struct {
     uint32_t seq;
@@ -85,6 +86,7 @@ extern drive_stats_t drive_stats;
 #define R_UNSUPPORTED     14
 #define R_PROTOCOL        15
 #define R_ALLOC_TOO_SMALL 16
+#define R_GEO_MISMATCH    17   // configured geometry belongs to another drive
 
 int      drive_result_from_ide(int ide_result);
 
@@ -100,13 +102,32 @@ uint8_t  drive_ecc_len(void);                       // effective READ LONG ECC l
 #define DETECT_SKIP_PROBE 0x01   // no reset/probe: select + IDENTIFY only
 #define DETECT_MOUNT      0x02   // mount on success
 #define DETECT_FORCE      0x04   // accept MANUAL geometry if IDENTIFY fails
+#define DETECT_MOUNT_FORCE 0x08  // with DETECT_MOUNT: skip the mount checks
+#define MOUNT_FORCE       0x01   // drive_mount_ex: skip the mount checks
 #define GEO_AUTO        0xFE     // LBA if supported, else NORMAL
 #define GEO_KEEP        0xFF     // don't touch geometry
 
 int      drive_detect(uint8_t only_dev, uint8_t geo_mode, uint16_t c, uint8_t h, uint8_t s, uint8_t flags);
 int      drive_apply_geometry(uint8_t mode, uint16_t c, uint8_t h, uint8_t s);
-int      drive_mount(void);
+void     drive_clear_geometry(void);
+int      drive_mount(void);                          // drive_mount_ex(0)
+int      drive_mount_ex(uint8_t flags);
+int      drive_geo_identity(void);                   // GEO_ID_* for the cached drive identity
 int      drive_unmount(void);
+
+// Park the heads before power-off: optional SEEK (70h, CHS, head 0) to a
+// landing-zone cylinder, then STANDBY IMMEDIATE (E0h; 94h if E0h is aborted).
+// Refused while mounted.  Returns the first failure (R_*), else R_OK.
+typedef struct {
+    bool      seek_issued;
+    uint16_t  cylinder;
+    ide_cmd_t seek;
+    ide_cmd_t standby;         // the one that decided the result (94h after a fallback)
+    bool      fallback;        // E0h was aborted, 94h was sent
+    uint8_t   e0_status, e0_error;   // what E0h got, when it fell back
+} drive_park_t;
+
+int      drive_park(bool seek, uint16_t cylinder, drive_park_t *out);
 
 // Logged sector I/O for the mass-storage path.  Return 0 on success, -1 on
 // failure (see drive_last_failure()); *done = sectors transferred without
