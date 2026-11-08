@@ -121,7 +121,7 @@ before parsing.
 
 | Op | Name | Arguments (CDB byte offsets) | Reply |
 |---|---|---|---|
-| 00 | INFO | — | JSON: firmware identity, protocol, git hash, board id, limits, op table, features |
+| 00 | INFO | — | JSON: firmware identity, protocol, git hash, board id, limits, `last_fault`, op table, features |
 | 01 | STATUS | — | JSON: everything (below) |
 | 02 | CONFIG_GET | — | JSON `{"config":{...}}` |
 | 03 | CONFIG_SET | [4] key, [8-11] value | JSON config (not saved) |
@@ -131,7 +131,7 @@ before parsing.
 | 11 | GEOMETRY | [5] mode 1 normal / 2 large / 3 lba / 4 manual · [6-7] cyls · [8] heads · [9] spt | JSON status |
 | 12 | MOUNT | — | JSON status |
 | 13 | UNMOUNT | — | JSON status |
-| 14 | RESET | [4] 0 soft (SRST) / 1 hard (RESET line, recalibrate) | JSON status |
+| 14 | RESET | [4] 0 soft (SRST) / 1 hard (RESET line, recalibrate) | JSON status; `not_ready` if the drive didn't come back (see [Resets](#resets)) |
 | 20 | IDENTIFY | [4] bit0 cached (no bus access) | binary: 512 bytes of IDENTIFY DEVICE data |
 | 21 | TASKFILE | — | JSON registers (`valid` false while BSY) |
 | 22 | READ | [4-7] LBA · [8-9] count (1..`max_read_sectors`) · [10] flags: bit0 no retry (0x21), bit1 read-through-error · [12-15] per-sector timeout ms (0 = config) | binary: result block + data |
@@ -141,7 +141,7 @@ before parsing.
 | 30 | LOG | [4-7] start index (0 = oldest retained) | JSON page of the error log |
 | 31 | LOG_CLEAR | [4] bit0 clear log, bit1 reset statistics | JSON |
 | 40 | ARM | [4-7] `"ARM!"` | JSON; arms one DANGEROUS pass-through command for 10 s |
-| 41 | REBOOT | [4] 0 restart / 1 BOOTSEL · [8-11] `"BOOT"` | JSON; reboots ~200 ms later |
+| 41 | REBOOT | [4] 0 restart / 1 BOOTSEL / 2 fault test (HardFault on purpose) · [8-11] `"BOOT"` | JSON; reboots ~200 ms later |
 
 ### STATUS
 
@@ -155,7 +155,10 @@ before parsing.
             "lba48": false, "lba48_sectors": 0, "ecc_bytes": 4, "ata_major": 0},
   "geometry": {"valid": true, "mode": "normal", "addressing": "chs",
                "cyls": 989, "heads": 10, "spt": 34, "sectors": 336260},
-  "bus": {"status": 80, "status_bits": "DRDY|DSC", "pio_faults": 0},
+  "bus": {"status": 80, "status_bits": "DRDY|DSC", "pio_faults": 0,
+          "resets": {"soft": 1, "soft_failed": 0, "hard": 0, "hard_failed": 0,
+                     "geometry_failed": 0, "last": "ok", "last_ms": 412},
+          "chs_check": {"state": "armed", "self_resets": 0, "reinits": 0, "reinit_failed": 0}},
   "config": {"write_protect": true, "auto_mount": false, "iordy": false, "intrq": false,
              "read_timeout_ms": 15000, "write_timeout_ms": 1000, "ecc_len": 0,
              "ecc_len_effective": 4, "no_retry": false, "device": "master"},
@@ -242,13 +245,20 @@ continue from `lba + done`.
  "entries": [{"seq": 1, "t_ms": 51234, "op": "read", "cmd": 32, "result": "ata_error",
               "lba": 19968, "count": 8, "done": 1, "fail_lba": 19969,
               "status": 89, "status_bits": "DRDY|DSC|DRQ|ERR", "error": 64, "error_bits": "UNC",
-              "tf_valid": true, "err_data": false, "recovered": false,
+              "tf_valid": true, "err_data": false, "recovered": false, "events": "",
               "elapsed_ms": 4290, "timeout_ms": 15000, "tf": [1, 12, 58, 0, 167]}]}
 ```
 
 The ring holds the last 64 failures. A page holds as many entries as fit in
 4 KiB; fetch `start = next` until `next` is null. `op` is `read` (USB disk),
 `write`, `read_diag` (API READ), `read_long`, `verify`, `passthrough` or `identify`.
+`events` lists what happened around the command, `|`-separated: `hw_reset`
+(the recovery soft reset failed and the RESET line was pulsed), `reset_failed`
+(the drive didn't come back even then), `self_reset` (CHS: the drive had
+reset itself since the previous command), `reinit` (CHS: 91h was sent again
+before the command), `reinit_failed` (the drive refused it, so the command was
+not issued and failed `not_ready`). See [CHS self-reset check](#chs-self-reset-check). An entry whose `result` is `ok` was
+logged for its events alone: the command itself succeeded.
 `tf` is null when the drive was still BSY. While BSY is set, every register
 reads back as STATUS, so those values would be garbage.
 
@@ -323,6 +333,94 @@ Every pass-through command is classified (`firmware/ata_policy.c`):
   (0x21), a fast first pass for imaging old drives with `ddrescue`. On an
   early-90s IBM drive an unreadable sector failed in 20-50 ms this way instead
   of 4.3 s with the drive's own retries.
+
+## Resets
+
+A soft reset (SRST) happens on RESET mode 0, on SAT soft/device reset, and
+after a command times out, hits a bus fault or leaves data behind (result
+flag bit3). After SRST the firmware:
+
+1. waits for the configured device, up to the 31 s ATA allows, polling once a
+   millisecond and stopping as soon as the drive is ready. A reset selects the
+   master; a slave first waits for a master to finish its own reset, but an
+   empty master position reads FFh on this bus, so a slave alone on the cable
+   stops waiting for it at once. The slave is then re-selected on every poll.
+2. in CHS mode, re-sends INITIALIZE DEVICE PARAMETERS (91h) and checks the
+   drive accepted it. In LBA mode the drive must show DRDY.
+3. if either step fails, pulses the RESET line once (this resets both devices
+   on the cable), waits the same way, sends RECALIBRATE and restores the
+   geometry.
+
+USB is blocked while this runs; a drive that never comes back takes about
+62 s (both waits) before the command fails. `STATUS.bus.resets` counts soft
+resets, soft resets that failed, hardware resets (fallback or RESET mode 1;
+the DETECT probe's own reset isn't counted), hardware resets that failed and
+refused 91h commands; `last` is `ok`, `hw_reset`, `failed` or `none`, and
+`last_ms` how long it took. LOG_CLEAR bit1 zeroes these counters too.
+
+## CHS self-reset check
+
+A drive that resets itself (brown-out, internal reset) forgets its
+INITIALIZE DEVICE PARAMETERS (91h) geometry and can be ready again before the
+next command. Every CHS address after that goes through the drive's default
+translation and reads a *different sector with good status*. So in CHS mode,
+after every command that leaves the drive idle (BSY and DRQ clear, also after
+an ATA error), the firmware writes A5h / 5Ah to Sector Count / Sector Number
+and reads them back. Any reset replaces them with the diagnostic signature
+(01h / 01h). Before the next CHS command they are read again: two register
+reads, no drive command, and no effect on a pending interrupt (only STATUS
+clears INTRQ). If they changed, or the drive lost DRDY, 91h is sent once
+before the command (`events` `self_reset|reinit`); if the drive refuses it,
+the command is not issued and fails `not_ready` (`reinit_failed`), and the next
+command tries again. Likewise, after a reset whose 91h was refused, every
+CHS command sends 91h first until the drive takes it.
+
+`STATUS.bus.chs_check.state`:
+
+| State | Meaning |
+|---|---|
+| `off` | not in CHS mode (LBA, or no geometry) |
+| `no_91h` | the drive refused 91h when the geometry was set (e.g. a late ATA drive): it runs on its default translation, nothing is checked or enforced |
+| `idle` | nothing armed yet (no command since the geometry was set or a failed one) |
+| `armed` | the sentinel is in place and is checked before the next command |
+| `lost` | the geometry is known lost; 91h goes out before the next command |
+| `unsupported` | the drive didn't keep the values (read back right after writing); no check until the geometry is set again (DETECT / GEOMETRY) |
+
+EXECUTE DEVICE DIAGNOSTIC (90h) and DEVICE RESET (08h) sent by pass-through
+also get 91h before the next CHS command. A raw register write from outside
+the command engine to Sector Count, Sector Number or Command disarms the
+check. Not
+detected: a reset in the microseconds between the check and the command, and
+a reset that leaves those registers alone (pre-ATA drives aren't bound to set
+the signature); a verify pass is still the check for those.
+
+## Faults
+
+A HardFault on either core no longer locks the core up with the bus as it
+was. The handler (in RAM, on its own stack) releases the IDE bus through the
+GPIO output overrides, which nothing else can undo: transceivers disabled,
+data lines inputs, DIOR-, DIOW-, CS0-, CS1- and RESET- negated. It then
+records the fault in RAM that survives a warm reboot and reboots through the
+watchdog, so the ATAboy re-enumerates on its own. The USB disk disappears
+mid-command and the next boot is unmounted unless `auto_mount` is set; the
+reboot itself may glitch the drive's RESET- line while the pins are at their
+power-on state, as any reboot does.
+
+INFO then carries the record (`null` when this boot wasn't caused by a fault;
+a power cycle loses it):
+
+```json
+"last_fault": {"core": 0, "pc": 268437121, "lr": 268436999, "xpsr": 553648128,
+               "sp": 537403312, "exc_return": 4294967273, "cfsr": 65536, "hfsr": 1073741824,
+               "mmfar": 0, "bfar": 0, "sfsr": 0, "sfar": 0, "uptime_ms": 81234}
+```
+
+`pc` / `lr` are from the stacked exception frame (0 if the stack pointer was
+unusable); `sp` is where that frame was; `cfsr`, `hfsr`, `mmfar`, `bfar`,
+`sfsr`, `sfar` are the Cortex-M33 fault status / address registers, and
+`uptime_ms` is how long the faulting boot had run. Feed `pc` and `lr` to
+`arm-none-eabi-addr2line -e ATAboy.elf`. REBOOT mode 2 executes an undefined
+instruction about 200 ms after its reply, to test the handler.
 
 ## Firmware updates
 

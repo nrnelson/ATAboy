@@ -11,6 +11,18 @@
 static uint8_t dev_base = 0xA0;   // 0xA0 = master, 0xB0 = slave
 static recursive_mutex_t ide_mtx;
 
+// CHS self-reset sentinel state (see "CHS self-reset sentinel" below)
+static bool sent_armed;        // sentinel written and read back after the last command
+static bool sent_unsupported;  // drive didn't keep it: no check until ide_set_geometry()
+static bool need_reinit;       // CHS geometry known lost: 91h before the next command
+static bool geo_accepted;      // the drive accepted 91h for the configured geometry
+
+// CHS addressing with a usable geometry: the drive needs INITIALIZE DEVICE
+// PARAMETERS to translate our addresses.
+static bool chs_active(void) {
+    return !config.use_lba_mode && config.heads && config.heads <= 16 && config.spt;
+}
+
 void ide_lock(void)   { recursive_mutex_enter_blocking(&ide_mtx); }
 void ide_unlock(void) { recursive_mutex_exit(&ide_mtx); }
 
@@ -118,10 +130,22 @@ static bool data_out(const uint16_t *buf, uint32_t words) {
 //  Public locked register access
 // ---------------------------------------------------------------------------
 
-void ide_write_reg(uint8_t reg, uint8_t val) { ide_lock(); wr(reg, val); ide_unlock(); }
+// Raw register writes from outside the engine invalidate the sentinel: a
+// write to SC/SN overwrites it, a raw command may leave anything there.
+void ide_write_reg(uint8_t reg, uint8_t val) {
+    ide_lock();
+    if (reg == 2 || reg == 3 || reg == 7) sent_armed = false;
+    wr(reg, val);
+    ide_unlock();
+}
 uint8_t ide_read_reg(uint8_t reg)  { ide_lock(); uint8_t v = rd(reg); ide_unlock(); return v; }
 uint8_t ide_read_alt_status(void)  { ide_lock(); uint8_t v = rd_alt(); ide_unlock(); return v; }
-void ide_write_control(uint8_t val) { ide_lock(); wr_ctl(val); ide_unlock(); }
+void ide_write_control(uint8_t val) {
+    ide_lock();
+    if (val & 0x04) { sent_armed = false; need_reinit = chs_active() && geo_accepted; }   // raw SRST
+    wr_ctl(val);
+    ide_unlock();
+}
 
 void ide_set_iordy(bool enabled) {
     gpio_set_inover(IDE_IORDY, enabled ? GPIO_OVERRIDE_NORMAL : GPIO_OVERRIDE_HIGH);
@@ -183,23 +207,170 @@ static bool set_geometry(uint8_t heads, uint8_t spt) {
     wr(6, dev_base | ((heads - 1) & 0x0F));
     wr(2, spt);
     wr(7, 0x91);                          // INITIALIZE DEVICE PARAMETERS
+    rd_alt();                             // >= 400 ns before STATUS is valid
     uint8_t st;
     if (!wait_ready(1000, true, &st)) return false;
-    return !(st & ATA_ST_ERR);
+    return !(st & (ATA_ST_ERR | ATA_ST_DF));
+}
+
+// ---------------------------------------------------------------------------
+//  Resets
+// ---------------------------------------------------------------------------
+
+ide_health_t ide_health;
+
+void ide_health_clear(void) {
+    ide_lock();
+    memset(&ide_health, 0, sizeof(ide_health));
+    ide_health.last_reset = IDE_RST_NONE;
+    ide_unlock();
+}
+
+// ---------------------------------------------------------------------------
+//  CHS self-reset sentinel
+//
+//  A drive that resets on its own (brown-out, internal reset) forgets
+//  INITIALIZE DEVICE PARAMETERS and may be ready again before the next
+//  command, so every CHS address afterwards goes through its default
+//  translation: the wrong sector, with good status.  After a CHS command
+//  ends with the drive idle, Sector Count / Sector Number are loaded with
+//  A5h / 5Ah, which an idle drive keeps; any reset replaces them with the
+//  diagnostic signature (01h / 01h).  Before the next CHS command they are
+//  read back -- two register reads, no command, and unlike STATUS they don't
+//  clear a pending interrupt.  If they changed, 91h is sent again (once)
+//  before the command; if the drive refuses it the command is not issued.
+//  A drive that doesn't keep the values (read back right after writing)
+//  gets no check until the geometry is set again.
+// ---------------------------------------------------------------------------
+
+#define SENTINEL_SC 0xA5
+#define SENTINEL_SN 0x5A
+
+
+// Caller holds the lock; the drive is idle (BSY=0, DRQ=0) with dev_base selected.
+static void arm_sentinel(void) {
+    sent_armed = false;
+    if (!chs_active() || !geo_accepted || sent_unsupported) return;
+    wr(2, SENTINEL_SC);
+    wr(3, SENTINEL_SN);
+    if (rd(2) == SENTINEL_SC && rd(3) == SENTINEL_SN) sent_armed = true;
+    else sent_unsupported = true;
+}
+
+uint8_t ide_chs_check_state(void) {
+    if (!chs_active()) return IDE_CHK_OFF;
+    if (!geo_accepted) return IDE_CHK_NO_91H;
+    if (sent_unsupported) return IDE_CHK_UNSUPPORTED;
+    if (need_reinit) return IDE_CHK_LOST;
+    return sent_armed ? IDE_CHK_ARMED : IDE_CHK_IDLE;
+}
+
+// Wait for the configured device after SRST or RESET-.  A reset leaves
+// DEV=0, so STATUS reads the master's until the slave is selected again.
+//
+//  - Master configured: wait for BSY=0 (and DRDY=1 in LBA mode; CHS drives
+//    may hold DRDY off until they get INITIALIZE DEVICE PARAMETERS).
+//  - Slave configured: first let a master finish its own reset (selecting
+//    the slave while the master is still busy can be lost), but an empty
+//    master position reads 0xFF on this bus, which looks busy: stop waiting
+//    for it as soon as it reads 0xFF.  Then select the slave and wait for
+//    it, re-selecting it on every poll.
+//
+// Bounded by budget_ms (ATA allows a device 31 s).  Polls once a ms; the
+// caller holds the lock, so USB is blocked for as long as the drive needs.
+static bool wait_after_reset(uint32_t budget_ms, uint8_t *st_out) {
+    uint32_t t0 = time_us_32();
+    uint32_t limit = budget_ms * 1000u;
+    bool need_drdy = !chs_active();
+    uint8_t st = 0xFF;
+
+    if (dev_base == 0xB0) {
+        for (;;) {
+            st = rd(7);
+            if (st == 0xFF || !(st & ATA_ST_BSY)) break;
+            if (time_us_32() - t0 >= limit) { *st_out = st; return false; }   // a master that never came back
+            busy_wait_us_32(1000);
+        }
+    }
+    for (;;) {
+        wr(6, dev_base);
+        busy_wait_us_32(1);
+        st = rd(7);
+        if (st != 0xFF && !(st & ATA_ST_BSY) && (!need_drdy || (st & ATA_ST_DRDY))) break;
+        if (time_us_32() - t0 >= limit) { *st_out = st; return false; }
+        busy_wait_us_32(1000);
+    }
+    *st_out = st;
+    return true;
+}
+
+// After a reset: CHS drives lost INITIALIZE DEVICE PARAMETERS.  Re-send it
+// and check the drive took it; leave the configured device selected.
+static bool restore_geometry(void) {
+    sent_armed = false;
+    need_reinit = false;
+    if (!chs_active()) { wr(6, dev_base); return true; }
+    if (set_geometry(config.heads, config.spt)) { geo_accepted = true; arm_sentinel(); return true; }
+    ide_health.geometry_failures++;
+    // A drive that never accepted this geometry runs on its default
+    // translation, which a reset doesn't change: carry on as before.
+    if (!geo_accepted) { wr(6, dev_base); return true; }
+    need_reinit = true;               // commands re-try 91h and fail until it is accepted
+    return false;
+}
+
+// Pulse RESET- (resets both devices on the cable), wait, recalibrate and
+// restore the geometry.  IORDY is ignored meanwhile: a drive holds it low
+// during POST.
+static bool hard_reset(void) {
+    uint8_t st;
+    ide_health.hw_resets++;
+    sent_armed = false;
+    ide_set_iordy(false);
+    gpio_put(IDE_RESET, 0);
+    sleep_ms(50);
+    gpio_put(IDE_RESET, 1);
+    sleep_ms(100);
+    wr_ctl(0x00);
+    bool ok = wait_after_reset(IDE_RESET_WAIT_MS, &st);
+    if (ok) {
+        // Recalibrate: seek heads to track 0 (required by some pre-ATA drives).
+        // ATA-4 and later drives may abort it, so its status is not judged.
+        wr(6, dev_base);
+        wr(7, 0x10);
+        rd_alt();
+        wait_ready(10000, true, NULL);
+        ok = restore_geometry();
+    }
+    if (!ok) ide_health.hw_reset_failures++;
+    ide_set_iordy(config.iordy_enabled);
+    return ok;
 }
 
 // SRST aborts whatever the drive is doing and clears INITIALIZE DEVICE
-// PARAMETERS, so CHS geometry is re-applied afterwards.
-static void soft_reset(void) {
-    wr_ctl(0x04);
-    busy_wait_us_32(10);
+// PARAMETERS.  Wait (bounded) for the configured device, restore the CHS
+// geometry and check it was accepted; if the drive doesn't come back, one
+// hardware reset.  Returns IDE_RST_*.
+static int soft_reset(void) {
+    uint32_t t0 = time_us_32();
+    uint8_t st;
+    ide_health.soft_resets++;
+    sent_armed = false;
+    ide_set_iordy(false);
+    wr_ctl(0x04);                          // SRST=1, nIEN=0
+    busy_wait_us_32(10);                   // >= 5 us
     wr_ctl(0x00);
-    busy_wait_us_32(2000);
-    wait_ready(2000, true, NULL);
-    if (!config.use_lba_mode && config.heads && config.spt)
-        set_geometry(config.heads, config.spt);
-    else
-        wr(6, dev_base);
+    busy_wait_us_32(2000);                 // >= 2 ms before BSY is valid
+    bool ok = wait_after_reset(IDE_RESET_WAIT_MS, &st) && restore_geometry();
+    ide_set_iordy(config.iordy_enabled);
+    int r = IDE_RST_OK;
+    if (!ok) {
+        ide_health.soft_reset_failures++;
+        r = hard_reset() ? IDE_RST_HW : IDE_RST_FAILED;
+    }
+    ide_health.last_reset = (int8_t)r;
+    ide_health.last_reset_ms = (time_us_32() - t0) / 1000u;
+    return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +379,7 @@ static void soft_reset(void) {
 
 void ide_hw_init(void) {
     recursive_mutex_init(&ide_mtx);
+    ide_health.last_reset = IDE_RST_NONE;
 
     // SIO-controlled output pins
     uint32_t sio_out = (1 << IDE_DIR) | (1 << IDE_DIR1) |
@@ -215,9 +387,28 @@ void ide_hw_init(void) {
                        ADDR_MASK |
                        (1 << IDE_RESET) |
                        (1 << IDE_CS0) | (1 << IDE_CS1);
+    // Active-low lines and their idle (negated) level: RESET-, CS0-, CS1-
+    // and the 74HCT245 output enables high; DIR low (IDE -> Pico) and the
+    // address lines low.  DIOR-/DIOW- are driven high here too until the
+    // PIO state machines take them over with the same level.
+    uint32_t strobes = (1u << IDE_DIOR) | (1u << IDE_DIOW);
+    uint32_t idle_high = (1u << IDE_OE) | (1u << IDE_OE1) | (1u << IDE_RESET) |
+                         (1u << IDE_CS0) | (1u << IDE_CS1) | strobes;
 
-    gpio_init_mask(sio_out);
-    gpio_set_dir_out_masked(sio_out);
+    // Load the output latches and enable the drivers *before* the pads are
+    // handed to SIO.  gpio_init() would clear the latch and gpio_set_dir()
+    // would then drive every line low (a RESET- pulse to the drive and a
+    // chip-select/transceiver glitch on every boot) until bus_idle() ran.
+    // Pull-ups on the active-low lines keep them negated whenever nothing
+    // drives them.
+    for (int i = 0; i < 32; i++) {
+        if (!((sio_out | strobes) & (1u << i))) continue;
+        if (idle_high & (1u << i)) gpio_pull_up(i); else gpio_disable_pulls(i);
+    }
+    sio_hw->gpio_clr = (sio_out | strobes) & ~idle_high;
+    sio_hw->gpio_set = idle_high;
+    sio_hw->gpio_oe_set = sio_out | strobes;
+    gpio_set_function_masked(sio_out | strobes, GPIO_FUNC_SIO);
 
     // INTRQ — active-high from drive, idle low
     gpio_init(IDE_INTRQ);
@@ -236,8 +427,6 @@ void ide_hw_init(void) {
 
     // Bring up PIO state machines
     ide_pio_init();
-
-    gpio_put(IDE_RESET, 1);
     bus_idle();
 
     // nIEN=0: allow INTRQ from the drive
@@ -247,41 +436,30 @@ void ide_hw_init(void) {
     ide_set_iordy(config.iordy_enabled);
 }
 
-void ide_reset_drive(void) {
+bool ide_reset_drive(void) {
     ide_lock();
-    // Force IORDY HIGH during reset — drive holds it LOW during POST
-    ide_set_iordy(false);
-
-    gpio_put(IDE_RESET, 0);
-    sleep_ms(50);
-    gpio_put(IDE_RESET, 1);
-    sleep_ms(100);
-    wr_ctl(0x00);
-    wait_ready(10000, true, NULL);
-
-    // Recalibrate — seek heads to track 0 (required by some pre-ATA drives)
-    wr(6, dev_base);
-    wr(7, 0x10);
-    wait_ready(10000, true, NULL);
-
-    // Hardware reset also clears INITIALIZE DEVICE PARAMETERS
-    if (!config.use_lba_mode && config.heads && config.spt)
-        set_geometry(config.heads, config.spt);
-
-    // Restore IORDY to config setting — drive is ready for normal operation
-    ide_set_iordy(config.iordy_enabled);
+    uint32_t t0 = time_us_32();
+    bool ok = hard_reset();
+    ide_health.last_reset = ok ? IDE_RST_HW : IDE_RST_FAILED;
+    ide_health.last_reset_ms = (time_us_32() - t0) / 1000u;
     ide_unlock();
+    return ok;
 }
 
-void ide_soft_reset(void) {
+int ide_soft_reset(void) {
     ide_lock();
-    soft_reset();
+    int r = soft_reset();
     ide_unlock();
+    return r;
 }
 
 uint8_t ide_probe_devices(uint8_t only) {
     ide_lock();
     ide_set_iordy(false);
+    // The caller (detect) applies the geometry explicitly afterwards.
+    sent_armed = false;
+    need_reinit = false;
+    geo_accepted = false;
 
     // Single hardware reset — both devices see it
     gpio_put(IDE_RESET, 0);
@@ -328,7 +506,14 @@ bool ide_wait_until_ready(uint32_t timeout_ms) {
 bool ide_set_geometry(uint8_t heads, uint8_t spt) {
     if (heads == 0 || spt == 0) return false;
     ide_lock();
+    sent_unsupported = false;          // new geometry: try the sentinel again
+    sent_armed = false;
+    need_reinit = false;
     bool ok = set_geometry(heads, spt);
+    // Refused (e.g. a late ATA drive that dropped 91h): the drive keeps its
+    // default translation and nothing is enforced, as before.
+    geo_accepted = ok;
+    if (ok) arm_sentinel();
     ide_unlock();
     return ok;
 }
@@ -354,6 +539,7 @@ int ide_exec(ide_cmd_t *c) {
     c->out_count = c->out_lba_lo = c->out_lba_mid = c->out_lba_hi = c->out_device = 0;
     c->out_hob_count = c->out_hob_lba_lo = c->out_hob_lba_mid = c->out_hob_lba_hi = 0;
     c->tf_valid = c->err_data = c->recovered = false;
+    c->events = 0;
     c->done = 0;
     c->elapsed_us = 0;
 
@@ -365,16 +551,53 @@ int ide_exec(ide_cmd_t *c) {
     ide_lock();
     uint8_t dh = dev_base | (c->device & 0x4F);
 
-    // Select the device and wait until it can take a command.
+    // Select the device and wait until it can take a command.  In CHS mode
+    // with an accepted geometry only BSY is waited on at first: a drive that
+    // reset itself may hold DRDY off until it gets 91h again.
+    uint32_t ready_ms = c->ready_ms ? c->ready_ms : 5000;
+    bool want_drdy = c->flags & IDE_F_NEED_DRDY;
+    bool chs = chs_active();
     wr(6, dh);
     busy_wait_us_32(1);
-    if (!wait_ready(c->ready_ms ? c->ready_ms : 5000, c->flags & IDE_F_NEED_DRDY, &st)) {
+    if (!wait_ready(ready_ms, want_drdy && !(chs && geo_accepted), &st)) {
         c->status = st;
         c->result = IDE_NOT_READY;
         ide_unlock();
         return IDE_NOT_READY;
     }
     if (st & ATA_ST_DRQ) drain_sector();          // stranded data from an earlier command
+
+    if (chs) {
+        if (sent_armed && (rd(2) != SENTINEL_SC || rd(3) != SENTINEL_SN)) {
+            c->events |= IDE_EV_SELF_RESET;       // the drive reset itself since the last command
+            ide_health.self_resets++;
+            need_reinit = true;
+        }
+        if (geo_accepted && want_drdy && !(st & ATA_ST_DRDY)) need_reinit = true;
+        sent_armed = false;                       // the command overwrites SC/SN
+        if (need_reinit) {
+            c->events |= IDE_EV_REINIT;
+            ide_health.reinits++;
+            if (!set_geometry(config.heads, config.spt)) {
+                // Never issue a CHS command through the drive's default
+                // translation: it would address a different sector.
+                ide_health.reinit_failures++;
+                c->events |= IDE_EV_REINIT_FAILED;
+                c->status = rd_alt();
+                c->result = IDE_NOT_READY;
+                ide_unlock();
+                return IDE_NOT_READY;
+            }
+            need_reinit = false;                  // set_geometry() waited for DRDY
+            wr(6, dh);
+            busy_wait_us_32(1);
+        } else if (want_drdy && !(st & ATA_ST_DRDY) && !wait_ready(ready_ms, true, &st)) {
+            c->status = st;
+            c->result = IDE_NOT_READY;
+            ide_unlock();
+            return IDE_NOT_READY;
+        }
+    }
 
     if (c->ext) {
         wr(1, c->hob_feature);
@@ -466,9 +689,20 @@ int ide_exec(ide_cmd_t *c) {
         if (!(st & (ATA_ST_ERR | ATA_ST_DF))) c->error = 0;   // error reg is undefined without ERR
     }
 
+    // Drive idle with the registers read: leave the sentinel for the next
+    // command (also after an ATA error, so a reset after a failed read is
+    // seen too).  EXECUTE DEVICE DIAGNOSTIC and DEVICE RESET may drop the
+    // geometry themselves, so they get 91h before the next command instead.
+    if (c->tf_valid && !(st & (ATA_ST_BSY | ATA_ST_DRQ)) && chs_active()) {
+        if (c->command == 0x90 || c->command == 0x08) need_reinit = (res == IDE_OK) && geo_accepted;
+        else arm_sentinel();
+    }
+
     if ((res == IDE_TIMEOUT || res == IDE_BUS_FAULT || leftover) && !(c->flags & IDE_F_NO_RECOVER)) {
-        soft_reset();
+        int rr = soft_reset();
         c->recovered = true;
+        if (rr == IDE_RST_HW) c->events |= IDE_EV_HW_RESET;
+        else if (rr == IDE_RST_FAILED) c->events |= IDE_EV_HW_RESET | IDE_EV_RESET_FAILED;
     }
 
     c->result = res;

@@ -35,5 +35,6 @@ void j_restore(json_t *j, json_mark_t m);
 // "BSY|DRDY|..." / "UNC|ABRT|..." decoders ("" when no bits set)
 const char *ata_status_bits(uint8_t st, char *out);
 const char *ata_error_bits(uint8_t err, char *out);
+const char *ide_event_bits(uint8_t ev, char *out);   // IDE_EV_*, out >= 96 bytes
 
 #endif

@@ -12,6 +12,7 @@
 #include "ide.h"
 #include "config.h"
 #include "api.h"
+#include "fault.h"
 #include "pico/util/queue.h"
 
 // ---------------------------------------------------------------------------
@@ -73,6 +74,7 @@ extern void core1_entry(void);
 
 int main(void) {
     // No pico_stdio — all console I/O goes through TinyUSB CDC via queues
+    fault_init();             // latch a HardFault record from before this reboot
     config_load();
     ide_hw_init();
     ide_select_device(config.dev_base);

@@ -44,6 +44,7 @@ typedef struct {
     bool     tf_valid;
     bool     err_data;
     bool     recovered;
+    uint8_t  events;          // IDE_EV_*
     uint32_t lba;             // first LBA of the request
     uint32_t fail_lba;        // where the drive stopped (from registers if valid)
     uint16_t count;           // sectors requested

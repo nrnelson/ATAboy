@@ -5,6 +5,7 @@
 #include <string.h>
 #include "ata_policy.h"
 #include "json.h"
+#include "ide.h"
 
 static int failures = 0;
 #define CHECK(cond) do { if (!(cond)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); failures++; } } while (0)
@@ -82,6 +83,14 @@ static void test_json(void) {
     CHECK(strcmp(ata_status_bits(0x59, sb), "DRDY|DSC|DRQ|ERR") == 0);
     CHECK(strcmp(ata_error_bits(0x40, sb), "UNC") == 0);
     CHECK(strcmp(ata_status_bits(0x00, sb), "") == 0);
+
+    char evb[96];
+    CHECK(strcmp(ide_event_bits(0, evb), "") == 0);
+    CHECK(strcmp(ide_event_bits(IDE_EV_HW_RESET, evb), "hw_reset") == 0);
+    CHECK(strcmp(ide_event_bits(IDE_EV_HW_RESET | IDE_EV_RESET_FAILED, evb), "hw_reset|reset_failed") == 0);
+    CHECK(strcmp(ide_event_bits(IDE_EV_SELF_RESET | IDE_EV_REINIT, evb), "self_reset|reinit") == 0);
+    CHECK(strcmp(ide_event_bits(IDE_EV_REINIT | IDE_EV_REINIT_FAILED, evb), "reinit|reinit_failed") == 0);
+    CHECK(strlen(ide_event_bits(0xFF, evb)) < sizeof(evb));
 }
 
 int main(void) {

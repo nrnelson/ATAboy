@@ -95,6 +95,19 @@ const char *ata_status_bits(uint8_t st, char *out) {
     static const char *const n[8] = {"BSY", "DRDY", "DF", "DSC", "DRQ", "CORR", "IDX", "ERR"};
     return bits(st, n, out);
 }
+// IDE_EV_* (ide.h), lowest bit first; out needs 96 bytes.
+const char *ide_event_bits(uint8_t ev, char *out) {
+    static const char *const n[8] = {"hw_reset", "reset_failed", "self_reset", "reinit",
+                                     "reinit_failed", "ev5", "ev6", "ev7"};
+    out[0] = '\0';
+    for (int b = 0; b < 8; b++) {
+        if (ev & (1u << b)) {
+            if (out[0]) strcat(out, "|");
+            strcat(out, n[b]);
+        }
+    }
+    return out;
+}
 const char *ata_error_bits(uint8_t err, char *out) {
     static const char *const n[8] = {"BBK", "UNC", "MC", "IDNF", "MCR", "ABRT", "TK0NF", "AMNF"};
     return bits(err, n, out);

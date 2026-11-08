@@ -13,6 +13,7 @@
 #include "sense.h"
 #include "version.h"
 #include "ide_pio.h"
+#include "fault.h"
 #include "tusb.h"
 #include "pico/time.h"
 #include "pico/bootrom.h"
@@ -67,7 +68,7 @@
 static uint8_t  cur_op;
 static uint32_t armed_until_ms = 0;
 static bool     armed = false;
-static int      reboot_mode = -1;     // -1 none, 0 normal, 1 BOOTSEL
+static int      reboot_mode = -1;     // -1 none, 0 normal, 1 BOOTSEL, 2 fault test
 static uint32_t reboot_at_ms;
 
 static uint32_t now_ms(void) { return to_ms_since_boot(get_absolute_time()); }
@@ -86,6 +87,7 @@ bool api_take_arm(void) {
 void api_poll(void) {
     if (reboot_mode < 0 || (int32_t)(now_ms() - reboot_at_ms) < 0) return;
     if (reboot_mode == 1) reset_usb_boot(0, 0);   // BOOTSEL: UF2 drive + PICOBOOT
+    if (reboot_mode == 2) fault_test();           // HardFault on purpose: handler test
     watchdog_reboot(0, 0, 0);
     while (true) tight_loop_contents();
 }
@@ -194,8 +196,40 @@ static void json_config(json_t *j, const char *key) {
     j_end(j);
 }
 
+static const char *reset_name(int r) {
+    switch (r) {
+    case IDE_RST_OK:     return "ok";
+    case IDE_RST_HW:     return "hw_reset";
+    case IDE_RST_FAILED: return "failed";
+    default:             return "none";
+    }
+}
+
+static void json_resets(json_t *j, const char *key) {
+    j_obj(j, key);
+    j_uint(j, "soft", ide_health.soft_resets);
+    j_uint(j, "soft_failed", ide_health.soft_reset_failures);
+    j_uint(j, "hard", ide_health.hw_resets);
+    j_uint(j, "hard_failed", ide_health.hw_reset_failures);
+    j_uint(j, "geometry_failed", ide_health.geometry_failures);
+    j_str(j, "last", reset_name(ide_health.last_reset));
+    j_uint(j, "last_ms", ide_health.last_reset_ms);
+    j_end(j);
+}
+
+static void json_chs_check(json_t *j, const char *key) {
+    static const char *const st[] = {"off", "idle", "armed", "lost", "unsupported", "no_91h"};
+    uint8_t s = ide_chs_check_state();
+    j_obj(j, key);
+    j_str(j, "state", s < 6 ? st[s] : "off");
+    j_uint(j, "self_resets", ide_health.self_resets);
+    j_uint(j, "reinits", ide_health.reinits);
+    j_uint(j, "reinit_failed", ide_health.reinit_failures);
+    j_end(j);
+}
+
 static void json_log_entry(json_t *j, const char *key, const errlog_entry_t *e) {
-    char sb[48], eb[48];
+    char sb[48], eb[48], evb[96];
     j_obj(j, key);
     j_uint(j, "seq", e->seq);
     j_uint(j, "t_ms", e->t_ms);
@@ -213,6 +247,7 @@ static void json_log_entry(json_t *j, const char *key, const errlog_entry_t *e) 
     j_bool(j, "tf_valid", e->tf_valid);
     j_bool(j, "err_data", e->err_data);
     j_bool(j, "recovered", e->recovered);
+    j_str(j, "events", ide_event_bits(e->events, evb));
     j_uint(j, "elapsed_ms", e->elapsed_ms);
     j_uint(j, "timeout_ms", e->timeout_ms);
     if (e->tf_valid) {
@@ -276,6 +311,8 @@ static void json_status_body(json_t *j) {
     j_uint(j, "status", alt);
     j_str(j, "status_bits", ata_status_bits(alt, sb));
     j_uint(j, "pio_faults", ide_pio_faults);
+    json_resets(j, "resets");
+    json_chs_check(j, "chs_check");
     j_end(j);
 
     json_config(j, "config");
@@ -386,6 +423,7 @@ static int32_t op_info(uint8_t *buf, uint32_t cap) {
     j_str(&j, "board_id", board_id);
     j_uint(&j, "max_xfer", CFG_TUD_MSC_EP_BUFSIZE);
     j_uint(&j, "max_read_sectors", (CFG_TUD_MSC_EP_BUFSIZE - HDR_LEN - RES_LEN) / 512);
+    fault_json(&j, "last_fault");
     j_obj(&j, "ops");
     j_uint(&j, "info", OP_INFO);           j_uint(&j, "status", OP_STATUS);
     j_uint(&j, "config_get", OP_CONFIG_GET); j_uint(&j, "config_set", OP_CONFIG_SET);
@@ -404,7 +442,7 @@ static int32_t op_info(uint8_t *buf, uint32_t cap) {
     j_str(&j, NULL, "pio_out"); j_str(&j, NULL, "read_through_error");
     j_str(&j, NULL, "read_long"); j_str(&j, NULL, "verify"); j_str(&j, NULL, "bootsel");
     j_str(&j, NULL, "persistent_timeouts"); j_str(&j, NULL, "no_retry_reads");
-    j_str(&j, NULL, "corrupt_sector");
+    j_str(&j, NULL, "corrupt_sector"); j_str(&j, NULL, "last_fault");
     j_end(&j);
     j_end(&j);
     return finish_json(buf, R_OK, &j);
@@ -481,12 +519,11 @@ static int32_t op_geometry(uint8_t *buf, uint32_t cap, const uint8_t *a) {
 }
 
 static int32_t op_reset(uint8_t *buf, uint32_t cap, const uint8_t *a) {
-    if (a[0] == 1) ide_reset_drive();
-    else ide_soft_reset();
+    int rr = (a[0] == 1) ? (ide_reset_drive() ? IDE_RST_HW : IDE_RST_FAILED) : ide_soft_reset();
     drive.api_gen++;
-    uint8_t st = ide_read_alt_status();
-    return reply_status(buf, cap, (st & ATA_ST_BSY) ? R_NOT_READY : R_OK,
-                        (st & ATA_ST_BSY) ? "drive still busy after reset" : NULL);
+    if (rr == IDE_RST_FAILED)
+        return reply_status(buf, cap, R_NOT_READY, "drive did not come back from reset (or refused the CHS geometry)");
+    return reply_status(buf, cap, R_OK, (a[0] != 1 && rr == IDE_RST_HW) ? "soft reset failed; hardware reset recovered the drive" : NULL);
 }
 
 static int32_t op_identify(uint8_t *buf, uint32_t cap, const uint8_t *a) {
@@ -802,7 +839,7 @@ int32_t api_handle(uint8_t lun, const uint8_t *cdb, uint8_t *buf, uint32_t cap) 
         armed_until_ms = now_ms() + ARM_WINDOW_MS;
         return reply_msg(buf, cap, R_OK, "armed for one dangerous pass-through command within 10 s");
     case OP_REBOOT:
-        if (be32(&a[4]) != 0x424F4F54u || a[0] > 1) return reply_msg(buf, cap, R_BAD_ARG, "bad reboot magic/mode");  // "BOOT"
+        if (be32(&a[4]) != 0x424F4F54u || a[0] > 2) return reply_msg(buf, cap, R_BAD_ARG, "bad reboot magic/mode");  // "BOOT"
         reboot_mode = a[0];
         reboot_at_ms = now_ms() + 200;    // let the reply and CSW go out first
         return reply_msg(buf, cap, R_OK, a[0] ? "rebooting to BOOTSEL" : "rebooting");
