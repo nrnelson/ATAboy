@@ -621,7 +621,11 @@ static int cmd_wait(ctx *c) {
         for (int i = 0; i < n && pick < 0; i++)
             if (!c->serial || !*c->serial || !strcasecmp(devs[i].serial, c->serial)) pick = i;
         if (pick < 0 && exec_cmd && *exec_cmd && t - last_exec > 3) {
-            int r = system(exec_cmd);   // e.g. usbipd attach under WSL
+            // e.g. usbipd attach under WSL; its output goes to stderr so
+            // stdout stays clean JSON
+            char cmd[1100];
+            snprintf(cmd, sizeof(cmd), "%s 1>&2", exec_cmd);
+            int r = system(cmd);
             (void)r;
             last_exec = t;
         }
