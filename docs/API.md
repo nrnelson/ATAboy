@@ -137,6 +137,7 @@ before parsing.
 | 22 | READ | [4-7] LBA · [8-9] count (1..`max_read_sectors`) · [10] flags: bit0 no retry (0x21), bit1 read-through-error · [12-15] per-sector timeout ms (0 = config) | binary: result block + data |
 | 23 | READ_LONG | [4-7] LBA · [8] ECC bytes (0 = auto) · [10] flags: bit0 no retry (0x23) · [12-15] timeout ms | binary: result block + 512 data + ECC bytes |
 | 25 | CORRUPT | [4-7] LBA · [8] data bits to flip (1..255) · [9] ECC bytes (0 = auto) | binary result block (of the WRITE LONG). **Destructive test helper**: READ LONG, flip bits, WRITE LONG with the old ECC; needs write protect off and an ARM |
+| 26 | HASHES | [4-7] first sequence number (0 = oldest retained) · [8] bit0 clear the ring first | binary: SHA-256 of recently read sectors (below) |
 | 24 | VERIFY | [4-7] LBA · [8-11] count · [12-15] per-command timeout ms | binary: result block (no data) |
 | 30 | LOG | [4-7] start index (0 = oldest retained) | JSON page of the error log |
 | 31 | LOG_CLEAR | [4] bit0 clear log, bit1 reset statistics | JSON |
@@ -238,6 +239,53 @@ failing LBA is the real one. No data
 crosses USB, so scanning is limited by the drive, not the 12 Mbit/s link. One
 request stops at the first error or after about 10 s (flag bit6, *partial*);
 continue from `lba + done`.
+
+### HASHES
+
+Every 512-byte sector the drive delivers on the USB-disk read path and to API
+READ (including a read-through-error block, flagged) is hashed with SHA-256
+by the RP2350's hardware SHA-256 block right after the drive command, before
+it goes to USB. The firmware keeps the last 1024 records in RAM (not saved;
+they start again at sequence 1 after a reboot or a clear). Compare them with
+the data the host received to rule out corruption between the drive and the
+host, or keep them as a record of what the drive delivered. READ LONG,
+pass-through and the serial menu are not hashed.
+
+Hashing costs about 10 µs a sector against roughly 1 ms per sector for the
+whole USB read at full speed (the header's busy time divided by the record
+count gives the measured figure), so it is always on. A known-answer test runs
+before first use; if the hardware gives a wrong digest, hashing stays off
+(header flag bit0 clear, INFO lists no `sector_hashes` feature).
+
+Reply payload: a 32-byte header, big-endian, then as many whole records as fit
+in the allocation (92 in 4 KiB). Page with `next` until it passes `newest`.
+
+| Byte | Meaning |
+|---|---|
+| 0-3 | `newest`: sequence number of the newest record (= sectors hashed since boot/clear; 0 = none) |
+| 4-7 | oldest retained sequence number (0 = none) |
+| 8-11 | `next`: sequence number to ask for next |
+| 12-13 | records in this reply |
+| 14-15 | record length (44) |
+| 16-17 | ring capacity (1024) |
+| 18 | flags: bit0 hashing active |
+| 19 | reserved |
+| 20-27 | µs spent hashing since boot/clear (64-bit) |
+| 28-31 | reserved |
+
+Record (44 bytes):
+
+| Byte | Meaning |
+|---|---|
+| 0-3 | sequence number |
+| 4-7 | LBA |
+| 8 | source: 1 USB disk READ(10), 2 API READ |
+| 9 | flags: bit0 data returned with ERR (read-through-error), not a good read |
+| 10-11 | reserved |
+| 12-43 | SHA-256 of the 512 data bytes |
+
+A sector that failed is not hashed (there is no data), and a USB-disk read
+that stops at a bad sector hashes only the sectors before it.
 
 ### LOG
 

@@ -1,5 +1,6 @@
 #include "drive.h"
 #include "config.h"
+#include "sector_hash.h"
 #include "pico/time.h"
 #include <string.h>
 
@@ -293,6 +294,7 @@ int drive_read(uint32_t lba, uint32_t count, uint8_t *buf, uint32_t *done) {
     if (r != IDE_OK) drive_stats.read_errors++;
     drive_record(LOGOP_READ, &c, lba, count);
     *done = c.done < count ? c.done : count;
+    hash_sectors(lba, buf, *done, HASH_SRC_USB, 0);
     return r == IDE_OK ? 0 : -1;
 }
 

@@ -48,6 +48,8 @@ add_executable(ATAboy
         menus.c
         usb.c
         msc_rw.c
+        sector_hash.c
+        sha256_hw.c
         usb_descriptors.c
         config.c)
 
@@ -89,6 +91,7 @@ target_link_libraries(ATAboy
         hardware_dma
         hardware_clocks
         hardware_watchdog
+        hardware_sha256
         pico_bootrom
         pico_unique_id
         tinyusb_device
