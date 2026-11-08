@@ -1220,17 +1220,25 @@ class ATAboy:
 
     def image(self, out, mapfile=None, start=0, count=None, chunk_sectors=128, time_budget_s=0,
               progress=None):
-        """Image the mounted drive through the USB disk (/dev/sdX, O_DIRECT) into
-        'out', keeping a ddrescue-compatible mapfile so the run can be resumed
-        and then handed to rescue().  Chunks that fail are re-read sector by
-        sector; unreadable sectors are marked '-'."""
+        """Image the drive into 'out', keeping a ddrescue-compatible mapfile so
+        the run can be resumed and then handed to rescue().  Reads through the
+        USB disk (/dev/sdX, O_DIRECT; needs the drive mounted and read access to
+        the block device, i.e. root or the 'disk' group), or else through API
+        READs (works over the serial transport as a normal user, mounted or
+        not).  Chunks that fail are re-read sector by sector; unreadable
+        sectors are marked '-'."""
         import mmap
-        if not (self.info_dev and self.info_dev.get("block")):
-            raise TransportError("imaging needs the block device of a discovered ATAboy")
         st = self.status()
-        if not st["mounted"]:
-            raise ApiError(_local_reply(OPS["status"], RESULTS.index("not_mounted"),
-                                        "imaging reads the USB disk; mount the drive first"))
+        if not st["geometry"]["valid"]:
+            raise ApiError(_local_reply(OPS["status"], RESULTS.index("no_geometry"),
+                                        "detect the drive (or set its geometry) first"))
+        fd = None
+        blk = (self.info_dev or {}).get("block")
+        if blk and st["mounted"]:
+            try:
+                fd = os.open(blk, os.O_RDONLY | os.O_DIRECT)
+            except PermissionError:
+                fd = None                 # not root / not in 'disk': read through the API
         total = st["geometry"]["sectors"]
         end = total if count is None else min(total, start + count)
         mapfile = mapfile or out + ".map"
@@ -1245,9 +1253,22 @@ class ATAboy:
                 a, b = max(pos // 512, start), min((pos + size) // 512, end)
                 if a < b:
                     todo.append((a, b))
-        fd = os.open(self.info_dev["block"], os.O_RDONLY | os.O_DIRECT)
         buf = mmap.mmap(-1, chunk_sectors * 512)
         one = mmap.mmap(-1, 4096)
+        api_max = 7                       # sectors per API READ (INFO max_read_sectors)
+
+        def read_into(dst, lba, n):
+            """n sectors at lba into dst; OSError(EIO) if any of them failed."""
+            if fd is not None:
+                if os.preadv(fd, [memoryview(dst)[:n * 512]], lba * 512) != n * 512:
+                    raise OSError(errno.EIO, "short read")
+                return
+            for off in range(0, n, api_max):
+                k = min(api_max, n - off)
+                r = self.read(lba + off, k)
+                if not r.ok or len(r.data) < k * 512:
+                    raise OSError(errno.EIO, "API read failed at LBA %d" % (lba + off))
+                dst[off * 512:(off + k) * 512] = r.data[:k * 512]
         mode = "r+b" if os.path.exists(out) else "w+b"
         t0, done, bad, last_save = time.time(), 0, [], time.time()
         complete = True
@@ -1262,9 +1283,7 @@ class ATAboy:
                             break
                         n = min(chunk_sectors, b - lba)
                         try:
-                            got = os.preadv(fd, [memoryview(buf)[:n * 512]], lba * 512)
-                            if got != n * 512:
-                                raise OSError(errno.EIO, "short read")
+                            read_into(buf, lba, n)
                             img.seek(lba * 512)
                             img.write(memoryview(buf)[:n * 512])
                             m.mark(lba, n, "+")
@@ -1275,8 +1294,7 @@ class ATAboy:
                                                      "rerun to resume" % e)
                             for s in range(lba, lba + n):          # isolate the bad sector(s)
                                 try:
-                                    if os.preadv(fd, [memoryview(one)[:512]], s * 512) != 512:
-                                        raise OSError(errno.EIO, "short read")
+                                    read_into(one, s, 1)
                                     img.seek(s * 512)
                                     img.write(memoryview(one)[:512])
                                     m.mark(s, 1, "+")
@@ -1299,10 +1317,12 @@ class ATAboy:
                     if not complete:
                         break
         finally:
-            os.close(fd)
+            if fd is not None:
+                os.close(fd)
             m.save()
         secs = time.time() - t0
         return {"result": "ok" if not bad else "errors", "image": out, "mapfile": mapfile,
+                "via": "usb_disk" if fd is not None else "api",
                 "imaged_sectors": done, "bad_lbas": bad, "complete": complete,
                 "map": m.summary(), "seconds": round(secs, 1),
                 "kB_per_s": round(done * 0.512 / secs, 1) if secs else None}

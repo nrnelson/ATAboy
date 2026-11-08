@@ -946,12 +946,30 @@ class TestMisc(HostTestCase):
             self.dev.read(self.fake.total, 1)
         self.assertEqual(cm.exception.reply.result_name, "bad_arg")
 
-    def test_image_not_mounted_is_api_error(self):
+    def test_image_not_mounted_reads_through_api(self):
+        # Not mounted (or no access to /dev/sdX, e.g. serial transport as a
+        # normal user): image falls back to API READs, 7 sectors at a time.
         self.dev.info_dev = {"sysfs": self.dir, "block": "/dev/sdzz", "sg": None, "rev": "api1",
                              "scsi_timeout_s": 30}
+        self.fake.bad[20] = UNC
+        out = self.path("x.img")
+        res = self.dev.image(out, count=30)
+        self.assertEqual(res["via"], "api")
+        self.assertEqual(res["bad_lbas"], [20])
+        self.assertEqual(res["imaged_sectors"], 29)
+        with open(out, "rb") as f:
+            for lba in range(30):
+                f.seek(lba * 512)
+                self.assertEqual(f.read(512), bytes(512) if lba == 20 else sector(lba))
+        reads = [struct.unpack(">IH", a[:6]) for op, a in self.fake.calls if op == ab.OPS["read"]]
+        self.assertTrue(all(n <= 7 for _, n in reads))
+        self.assertEqual(ab.Mapfile.load(out + ".map").status_at(20 * 512 // 512), "-")
+
+    def test_image_without_geometry_is_api_error(self):
+        self.fake.geometry_valid = False
         with self.assertRaises(ab.ApiError) as cm:
             self.dev.image(self.path("x.img"))
-        self.assertEqual(cm.exception.reply.result_name, "not_mounted")
+        self.assertEqual(cm.exception.reply.result_name, "no_geometry")
 
 
 
