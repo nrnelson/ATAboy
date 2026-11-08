@@ -926,6 +926,13 @@ class TestGeometryOwner(HostTestCase):
         self.assertTrue(r.ok)
         self.assertEqual(r.json["geometry"]["owner"]["model"], "WDC WD10EZEX-00BN5A0")
 
+    def test_forced_manual_detect_and_mount_cdb(self):
+        # A drive that doesn't answer IDENTIFY: manual CHS + force + mount in one DETECT.
+        r = self.dev.detect(geometry="manual", chs=(615, 4, 17), force=True, mount=True)
+        self.assertTrue(r.ok)
+        a = [args for op, args in self.fake.calls if op == 0x10][-1]
+        self.assertEqual(a[:7], bytes([0, 4]) + struct.pack(">H", 615) + bytes([4, 17, 2 | 4]))
+
     def test_not_ready_drive_is_not_mounted(self):
         self.fake.ready = False
         r = self.dev.mount(rescan=False)
