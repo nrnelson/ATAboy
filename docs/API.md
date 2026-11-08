@@ -5,20 +5,25 @@ menu: everything the menu can do (detect, set geometry, mount, change
 settings, run diagnostics) plus things it can't (raw ATA commands, READ LONG,
 surface scans, a full error log, remote firmware updates).
 
-There are two ways in, both over the ATAboy's existing USB mass-storage
-interface. They're available whether or not a drive is mounted; the USB disk
-just shows 0 bytes until one is:
+There are three ways in. They're available whether or not a drive is
+mounted; the USB disk just shows 0 bytes until one is:
 
-| Interface | SCSI opcode | Use it for |
+| Interface | How | Use it for |
 |---|---|---|
-| **ATAboy API** | `0xC0` (vendor) | state, configuration, detection, mounting, diagnostics, logs |
-| **SAT ATA PASS-THROUGH** | `0x85` (16) / `0xA1` (12) | raw ATA commands; makes `smartctl -d sat`, `hdparm`, `sg_sat_identify` work unchanged |
+| **ATAboy API** over the **API serial port** | USB CDC serial port "ATAboy API" ([below](#api-serial-port)) | everything the API does; **no root / admin needed** |
+| **ATAboy API** over SCSI | vendor opcode `0xC0` on the mass-storage interface | the same requests and replies |
+| **SAT ATA PASS-THROUGH** | SCSI `0x85` (16) / `0xA1` (12) | raw ATA commands; makes `smartctl -d sat`, `hdparm`, `sg_sat_identify` work unchanged |
 
-The `ataboy` host tool (`host/ataboy`) wraps both. The rest of this document
-is the wire format, for anyone writing another client.
+The `ataboy` host tool (`host/ataboy`) wraps all three: it uses the serial
+port when it can open it and falls back to SCSI (`--transport
+auto|serial|sgio`). The rest of this document is the wire format, for anyone
+writing another client.
 
-On Linux both are sent with the `SG_IO` ioctl on `/dev/sgN` or `/dev/sdX`.
-Vendor and pass-through opcodes need `CAP_SYS_RAWIO` (root).
+On Linux the SCSI opcodes are sent with the `SG_IO` ioctl on `/dev/sgN` or
+`/dev/sdX`. Vendor and pass-through opcodes need `CAP_SYS_RAWIO` (root): they
+are outside the kernel's whitelist for unprivileged SG_IO, and membership of
+group `disk` is not enough. On Windows they need administrator rights. The
+API serial port needs only read/write access to the tty.
 
 ## Quick start
 
@@ -53,6 +58,12 @@ LBAs) and counts per kind.
 reported a failure (ATA error, bad argument, ...), `2` usage, `3` transport /
 no device, `4` permission.
 
+With more than one ATAboy attached, pick one by its USB serial number:
+`ataboy list` shows them, `ataboy -s E66138935F4B2F2B status` (or
+`ATABOY_SERIAL`) selects one. The serial number is the RP2350's unique board
+id (16 hex digits, also INFO's `board_id`); firmware before it reported
+`654321` on every unit.
+
 ## Request format (vendor opcode 0xC0)
 
 Every request is a **16-byte CDB, data-in**. Ask for 4096 bytes; the device
@@ -62,11 +73,13 @@ returns fewer and the residue tells you how many.
 |---|---|
 | 0 | `0xC0` |
 | 1 | sub-operation (table below) |
-| 2-3 | `'A' 'B'` (0x41 0x42) signature; any other value gets ILLEGAL REQUEST |
-| 4-15 | arguments, big-endian, per sub-op |
+| 2-3 | signature: `'A' 'B'` (0x41 0x42) basic request, or `'A' 'X'` (0x41 0x58) extended request (32-byte reply header, request id); any other value gets ILLEGAL REQUEST |
+| 4-15 | arguments, big-endian, per sub-op. In an extended request to a state-changing op (INFO `rid_ops`), bytes 12-15 are the request id instead ([Request ids](#request-ids)) |
 
 The allocation length must be at least 256 bytes, otherwise the command fails
-with ILLEGAL REQUEST (24h/00h).
+with ILLEGAL REQUEST (24h/00h). Firmware without the extended header refuses
+`'A' 'X'` the same way (ILLEGAL REQUEST 24h/00h, nothing run), so a client can
+try an extended request first and fall back to basic ones.
 
 ## Reply format
 
@@ -82,9 +95,22 @@ Every reply starts with a 16-byte header:
 | 6-7 | payload length (BE) |
 | 8-11 | device uptime in ms (BE) |
 | 12 | flags: bit0 mounted, bit1 write protect, bit2 drive identified, bit3 armed, bit4 geometry valid |
-| 13-15 | reserved (0) |
+| 13 | header length: `0` in a basic reply (16 bytes), `32` in an extended reply |
+| 14-15 | reserved (0) |
 
-The payload follows. **Device-level outcomes come back in-band**: the SCSI
+An extended request (`'A' 'X'`) gets 16 more header bytes:
+
+| Byte | Meaning |
+|---|---|
+| 16-19 | boot id: random, new on every power-up or reboot (RP2350 TRNG) |
+| 20-23 | state counter: goes up on every state change since boot ([below](#boot-id-and-state-counter)) |
+| 24-27 | request id echo (0 when none was taken) |
+| 28 | flags: bit0 replayed (this is the stored reply of an earlier request with the same id; nothing ran), bit1 request id taken (the op is in `rid_ops`) |
+| 29-31 | reserved (0) |
+
+The payload follows the header (byte 16, or 32 in an extended reply). The
+allocation length counts the whole reply, so an extended reply has 16 bytes
+less room for payload; `max_read_sectors` is 7 either way. **Device-level outcomes come back in-band**: the SCSI
 command succeeds and the header says what happened. CHECK CONDITION is only
 used for malformed CDBs (bad signature, allocation too small), so a client
 never has to parse sense data to use the API.
@@ -116,12 +142,13 @@ before parsing.
 | 14 | `unsupported` | the drive lacks the feature (e.g. LBA) |
 | 15 | `protocol` | the drive's data phase didn't match (e.g. wrong READ LONG ECC length) |
 | 16 | `alloc_too_small` | allocation length too small for this reply |
+| 18 | `request_id_conflict` | the request id was already used for a different request ([Request ids](#request-ids)); nothing ran |
 
 ## Sub-operations
 
 | Op | Name | Arguments (CDB byte offsets) | Reply |
 |---|---|---|---|
-| 00 | INFO | — | JSON: firmware identity, protocol, git hash, board id, limits, op table, features |
+| 00 | INFO | — | JSON: firmware identity, protocol, git hash, board id, limits, op table, features; `boot_id`, `state_counter`, `rid_ops` (ops that take a request id), `rid_cache` (replies kept), `transports` |
 | 01 | STATUS | — | JSON: everything (below) |
 | 02 | CONFIG_GET | — | JSON `{"config":{...}}` |
 | 03 | CONFIG_SET | [4] key, [8-11] value | JSON config (not saved) |
@@ -261,6 +288,154 @@ ECC bytes per sector, up to 5 scattered flipped bits were corrected silently
 differed from the original by exactly the flipped bits. Writing the sector
 normally repairs it.
 
+## Request ids
+
+A state-changing request can be made run-once, so a client that lost the
+reply can safely ask again. This matters on USB: very rarely a reply arrives
+empty (seen about once in 500 calls right after a mount), and on the serial
+port a reply can be cut off when a program is killed or a cable is pulled.
+
+- Only in extended requests (`'A' 'X'`), only for the ops in INFO `rid_ops`:
+  CONFIG_SET, CONFIG_SAVE, CONFIG_DEFAULTS, DETECT, GEOMETRY, MOUNT, UNMOUNT,
+  RESET, CORRUPT, LOG_CLEAR, ARM, REBOOT. CDB bytes 12-15 carry the id
+  (non-zero; 0 = no id); the op itself sees them as zero. These ops never use
+  bytes 12-15 for arguments, and new state-changing ops won't either. For all
+  other ops bytes 12-15 stay arguments (READ, READ_LONG and VERIFY use them):
+  those ops only read, so asking again is safe anyway.
+- The firmware keeps the replies to the last 4 requests that carried an id
+  (in RAM; a reboot forgets them, and the boot id tells the client). The same
+  16 CDB bytes again (same op, arguments and id) get the stored reply with
+  extended flag bit0 *replayed*, and nothing runs. Header bytes 8-12 (uptime,
+  flags) and the state counter are refreshed; the payload is what the first
+  request produced.
+- The same id with a different request gets `request_id_conflict` (18) and
+  nothing runs. Use a fresh random id for every new request.
+- A replay works across transports: an id first sent over SCSI can be
+  retried on the serial port.
+
+The host library does this automatically: every state-changing call gets a
+random id, and after an empty or lost reply it sends exactly the same request
+once more. Against firmware without the extended header it sends basic
+requests and, as before, only re-sends the read-only ops.
+
+## Boot id and state counter
+
+Every extended reply carries the **boot id**, a random 32-bit value chosen at
+power-up, and the **state counter**. A client that sees a different boot id
+than in its previous reply knows the ATAboy rebooted (watchdog, power cycle,
+REBOOT) and that everything in RAM went with it: unsaved settings, geometry,
+mount, the error log, the replay store. The host library tracks the boot id
+per USB serial number (`ATAboy.link_info()`, `Reply.rebooted`,
+`ATAboy.on_reboot`); the CLI warns and remembers the last boot id between
+runs in `~/.cache/ataboy/boot-ids.json`, so it also reports a power cycle
+since the previous command.
+
+The state counter starts at 0 at boot and goes up when anything a host would
+call state changes: mount/unmount, write protect and every other setting,
+geometry, the identified drive (detect, device change), and every API op that
+changes state (`drive.api_gen`), even when it ends where it started. Changes
+made from the setup menu or by auto-mount count too: the firmware compares a
+fingerprint of that state on every reply and every 10 ms. A change undone
+within one long USB command (for example toggled twice in the menu while a
+10 s VERIFY runs) can be missed. A client can read the counter before and
+after something and know whether anything changed in between. INFO also
+reports both.
+
+## API serial port
+
+The ATAboy is a composite USB device: interface 0-1 the setup UI serial port
+("ATAboy CDC"), interface 2 the disk ("ATAboy Storage"), and interfaces 3-4 a
+second CDC ACM serial port, **"ATAboy API"**, with its own IAD (endpoints
+84h, 05h, 85h). The setup UI and the disk are unchanged. bcdDevice is 0101h
+on firmware with the API port, so hosts don't reuse a descriptor layout
+cached for the old firmware. The baud rate and line settings are ignored.
+
+The port carries exactly the requests of the 0xC0 vendor command and returns
+exactly the bytes the SCSI path returns, framed with a length and a CRC:
+
+**Request frame**
+
+| Byte | Meaning |
+|---|---|
+| 0-1 | `A5 51` (`'Q'`) |
+| 2 | frame version `1` |
+| 3 | flags (0) |
+| 4-5 | tag: any value; echoed in the response |
+| 6-7 | allocation length, as in the SCSI command (`0` = 4096; at least 256; larger values are cut to 4096) |
+| 8-9 | body length: 16 (the CDB); 16 + n with n bytes of data-out (no op takes data-out yet: refused, not run) |
+| 10.. | the 16 CDB bytes, as in [Request format](#request-format-vendor-opcode-0xc0) |
+| last 4 | CRC-32 (zlib/PNG polynomial, as `zlib.crc32`) of every byte before it, big-endian |
+
+**Response frame**
+
+| Byte | Meaning |
+|---|---|
+| 0-1 | `A5 52` (`'R'`) |
+| 2 | frame version `1` |
+| 3 | status: `0` ok, body = the API reply · `1` the SCSI path would have answered CHECK CONDITION (bad signature, allocation < 256), body = sense key, ASC, ASCQ · `2` the request failed its CRC check, **nothing ran**, send it again · `3` unsupported frame (data-out), nothing ran |
+| 4-5 | tag of the request |
+| 6-7 | 0 |
+| 8-9 | body length (≤ 4096) |
+| 10.. | body |
+| last 4 | CRC-32 of every byte before it |
+
+Rules:
+
+- One request at a time. The firmware reads the next request only after the
+  previous response has been handed to USB; a client sends, then reads until
+  a response with its tag arrives. Discard responses with another tag (left
+  over from an abandoned request) and any bytes before `A5 52`.
+- Requests run on the same core and through the same dispatcher as the SCSI
+  vendor command, between USB events: never in the middle of a mass-storage
+  READ(10)/WRITE(10) (a transfer counts as finished at its completion, or
+  after 500 ms without progress), never at the same time as an SCSI request,
+  and sharing the IDE bus with the setup menu as before. Everything above
+  (results, locks, write protect, ARM, request ids, boot id) is the same.
+- A frame that stops arriving for 1 s is dropped. Opening or closing the port
+  (DTR change) drops a half-received request and any response nobody has
+  read; a request already received still runs.
+- After REBOOT the firmware waits (up to 1 s) for the reply to leave before
+  restarting; the port then disappears with the device.
+- If no intact response arrives (timeout, CRC error), the request may or may
+  not have run: re-send read-only ops freely and state-changing ops only with
+  a request id (the host library does this). Status 2 means it did not run.
+
+**Finding the port.** On Linux, the tty whose USB interface has the string
+`ATAboy API` (`/sys/class/tty/ttyACM*/device/interface`) on a device with
+VID:PID `cafe:4005`; the USB serial number (`../serial`) says which unit.
+`ataboy list` shows it. The interface number is 3. Never rely on the
+`ttyACMn` number. The setup UI is the port on interface 0.
+
+**Permissions.** `/dev/ttyACM*` is usually `root:dialout 0660` (`uucp` on
+Arch): add yourself to that group (`sudo usermod -aG dialout $USER`, then log
+in again). Alternatively a udev rule gives the logged-in user access and a
+stable name:
+
+```
+# /etc/udev/rules.d/70-ataboy.rules
+SUBSYSTEM=="tty", ATTRS{idVendor}=="cafe", ATTRS{idProduct}=="4005", ENV{ID_USB_INTERFACE_NUM}=="03", \
+  TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1", SYMLINK+="ataboy-api-$env{ID_SERIAL_SHORT}"
+```
+
+`ID_MM_DEVICE_IGNORE` keeps ModemManager from probing the port with AT
+commands (harmless, the firmware skips bytes that aren't a frame, but it
+wastes time).
+
+**Other systems.** macOS names the port `/dev/cu.usbmodem…`; the host library
+works there with `--dev /dev/cu.usbmodem…` (termios), but has no automatic
+discovery and no SG_IO. Windows: the port appears as a COM port with the
+inbox `usbser.sys` driver (Windows 10 and later, no INF); a Windows transport
+for the host library (Win32 serial API via ctypes, discovery by
+`USB\VID_CAFE&PID_4005&MI_03` and the serial number) is future work.
+
+**Throughput.** The port is full-speed USB CDC with 64-byte bulk packets:
+roughly 0.5-1 MB/s of raw bandwidth, depending on how quickly the main loop
+re-arms the endpoint. An API READ of 7 sectors is a ~3.6 KB reply, so
+expect a few milliseconds of USB time per request plus the drive's time, in
+the same range as the SCSI vendor command (which needs CBW/CSW round trips
+of its own). Bulk imaging should keep using the USB disk (READ(10)), which
+is unchanged.
+
 ## SAT ATA PASS-THROUGH
 
 ATA PASS-THROUGH (16) `0x85` and (12) `0xA1` are implemented per SAT for
@@ -341,5 +516,12 @@ recoverable by holding BOOTSEL while plugging in USB.
 
 - `INFO.proto` is bumped only for incompatible changes. New fields and
   sub-ops are added compatibly; clients should ignore unknown JSON fields.
+- The extended header, request ids and the API serial port are compatible
+  additions to protocol 1: a client that sends basic `'A' 'B'` requests gets
+  byte-for-byte the replies it always got (header byte 13 stays 0). Extended
+  replies also carry protocol `1` in byte 2; check byte 13 for the header
+  length. Firmware without them refuses `'A' 'X'` with ILLEGAL REQUEST
+  24h/00h and has no "ATAboy API" port; INFO `features` lists `ext_header`,
+  `request_id` and `serial_api` when present.
 - INQUIRY product revision is `api1` for this firmware, so a host can tell API
   firmware from stock (`V0.6`) by `/sys/block/sdX/device/rev`.
