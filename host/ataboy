@@ -230,6 +230,9 @@ CONFIG_KEYS = {
 
 GEOMETRY_MODES = {"auto": 0, "normal": 1, "large": 2, "lba": 3, "manual": 4, "keep": 5}
 
+MSC_CHUNK_SECTORS = 8          # one USB-disk READ(10) chunk: the firmware's 4 KiB MSC buffer
+LBA28_LIMIT = 1 << 28          # READ LONG (0x22/0x23) has no 48-bit form
+
 
 class Reply:
     """Decoded API reply (16-byte header + JSON or binary payload)."""
@@ -268,11 +271,19 @@ class Reply:
                 "armed": bool(f & 8), "geometry_valid": bool(f & 16)}
 
 
+def _local_reply(op, result, message):
+    """A Reply synthesised on the host (for ApiError), shaped like the device's."""
+    payload = json.dumps({"result": RESULTS[result], "message": message}).encode()
+    return Reply(Reply.HDR.pack(b"AB", API_PROTO, op, result, CT_JSON, len(payload), 0, 0) + payload)
+
+
 class AtaResult:
     """Binary ATA result block (32 bytes) + data from read/read_long/verify."""
     FMT = struct.Struct(">IHHBBBBII5sBbxI")
 
-    def __init__(self, payload, op_result):
+    def __init__(self, payload, op_result, verify=False):
+        if len(payload) < self.FMT.size:
+            raise TransportError("short ATA result block (%d bytes)" % len(payload))
         (self.lba, self.count, self.done, self.status, self.error, self.command, fl,
          self.elapsed_us, fail_lba, tf, self.ecc_len, ide_res, done32) = self.FMT.unpack_from(payload)
         self.timed_out = bool(fl & 0x01)
@@ -287,7 +298,9 @@ class AtaResult:
         self.ide_result = IDE_RESULTS.get(ide_res, str(ide_res))
         self.result = RESULTS[op_result] if op_result < len(RESULTS) else str(op_result)
         self.data = payload[32:]
-        if self.command in (0x40, 0x41, 0x42):          # VERIFY carries a 32-bit count
+        # VERIFY carries a 32-bit count.  The command byte alone isn't enough to
+        # recognise it: it is 0 when the firmware gave up before issuing one.
+        if verify or self.command in (0x40, 0x41, 0x42):
             self.done = done32
 
     @property
@@ -451,22 +464,48 @@ class ATAboy:
     def defaults(self):
         return self._json("config_defaults")
 
+    @staticmethod
+    def kernel_timeout_needed(fw_timeout_ms):
+        """Kernel SCSI timeout (s) that covers one USB-disk READ(10) chunk of
+        MSC_CHUNK_SECTORS slow-but-succeeding sectors, each allowed the firmware
+        per-sector timeout, plus 30 s of slack."""
+        ms = int(fw_timeout_ms) * MSC_CHUNK_SECTORS
+        return (ms + 999) // 1000 + 30
+
     def ensure_kernel_timeout(self, fw_timeout_ms):
         """Make the kernel's SCSI timeout for /dev/sdX longer than the firmware
-        per-sector timeout so the host doesn't abort a read the drive is still retrying."""
+        can spend on one READ(10) chunk, so the host doesn't abort a read the
+        drive is still retrying.  Never lowers a larger existing timeout.
+        Returns the timeout now in effect (s), or None when it can't be set."""
         if not self.info_dev:
             return None
         path = self.info_dev["sysfs"] + "/timeout"
-        need = fw_timeout_ms // 1000 + 30
+        need = self.kernel_timeout_needed(fw_timeout_ms)
         try:
             cur = int(_read(path) or 0)
             if cur < need:
                 with open(path, "w") as f:
                     f.write(str(need))
-                return need
+                cur = need
+            self.info_dev["scsi_timeout_s"] = cur
             return cur
-        except OSError:
+        except (OSError, ValueError):
             return None
+
+    def sync_kernel_timeout(self, status_json=None):
+        """ensure_kernel_timeout() for the device's current read_timeout_ms, which
+        may come from flash or the serial menu rather than set_config().  Uses
+        the config in status_json (a STATUS-shaped reply) when present."""
+        if not self.info_dev:
+            return None
+        cfg = status_json.get("config") if isinstance(status_json, dict) else None
+        if not isinstance(cfg, dict) or "read_timeout_ms" not in cfg:
+            try:
+                cfg = self.status().get("config") or {}
+            except ApiError:
+                return None
+        ms = cfg.get("read_timeout_ms")
+        return self.ensure_kernel_timeout(ms) if ms else None
 
     # -- drive setup -----------------------------------------------------------
 
@@ -476,6 +515,7 @@ class ATAboy:
         c, h, s = chs or (0, 0, 0)
         flags = (0 if probe else 1) | (2 if mount else 0) | (4 if force else 0)
         r = self.call("detect", struct.pack(">BBHBBB", dev, geo, c, h, s, flags), timeout_ms=120000)
+        self.sync_kernel_timeout(r.json)      # before the rescan makes the kernel read the disk
         if r.ok and mount:
             self.rescan()
         return r
@@ -486,6 +526,7 @@ class ATAboy:
 
     def mount(self, rescan=True):
         r = self.call("mount")
+        self.sync_kernel_timeout(r.json)
         if r.ok and rescan:
             self.rescan()
         return r
@@ -558,7 +599,7 @@ class ATAboy:
         r = self.call("verify", struct.pack(">III", lba, count, timeout_ms), timeout_ms=sg_t)
         if r.ctype != CT_BINARY:
             raise ApiError(r)
-        return AtaResult(r.payload, r.result)
+        return AtaResult(r.payload, r.result, verify=True)
 
     def corrupt(self, lba, bits=16, ecc_len=0):
         """DESTRUCTIVE test helper: flip 'bits' data bits in a sector and write it
@@ -605,7 +646,9 @@ class ATAboy:
             n = end - cur if not time_budget_s else min(end - cur, 8192)
             r = self.verify(cur, n, timeout_ms=timeout_ms)
             requests += 1
-            cur += r.done
+            if r.ok and r.done == 0:
+                break               # no progress and no error: don't spin; next_lba says where
+            cur += min(r.done, n)
             if r.result != "ok":
                 bad.append({"lba": cur, "status": r.status, "error": r.error,
                             "error_bits": bits(r.error, ER_BITS), "ide_result": r.ide_result})
@@ -648,7 +691,11 @@ class ATAboy:
                 if r.ok:
                     cur += n
                     continue
-                fl = r.fail_lba if r.fail_lba is not None else cur + r.done
+                # Don't trust a drive-reported LBA outside the request (CHS
+                # decoding, stale registers): fall back to the first sector not done.
+                fl = r.fail_lba
+                if fl is None or not cur <= fl < cur + n:
+                    fl = cur + min(r.done, n - 1)
                 bad.append(fl)
                 if not keep_going:
                     cur = fl
@@ -680,6 +727,7 @@ class ATAboy:
         if not good:
             return None, info
         n = len(good[0])
+        good = [d for d in good if len(d) == n]        # vote only like with like
         voted, unstable = bytearray(n), 0
         for i in range(n):
             col = [d[i] for d in good]
@@ -701,7 +749,8 @@ class ATAboy:
             raise TransportError("imaging needs the block device of a discovered ATAboy")
         st = self.status()
         if not st["mounted"]:
-            raise ApiError(Reply(b"AB\x01\x00\x04\x01\x00\x00" + bytes(8)))
+            raise ApiError(_local_reply(OPS["status"], RESULTS.index("not_mounted"),
+                                        "imaging reads the USB disk; mount the drive first"))
         total = st["geometry"]["sectors"]
         end = total if count is None else min(total, start + count)
         mapfile = mapfile or out + ".map"
@@ -740,7 +789,10 @@ class ATAboy:
                             img.write(memoryview(buf)[:n * 512])
                             m.mark(lba, n, "+")
                             done += n
-                        except OSError:
+                        except OSError as e:
+                            if e.errno in (errno.ENODEV, errno.ENXIO, errno.ENOMEDIUM):
+                                raise TransportError("device went away during imaging (%s); map saved, "
+                                                     "rerun to resume" % e)
                             for s in range(lba, lba + n):          # isolate the bad sector(s)
                                 try:
                                     if os.preadv(fd, [memoryview(one)[:512]], s * 512) != 512:
@@ -749,7 +801,10 @@ class ATAboy:
                                     img.write(memoryview(one)[:512])
                                     m.mark(s, 1, "+")
                                     done += 1
-                                except OSError:
+                                except OSError as e:
+                                    if e.errno in (errno.ENODEV, errno.ENXIO, errno.ENOMEDIUM):
+                                        raise TransportError("device went away during imaging (%s); map "
+                                                             "saved, rerun to resume" % e)
                                     m.mark(s, 1, "-")
                                     bad.append(s)
                                     if progress:
@@ -778,93 +833,123 @@ class ATAboy:
         """Targeted recovery after ddrescue: retry only the sectors the mapfile
         marks non-finished, gentlest first, writing recovered data into the image
         and updating the mapfile.  READ LONG results go into the image but stay
-        marked bad in the map; they are listed in IMAGE.readlong.json."""
+        marked bad in the map; they are listed in IMAGE.readlong.json.
+
+        The mapfile (and the READ LONG sidecar) are saved even when a transport
+        error aborts the run; the exception is then re-raised.  A per-sector
+        ApiError (e.g. bad_arg) leaves that sector bad and is listed in
+        'errors'.  Sectors that were tried and failed but were '?' in the map
+        are marked '-'."""
         m = Mapfile.load(mapfile)
         targets = m.bad_sectors(max_sectors, include_untried=include_untried)
         t0 = time.time()
         rec = {"result": "ok", "image": image, "mapfile": mapfile, "candidates": len(targets),
                "recovered_no_retry": [], "recovered_retry": [], "readlong": [], "still_bad": [],
-               "complete": True}
+               "readlong_skipped": [], "errors": [], "complete": True}
         say = progress or (lambda s: None)
+        state = {"budget_hit": False}
+        tried = set()                       # got a real answer from the drive, and it failed
+        sidecar_path = image + ".readlong.json"
+        sidecar = {}
+        sidecar_dirty = False
 
         def budget_left():
-            return not time_budget_s or time.time() - t0 < time_budget_s
+            if time_budget_s and time.time() - t0 >= time_budget_s:
+                state["budget_hit"] = True
+                return False
+            return True
 
-        with open(image, "r+b") as img:
-            def put(lba, data):
-                img.seek(lba * 512)
-                img.write(data[:512])
+        def api_error(lba, pass_name, e):
+            rec["errors"].append({"lba": lba, "pass": pass_name, "error": str(e)})
+            say("LBA %d: %s pass: %s" % (lba, pass_name, e))
 
-            remaining = list(targets)
-            # Pass 1: no drive retries, single sectors (fast fail, gentle)
-            if no_retry_pass:
-                nxt = []
-                for lba in remaining:
-                    if not budget_left():
-                        nxt.append(lba)
-                        continue
-                    r = self.read(lba, 1, no_retry=True, timeout_ms=min(timeout_ms, 5000))
-                    if r.ok:
-                        put(lba, r.data)
-                        m.mark(lba, 1, "+")
-                        rec["recovered_no_retry"].append(lba)
-                        say("LBA %d recovered (no-retry pass)" % lba)
-                    else:
-                        nxt.append(lba)
-                remaining = nxt
+        remaining = list(targets)
+        try:
+            with open(image, "r+b") as img:
+                def put(lba, data):
+                    img.seek(lba * 512)
+                    img.write(data[:512])
+
+                def read_pass(lbas, pass_name, out_key, **kw):
+                    nxt = []
+                    for i, lba in enumerate(lbas):
+                        if not budget_left():
+                            nxt.extend(lbas[i:])
+                            break
+                        try:
+                            r = self.read(lba, 1, **kw)
+                        except ApiError as e:
+                            api_error(lba, pass_name, e)
+                            nxt.append(lba)
+                            continue
+                        if r.ok and len(r.data) >= 512:
+                            put(lba, r.data)
+                            m.mark(lba, 1, "+")
+                            rec[out_key].append(lba)
+                            tried.discard(lba)
+                            say("LBA %d recovered (%s pass, %.0f ms)" % (lba, pass_name, r.elapsed_us / 1000))
+                        else:
+                            tried.add(lba)
+                            nxt.append(lba)
+                    return nxt
+
+                # Pass 1: no drive retries, single sectors (fast fail, gentle)
+                if no_retry_pass:
+                    remaining = read_pass(remaining, "no-retry", "recovered_no_retry",
+                                          no_retry=True, timeout_ms=min(timeout_ms, 5000))
+                    m.save()
+                # Pass 2: drive retries, long timeout
+                remaining = read_pass(remaining, "retry", "recovered_retry", timeout_ms=timeout_ms)
                 m.save()
-            # Pass 2: drive retries, long timeout
-            nxt = []
-            for lba in remaining:
-                if not budget_left():
-                    nxt.append(lba)
-                    continue
-                r = self.read(lba, 1, timeout_ms=timeout_ms)
-                if r.ok:
-                    put(lba, r.data)
-                    m.mark(lba, 1, "+")
-                    rec["recovered_retry"].append(lba)
-                    say("LBA %d recovered with drive retries (%.0f ms)" % (lba, r.elapsed_us / 1000))
-                else:
-                    nxt.append(lba)
-            remaining = nxt
-            m.save()
-            # Pass 3: READ LONG majority vote (data without ECC correction)
-            sidecar_path = image + ".readlong.json"
-            sidecar = {}
-            if readlong and remaining:
-                if os.path.exists(sidecar_path):
-                    with open(sidecar_path) as sf:
-                        sidecar = json.load(sf)
-                nxt = []
-                for lba in remaining:
-                    if not budget_left():
-                        nxt.append(lba)
-                        continue
-                    payload, info = self.read_long_vote(lba, votes=votes, timeout_ms=timeout_ms)
-                    if payload is None:
-                        nxt.append(lba)
-                        continue
-                    put(lba, payload)
-                    entry = {"lba": lba, "ecc_hex": info["ecc_hex"], "votes": info["vote"]["reads"],
-                             "unstable_bytes": info["vote"]["unstable_bytes"],
-                             "status": info["status"], "error_bits": info["error_bits"]}
-                    sidecar[str(lba)] = entry
-                    rec["readlong"].append(entry)
-                    nxt.append(lba)          # still bad in the map: data is unverified
-                    say("LBA %d: READ LONG data written (%d unstable bytes over %d reads)"
-                        % (lba, entry["unstable_bytes"], entry["votes"]))
-                with open(sidecar_path, "w") as sf:
-                    json.dump(sidecar, sf, indent=1, sort_keys=True)
-                rec["readlong_sidecar"] = sidecar_path
-                remaining = nxt
+                # Pass 3: READ LONG majority vote (data without ECC correction)
+                if readlong and remaining:
+                    if os.path.exists(sidecar_path):
+                        with open(sidecar_path) as sf:
+                            sidecar = json.load(sf)
+                    for lba in remaining:          # every one stays bad in the map
+                        if not budget_left():
+                            break
+                        if lba >= LBA28_LIMIT:
+                            rec["readlong_skipped"].append(
+                                {"lba": lba, "reason": "READ LONG has no 48-bit form (LBA >= 2^28)"})
+                            continue
+                        try:
+                            payload, info = self.read_long_vote(lba, votes=votes, timeout_ms=timeout_ms)
+                        except ApiError as e:
+                            api_error(lba, "readlong", e)
+                            continue
+                        tried.add(lba)
+                        if payload is None:
+                            continue
+                        put(lba, payload)
+                        entry = {"lba": lba, "ecc_hex": info["ecc_hex"], "votes": info["vote"]["reads"],
+                                 "unstable_bytes": info["vote"]["unstable_bytes"],
+                                 "status": info["status"], "error_bits": info["error_bits"]}
+                        sidecar[str(lba)] = entry
+                        sidecar_dirty = True
+                        rec["readlong"].append(entry)
+                        say("LBA %d: READ LONG data written (%d unstable bytes over %d reads)"
+                            % (lba, entry["unstable_bytes"], entry["votes"]))
+                    rec["readlong_sidecar"] = sidecar_path
+        finally:
+            # Always keep what was written to the image accounted for in the map.
+            for lba in sorted(tried.intersection(remaining)):
+                if m.status_at(lba) == "?":
+                    m.mark(lba, 1, "-")
+            try:
+                m.save()
+            finally:
+                if sidecar_dirty or (readlong and "readlong_sidecar" in rec):
+                    tmp = sidecar_path + ".tmp"
+                    with open(tmp, "w") as sf:
+                        json.dump(sidecar, sf, indent=1, sort_keys=True)
+                    os.replace(tmp, sidecar_path)
         rec["still_bad"] = remaining
-        rec["complete"] = budget_left()
+        rec["complete"] = not state["budget_hit"]
         rec["recovered"] = len(rec["recovered_no_retry"]) + len(rec["recovered_retry"])
         rec["seconds"] = round(time.time() - t0, 1)
         if remaining:
             rec["result"] = "partial"
-        m.save()
         return rec
 
     # -- raw ATA pass-through (SAT ATA PASS-THROUGH 16) ----------------------------
@@ -950,6 +1035,14 @@ class Mapfile:
                 if limit and len(out) >= limit:
                     return out
         return out
+
+    def status_at(self, lba):
+        """Status character of the block holding sector 'lba' (None if unmapped)."""
+        a = lba * 512
+        for pos, size, st in self.blocks:
+            if pos <= a < pos + size:
+                return st
+        return None
 
     def mark(self, lba, n, status):
         a, b = lba * 512, (lba + n) * 512
@@ -1797,7 +1890,10 @@ def cmd_rescue(args, dev):
     _emit(args, out, lambda o: print("rescue: %d candidate sectors, %d recovered (%d fast, %d with retries), "
                                      "%d READ LONG, %d still bad%s" % (
         o["candidates"], o["recovered"], len(o["recovered_no_retry"]), len(o["recovered_retry"]),
-        len(o["readlong"]), len(o["still_bad"]), "" if o["complete"] else " (time budget ran out)")))
+        len(o["readlong"]), len(o["still_bad"]), "" if o["complete"] else " (time budget ran out)"),
+        o.get("errors") and print("  %d sector(s) hit device errors: %s" % (len(o["errors"]), o["errors"][:5])),
+        o.get("readlong_skipped") and print("  READ LONG skipped for %d sector(s) above the 28-bit limit"
+                                            % len(o["readlong_skipped"]))))
     return EXIT_OK if not out["still_bad"] else EXIT_DEVICE
 
 

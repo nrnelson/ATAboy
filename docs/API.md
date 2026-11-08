@@ -190,7 +190,11 @@ their defaults).
 **Long timeouts and the host.** While the firmware waits on a sector, the USB
 command is outstanding. The Linux SCSI timeout for `/dev/sdX`
 (`/sys/block/sdX/device/timeout`, default 30 s) must be longer than
-`read_timeout_ms`; `ataboy config read_timeout_ms=N` raises it automatically.
+`read_timeout_ms`: one host READ(10) chunk can hold 8 sectors that each take
+up to `read_timeout_ms`, so the host tool raises it to at least
+8 × `read_timeout_ms` + 30 s whenever the timeout is set and on every
+`detect` / `mount` (the timeout may come from flash or the serial menu). It
+never lowers a larger value.
 The serial menu also freezes during a long wait, because both share core 0's
 USB task.
 

@@ -39,6 +39,7 @@ jobs:
         run: |
           python3 -m py_compile host/ataboy
           python3 host/ataboy --help > /dev/null
+          python3 tests/test_host_lib.py
           bash -n tools/flash-wsl.sh
 
       - name: Build firmware
