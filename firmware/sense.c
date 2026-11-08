@@ -1,5 +1,6 @@
 #include "sense.h"
 #include "tusb.h"
+#include "usbbuf.h"
 #include <string.h>
 
 #define SENSE_LEN 22     // > 18 bytes so Linux usb-storage switches to 96-byte auto-sense
@@ -94,6 +95,7 @@ void sense_set_ata(uint8_t lun, uint8_t key, uint8_t asc, uint8_t ascq, const id
 int32_t tud_msc_request_sense_cb(uint8_t lun, void *buffer, uint16_t bufsize) {
     (void)lun;
     uint8_t *b = (uint8_t *)buffer;
+    usbbuf_note(b);
     if (bufsize < SENSE_LEN) return 18;
     if (pend_valid) {
         memcpy(b, pend, SENSE_LEN);

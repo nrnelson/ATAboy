@@ -187,6 +187,8 @@ int drive_detect(uint8_t only_dev, uint8_t geo_mode, uint16_t c, uint8_t h, uint
 
     if (geo_mode == GEO_AUTO) geo_mode = (drive.id[49] & 0x0200) ? GEO_LBA : GEO_NORMAL;
     if (geo_mode != GEO_KEEP) r = drive_apply_geometry(geo_mode, c, h, s);
+    else if (!config.use_lba_mode && config.heads && config.spt)
+        ide_set_geometry(config.heads, config.spt);   // the probe's RESET cleared INIT PARAMS
     ide_unlock();
 
     if (r == R_OK && (flags & DETECT_MOUNT)) r = drive_mount();
@@ -266,9 +268,18 @@ void drive_stats_clear(void) { memset(&drive_stats, 0, sizeof(drive_stats)); }
 //  Mass-storage sector I/O
 // ---------------------------------------------------------------------------
 
+// An LBA the configured geometry can't express: log it so the sense data
+// describes this failure rather than an older one.
+static int32_t address_fail(uint8_t op, uint32_t lba, uint32_t count) {
+    ide_cmd_t c = {0};
+    c.result = IDE_PROTOCOL;
+    drive_record(op, &c, lba, count);
+    return -1;
+}
+
 int32_t drive_read(uint32_t lba, uint32_t count, uint8_t *buf) {
     ide_cmd_t c = {0};
-    if (!ide_cmd_address(&c, lba, count, true)) return -1;
+    if (!ide_cmd_address(&c, lba, count, true)) return address_fail(LOGOP_READ, lba, count);
     c.command = c.ext ? 0x24 : (config.no_retry ? 0x21 : 0x20);
     c.proto = IDE_PROTO_PIO_IN;
     c.buf = buf;
@@ -285,7 +296,7 @@ int32_t drive_read(uint32_t lba, uint32_t count, uint8_t *buf) {
 
 int32_t drive_write(uint32_t lba, uint32_t count, const uint8_t *buf) {
     ide_cmd_t c = {0};
-    if (!ide_cmd_address(&c, lba, count, true)) return -1;
+    if (!ide_cmd_address(&c, lba, count, true)) return address_fail(LOGOP_WRITE, lba, count);
     c.command = c.ext ? 0x34 : 0x30;
     c.proto = IDE_PROTO_PIO_OUT;
     c.buf = (uint8_t *)buf;

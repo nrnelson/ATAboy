@@ -63,7 +63,9 @@ if (GIT_FOUND)
         set(FW_GIT_HASH "unknown")
     endif()
 endif()
-target_compile_definitions(ATAboy PRIVATE FW_GIT_HASH="${FW_GIT_HASH}")
+target_compile_definitions(ATAboy PRIVATE FW_GIT_HASH="${FW_GIT_HASH}"
+        PICO_STACK_SIZE=0x1000          # core 0 (SCRATCH_Y, 4 KiB): TinyUSB callbacks + IDE + JSON
+        PICO_CORE1_STACK_SIZE=0x1000)   # core 1 (SCRATCH_X, 4 KiB): menu (vsnprintf, IDENTIFY buffers)
 target_compile_options(ATAboy PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation)
 
 pico_set_program_name(ATAboy "ATAboy")

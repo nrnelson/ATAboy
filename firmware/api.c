@@ -153,6 +153,15 @@ static uint8_t hdr_flags(void) {
            (drive_geometry_valid() ? 0x10 : 0);
 }
 
+static int32_t finish(uint8_t *buf, int result, uint8_t ctype, uint32_t payload_len);
+
+// A JSON reply that didn't fit the host's allocation would be truncated
+// (invalid) JSON; report alloc_too_small with an empty body instead.
+static int32_t finish_json(uint8_t *buf, int result, const json_t *j) {
+    if (j->overflow || j->depth) return finish(buf, R_ALLOC_TOO_SMALL, CT_NONE, 0);
+    return finish(buf, result, CT_JSON, j->len);
+}
+
 static int32_t finish(uint8_t *buf, int result, uint8_t ctype, uint32_t payload_len) {
     buf[0] = 'A'; buf[1] = 'B';
     buf[2] = API_PROTO_VERSION;
@@ -304,7 +313,7 @@ static int32_t reply_status(uint8_t *buf, uint32_t cap, int result, const char *
     if (msg) j_str(&j, "message", msg);
     json_status_body(&j);
     j_end(&j);
-    return finish(buf, result, CT_JSON, j.len);
+    return finish_json(buf, result, &j);
 }
 
 static int32_t reply_msg(uint8_t *buf, uint32_t cap, int result, const char *msg) {
@@ -314,7 +323,7 @@ static int32_t reply_msg(uint8_t *buf, uint32_t cap, int result, const char *msg
     j_str(&j, "result", result_name(result));
     if (msg) j_str(&j, "message", msg);
     j_end(&j);
-    return finish(buf, result, CT_JSON, j.len);
+    return finish_json(buf, result, &j);
 }
 
 static int32_t reply_config(uint8_t *buf, uint32_t cap, int result, const char *msg) {
@@ -325,7 +334,7 @@ static int32_t reply_config(uint8_t *buf, uint32_t cap, int result, const char *
     if (msg) j_str(&j, "message", msg);
     json_config(&j, "config");
     j_end(&j);
-    return finish(buf, result, CT_JSON, j.len);
+    return finish_json(buf, result, &j);
 }
 
 // ---------------------------------------------------------------------------
@@ -398,7 +407,7 @@ static int32_t op_info(uint8_t *buf, uint32_t cap) {
     j_str(&j, NULL, "corrupt_sector");
     j_end(&j);
     j_end(&j);
-    return finish(buf, R_OK, CT_JSON, j.len);
+    return finish_json(buf, R_OK, &j);
 }
 
 static int32_t op_config_set(uint8_t *buf, uint32_t cap, const uint8_t *a) {
@@ -526,7 +535,7 @@ static int32_t op_taskfile(uint8_t *buf, uint32_t cap) {
     j_str(&j, "status_bits", ata_status_bits(tf[7], sb));
     j_uint(&j, "alt_status", alt);
     j_end(&j);
-    return finish(buf, R_OK, CT_JSON, j.len);
+    return finish_json(buf, R_OK, &j);
 }
 
 // READ: up to max_read_sectors with full diagnostics; optional read-through-error.
@@ -591,6 +600,18 @@ static int32_t op_read_long(uint8_t *buf, uint32_t cap, const uint8_t *a) {
     return finish(buf, drive_result_from_ide(r), CT_BINARY, RES_LEN + (data ? 512u + ecc : 0u));
 }
 
+static int verify_chunk(ide_cmd_t *c, uint32_t lba, uint32_t n, uint32_t tmo) {
+    memset(c, 0, sizeof(*c));
+    if (!ide_cmd_address(c, lba, n, true)) { c->result = IDE_PROTOCOL; return IDE_PROTOCOL; }
+    c->command = c->ext ? 0x42 : (config.no_retry ? 0x41 : 0x40);
+    c->proto = IDE_PROTO_NONDATA;
+    c->flags = IDE_F_NEED_DRDY;
+    c->timeout_ms = tmo ? tmo : (config.read_timeout_ms * 2 > 30000 ? config.read_timeout_ms * 2 : 30000);
+    int r = ide_exec(c);
+    drive_record(LOGOP_VERIFY, c, lba, n);
+    return r;
+}
+
 static int32_t op_verify(uint8_t *buf, uint32_t cap, const uint8_t *a) {
     uint32_t lba = be32(&a[0]);
     uint32_t count = be32(&a[4]);
@@ -609,30 +630,35 @@ static int32_t op_verify(uint8_t *buf, uint32_t cap, const uint8_t *a) {
         if (time_us_32() - t0 > VERIFY_BUDGET_US) { partial = true; break; }
         uint32_t n = count - done;
         if (n > 256) n = 256;
-        memset(&c, 0, sizeof(c));
-        if (!ide_cmd_address(&c, lba + done, n, true)) { r = IDE_PROTOCOL; break; }
-        c.command = c.ext ? 0x42 : (config.no_retry ? 0x41 : 0x40);
-        c.proto = IDE_PROTO_NONDATA;
-        c.flags = IDE_F_NEED_DRDY;
-        c.timeout_ms = tmo ? tmo : (config.read_timeout_ms * 2 > 30000 ? config.read_timeout_ms * 2 : 30000);
-        r = ide_exec(&c);
-        drive_record(LOGOP_VERIFY, &c, lba + done, n);
-        if (r != IDE_OK) {
-            uint32_t fl;
-            if (ide_cmd_result_lba(&c, &fl) && fl >= lba + done && fl < lba + done + n) done = fl - lba;
+        r = verify_chunk(&c, lba + done, n, tmo);
+        if (r == IDE_OK) { done += n; continue; }
+        if (r == IDE_PROTOCOL && c.command == 0) break;          // address not expressible
+
+        uint32_t fl;
+        if (ide_cmd_result_lba(&c, &fl) && fl >= lba + done && fl < lba + done + n) {
+            done = fl - lba;                                      // the drive said where it stopped
             break;
         }
-        done += n;
+        // Registers invalid (timeout: drive still BSY) or implausible: find the
+        // failing sector one at a time.  Good sectors verify quickly; stop at the
+        // first one that fails so the caller gets the real bad LBA.
+        uint32_t end = done + n;
+        r = IDE_OK;
+        while (done < end) {
+            if (time_us_32() - t0 > VERIFY_BUDGET_US) { partial = true; break; }
+            r = verify_chunk(&c, lba + done, 1, tmo);
+            if (r != IDE_OK) break;
+            done++;
+        }
+        if (r != IDE_OK || partial) break;
+        // the whole chunk verified one by one: the failure was transient; go on
     }
     c.done = done;
     c.elapsed_us = time_us_32() - t0;
     put_result(buf + HDR_LEN, &c, lba, count > 0xFFFF ? 0xFFFF : count, partial);
     put_be32(buf + HDR_LEN + 28, done);           // full 32-bit verified count
     put_be32(buf + HDR_LEN + 12, c.elapsed_us);
-    if (r != IDE_OK) {
-        uint32_t fl = lba + done;
-        put_be32(buf + HDR_LEN + 16, fl);
-    }
+    put_be32(buf + HDR_LEN + 16, r != IDE_OK ? lba + done : 0xFFFFFFFFu);
     return finish(buf, drive_result_from_ide(r), CT_BINARY, RES_LEN);
 }
 
@@ -710,7 +736,7 @@ static int32_t op_log(uint8_t *buf, uint32_t cap, const uint8_t *a) {
     j_uint(&j, "returned", i - start);
     if (i < n) j_uint(&j, "next", i); else j_null(&j, "next");
     j_end(&j);
-    return finish(buf, R_OK, CT_JSON, j.len);
+    return finish_json(buf, R_OK, &j);
 }
 
 // ---------------------------------------------------------------------------

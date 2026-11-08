@@ -9,7 +9,34 @@
 #include "api.h"
 #include "sat.h"
 #include "version.h"
+#include "usbbuf.h"
 #include <string.h>
+
+// ---------------------------------------------------------------------------
+//  Class-buffer tag (see usbbuf.h)
+// ---------------------------------------------------------------------------
+
+static uint8_t *msc_buf = NULL;
+static uint32_t poison_seq = 0;
+static const char poison_magic[12] = "ATABOY-NODAT";
+
+void usbbuf_note(uint8_t *buf) { if (buf) msc_buf = buf; }
+
+void usbbuf_poison(void) {
+    if (!msc_buf) return;
+    poison_seq++;
+    memcpy(msc_buf, poison_magic, 12);
+    memcpy(msc_buf + 12, &poison_seq, 4);
+}
+
+bool usbbuf_has_host_data(const uint8_t *buf) {
+    if (!msc_buf || buf != msc_buf) return false;     // address unknown yet: fail safe
+    return memcmp(buf, poison_magic, 12) != 0 || memcmp(buf + 12, &poison_seq, 4) != 0;
+}
+
+void tud_msc_scsi_complete_cb(uint8_t lun, uint8_t const scsi_cmd[16]) { (void)lun; (void)scsi_cmd; usbbuf_poison(); }
+void tud_msc_read10_complete_cb(uint8_t lun)  { (void)lun; usbbuf_poison(); }
+void tud_msc_write10_complete_cb(uint8_t lun) { (void)lun; usbbuf_poison(); }
 
 // TinyUSB passes the host's transfer length as 'bufsize' even when it is
 // larger than the class buffer, so cap it before touching the buffer.
@@ -41,8 +68,17 @@ bool tud_msc_is_writable_cb(uint8_t lun) {
     return !config.drive_write_protected;
 }
 
+// TEST UNIT READY is answered by TinyUSB itself (as are INQUIRY, READ
+// CAPACITY, MODE SENSE(6) and REQUEST SENSE), so this is where a mount or
+// unmount is announced: UNIT ATTENTION 28h/00h makes the host's disk driver
+// re-read capacity and the write-protect bit.
 bool tud_msc_test_unit_ready_cb(uint8_t lun) {
-    (void)lun;
+    if (media_changed_waiting && is_mounted) {
+        media_changed_waiting = false;
+        sense_set(lun, SCSI_SENSE_UNIT_ATTENTION, 0x28, 0x00);
+        return false;
+    }
+    if (!is_mounted) media_changed_waiting = false;   // "medium not present" says it all
     return is_mounted;
 }
 
@@ -73,6 +109,7 @@ static int32_t media_fail(uint8_t lun) {
 
 int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
                           void *buffer, uint32_t bufsize) {
+    usbbuf_note((uint8_t *)buffer);
     if (!is_mounted) return -1;
 
     uint64_t max = drive_total_sectors();
@@ -118,6 +155,7 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
 
 int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
                            uint8_t *buffer, uint32_t bufsize) {
+    usbbuf_note(buffer);
     if (!is_mounted) return -1;
     if (config.drive_write_protected) {
         sense_set(lun, SCSI_SENSE_DATA_PROTECT, 0x27, 0x00);
@@ -171,6 +209,7 @@ int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16],
     uint8_t opcode = scsi_cmd[0];
     uint8_t *buf = (uint8_t *)buffer;
     uint32_t cap = buf_cap(bufsize);
+    usbbuf_note(buf);
 
     // API and pass-through work with or without a mounted drive and must not
     // swallow the mount/unmount UNIT ATTENTION meant for the host's sd driver.

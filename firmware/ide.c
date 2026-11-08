@@ -358,12 +358,12 @@ int ide_exec(ide_cmd_t *c) {
     c->elapsed_us = 0;
 
     uint32_t limit_us = (c->timeout_ms ? c->timeout_ms : 1000) * 1000u;
-    uint8_t dh = dev_base | (c->device & 0x4F);
     uint8_t st = 0;
     int res = IDE_OK;
     bool leftover = false;
 
     ide_lock();
+    uint8_t dh = dev_base | (c->device & 0x4F);
 
     // Select the device and wait until it can take a command.
     wr(6, dh);
@@ -409,6 +409,7 @@ int ide_exec(ide_cmd_t *c) {
             }
             if (st & (ATA_ST_ERR | ATA_ST_DF)) { c->err_data = true; res = IDE_ATA_ERROR; break; }
             c->done = b + 1;
+            rd_alt();                             // give the drive >= 400 ns to drop DRQ / raise BSY
         }
         if (res == IDE_OK) {
             if (wait_not_busy(limit_us, &st) < 0) res = IDE_TIMEOUT;
@@ -427,6 +428,7 @@ int ide_exec(ide_cmd_t *c) {
                     wr(0, c->buf[(b + 1) * 512 + i]);
             }
             c->done = b;                          // committed once the drive moves on
+            rd_alt();                             // >= 400 ns before polling STATUS again
         }
         if (res == IDE_OK) {
             if (wait_not_busy(limit_us, &st) < 0) res = IDE_TIMEOUT;

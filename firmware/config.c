@@ -3,6 +3,7 @@
 #include "hardware/sync.h"
 #include "pico/multicore.h"
 #include "pico/sync.h"
+#include "ide.h"
 #include <string.h>
 
 #define FLASH_TARGET_OFFSET (2048 * 1024 - FLASH_SECTOR_SIZE)
@@ -67,6 +68,7 @@ void config_load(void) {
 // pauses the other while flash is erased/programmed.
 void config_save(void) {
     mutex_enter_blocking(&config_save_mtx);
+    ide_lock();      // the other core is paused below; don't freeze it mid-burst
     config.magic = CONFIG_MAGIC;
     config.ext_magic = CONFIG_EXT_MAGIC;
     static uint8_t buf[FLASH_PAGE_SIZE];
@@ -79,5 +81,6 @@ void config_save(void) {
     flash_range_program(FLASH_TARGET_OFFSET, buf, FLASH_PAGE_SIZE);
     restore_interrupts(ints);
     multicore_lockout_end_blocking();
+    ide_unlock();
     mutex_exit(&config_save_mtx);
 }

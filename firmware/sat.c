@@ -5,6 +5,7 @@
 #include "api.h"
 #include "config.h"
 #include "tusb.h"
+#include "usbbuf.h"
 #include <string.h>
 
 // SAT protocol field values (CDB byte 1, bits 4:1)
@@ -87,6 +88,15 @@ int32_t sat_passthrough(uint8_t lun, const uint8_t *cdb, uint8_t *buf, uint32_t 
     } else if (xfer_len) {
         return reject(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00);
     }
+    // PIO data-out must only run with data the host actually sent (usbbuf.h).
+    if (c.proto == IDE_PROTO_PIO_OUT && !usbbuf_has_host_data(buf))
+        return reject(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00);
+
+    // Commands that change CHS translation, transfer timing or power state
+    // would silently break a mounted USB disk underneath the host.
+    if (is_mounted && (c.command == 0x91 || c.command == 0xE6 || c.command == 0x99 ||
+                       (c.command == 0xEF && c.feature == 0x03)))
+        return reject(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x2C, 0x00);   // command sequence error: unmount first
 
     // Write-protect / arming policy
     ata_class_t cls = ata_classify(c.command, c.feature);

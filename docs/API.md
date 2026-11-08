@@ -223,7 +223,10 @@ DRQ both set (typically UNC), the drive is offering its best-effort data. With
 this flag the firmware transfers that block too and sets result flag bit1, so
 you get the sector's contents *and* the error.
 
-**VERIFY** issues READ VERIFY (0x40/0x41/0x42) in chunks of 256 sectors. No data
+**VERIFY** issues READ VERIFY (0x40/0x41/0x42) in chunks of 256 sectors.
+If a chunk fails without telling where (timeout: registers invalid), the
+firmware re-verifies that chunk one sector at a time, so the reported
+failing LBA is the real one. No data
 crosses USB, so scanning is limited by the drive, not the 12 Mbit/s link. One
 request stops at the first error or after about 10 s (flag bit6, *partial*);
 continue from `lba + done`.
@@ -275,6 +278,14 @@ only does PIO.
   would issue the ATA command twice.
 - Sense data is 22 bytes, so Linux usb-storage switches to 96-byte
   auto-sense after the first one.
+- PIO data-out runs only if host data really arrived (the class buffer is
+  stamped after every command; a stale buffer is refused with ILLEGAL REQUEST
+  24h/00h). This guards against a host that sends a data-out CDB with a
+  data-in transfer.
+- While the drive is mounted, commands that would change translation, timing
+  or power state underneath the host are refused with ILLEGAL REQUEST
+  2Ch/00h: INITIALIZE DEVICE PARAMETERS (91h), SLEEP (E6h/99h), SET FEATURES
+  set transfer mode (EFh/03h). Unmount first.
 
 ### Safety policy
 
@@ -297,7 +308,10 @@ Every pass-through command is classified (`firmware/ata_policy.c`):
   codes the Linux SCSI layer completes without retrying. Anything else, even
   HARDWARE ERROR on USB storage, makes Linux re-read a sector the drive has
   just spent seconds failing on. Failed writes use 03/0C/00.
-- Mount and unmount raise UNIT ATTENTION 28h/00h on the next ordinary command.
+- Mount (and a write-protect change while mounted) raises UNIT ATTENTION
+  28h/00h, delivered on the next TEST UNIT READY. TinyUSB answers most
+  standard opcodes itself, so TUR is where the host's disk driver learns
+  about it.
   The vendor and pass-through opcodes don't consume it, so the host's disk
   driver still sees it. `ataboy mount` / `unmount` also ask the kernel to
   rescan.

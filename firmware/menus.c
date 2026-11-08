@@ -103,6 +103,7 @@ static uint8_t  cur_spt = 0;
 static uint64_t total_lba_sectors = 0;
 static bool     use_lba_mode = false;
 
+static uint32_t seen_api_gen = 0;      // drive.api_gen the menu last synced to
 static bool show_detect_result = false;
 static bool force_detect = false;
 static int  confirm_type = 0;
@@ -773,8 +774,6 @@ static void sync_to_config(void) {
 //  Follow changes made through the USB API (detect, geometry, mount, config)
 // ---------------------------------------------------------------------------
 
-static uint32_t seen_api_gen = 0;
-
 static void sync_from_api(void) {
     if (drive.api_gen == seen_api_gen) return;
     seen_api_gen = drive.api_gen;
@@ -925,6 +924,7 @@ void core1_entry(void) {
                 while (waiting) {
                     if (sd) { draw_selection_menu_ex(dummy_id, geo_idx, true); sd = false; }
                     int ch = get_input();
+                    if (drive.api_gen != seen_api_gen || is_mounted) { waiting = false; break; }   // API took over
                     if (ch == -1) { tight_loop_contents(); continue; }
                     if (ch == KEY_ESC) { waiting = false; }
                     else if (ch == '\t' || ch == KEY_ENTER) {
@@ -1038,6 +1038,7 @@ void core1_entry(void) {
                             while (waiting) {
                                 if (sd) { draw_selection_menu(id_buf, geo_idx); sd = false; }
                                 int ch = get_input();
+                                if (drive.api_gen != seen_api_gen || is_mounted) { waiting = false; break; }   // API took over
                                 if (ch == -1) { tight_loop_contents(); continue; }
 
                                 if (ch == KEY_UP && geo_idx > 0) { geo_idx--; if (!ls && geo_idx == 2) geo_idx--; sd = true; }
