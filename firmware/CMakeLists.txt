@@ -37,6 +37,7 @@ pico_sdk_init()
 
 add_executable(ATAboy
         ATAboy.c
+        fault.c
         ide_pio.c
         ide.c
         drive.c

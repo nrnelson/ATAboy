@@ -121,7 +121,7 @@ before parsing.
 
 | Op | Name | Arguments (CDB byte offsets) | Reply |
 |---|---|---|---|
-| 00 | INFO | — | JSON: firmware identity, protocol, git hash, board id, limits, op table, features |
+| 00 | INFO | — | JSON: firmware identity, protocol, git hash, board id, limits, `last_fault`, op table, features |
 | 01 | STATUS | — | JSON: everything (below) |
 | 02 | CONFIG_GET | — | JSON `{"config":{...}}` |
 | 03 | CONFIG_SET | [4] key, [8-11] value | JSON config (not saved) |
@@ -141,7 +141,7 @@ before parsing.
 | 30 | LOG | [4-7] start index (0 = oldest retained) | JSON page of the error log |
 | 31 | LOG_CLEAR | [4] bit0 clear log, bit1 reset statistics | JSON |
 | 40 | ARM | [4-7] `"ARM!"` | JSON; arms one DANGEROUS pass-through command for 10 s |
-| 41 | REBOOT | [4] 0 restart / 1 BOOTSEL · [8-11] `"BOOT"` | JSON; reboots ~200 ms later |
+| 41 | REBOOT | [4] 0 restart / 1 BOOTSEL / 2 fault test (HardFault on purpose) · [8-11] `"BOOT"` | JSON; reboots ~200 ms later |
 
 ### STATUS
 
@@ -393,6 +393,34 @@ check. Not
 detected: a reset in the microseconds between the check and the command, and
 a reset that leaves those registers alone (pre-ATA drives aren't bound to set
 the signature); a verify pass is still the check for those.
+
+## Faults
+
+A HardFault on either core no longer locks the core up with the bus as it
+was. The handler (in RAM, on its own stack) releases the IDE bus through the
+GPIO output overrides, which nothing else can undo: transceivers disabled,
+data lines inputs, DIOR-, DIOW-, CS0-, CS1- and RESET- negated. It then
+records the fault in RAM that survives a warm reboot and reboots through the
+watchdog, so the ATAboy re-enumerates on its own. The USB disk disappears
+mid-command and the next boot is unmounted unless `auto_mount` is set; the
+reboot itself may glitch the drive's RESET- line while the pins are at their
+power-on state, as any reboot does.
+
+INFO then carries the record (`null` when this boot wasn't caused by a fault;
+a power cycle loses it):
+
+```json
+"last_fault": {"core": 0, "pc": 268437121, "lr": 268436999, "xpsr": 553648128,
+               "sp": 537403312, "exc_return": 4294967273, "cfsr": 65536, "hfsr": 1073741824,
+               "mmfar": 0, "bfar": 0, "sfsr": 0, "sfar": 0, "uptime_ms": 81234}
+```
+
+`pc` / `lr` are from the stacked exception frame (0 if the stack pointer was
+unusable); `sp` is where that frame was; `cfsr`, `hfsr`, `mmfar`, `bfar`,
+`sfsr`, `sfar` are the Cortex-M33 fault status / address registers, and
+`uptime_ms` is how long the faulting boot had run. Feed `pc` and `lr` to
+`arm-none-eabi-addr2line -e ATAboy.elf`. REBOOT mode 2 executes an undefined
+instruction about 200 ms after its reply, to test the handler.
 
 ## Firmware updates
 

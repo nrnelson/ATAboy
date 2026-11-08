@@ -13,6 +13,7 @@
 #include "sense.h"
 #include "version.h"
 #include "ide_pio.h"
+#include "fault.h"
 #include "tusb.h"
 #include "pico/time.h"
 #include "pico/bootrom.h"
@@ -67,7 +68,7 @@
 static uint8_t  cur_op;
 static uint32_t armed_until_ms = 0;
 static bool     armed = false;
-static int      reboot_mode = -1;     // -1 none, 0 normal, 1 BOOTSEL
+static int      reboot_mode = -1;     // -1 none, 0 normal, 1 BOOTSEL, 2 fault test
 static uint32_t reboot_at_ms;
 
 static uint32_t now_ms(void) { return to_ms_since_boot(get_absolute_time()); }
@@ -86,6 +87,7 @@ bool api_take_arm(void) {
 void api_poll(void) {
     if (reboot_mode < 0 || (int32_t)(now_ms() - reboot_at_ms) < 0) return;
     if (reboot_mode == 1) reset_usb_boot(0, 0);   // BOOTSEL: UF2 drive + PICOBOOT
+    if (reboot_mode == 2) fault_test();           // HardFault on purpose: handler test
     watchdog_reboot(0, 0, 0);
     while (true) tight_loop_contents();
 }
@@ -421,6 +423,7 @@ static int32_t op_info(uint8_t *buf, uint32_t cap) {
     j_str(&j, "board_id", board_id);
     j_uint(&j, "max_xfer", CFG_TUD_MSC_EP_BUFSIZE);
     j_uint(&j, "max_read_sectors", (CFG_TUD_MSC_EP_BUFSIZE - HDR_LEN - RES_LEN) / 512);
+    fault_json(&j, "last_fault");
     j_obj(&j, "ops");
     j_uint(&j, "info", OP_INFO);           j_uint(&j, "status", OP_STATUS);
     j_uint(&j, "config_get", OP_CONFIG_GET); j_uint(&j, "config_set", OP_CONFIG_SET);
@@ -439,7 +442,7 @@ static int32_t op_info(uint8_t *buf, uint32_t cap) {
     j_str(&j, NULL, "pio_out"); j_str(&j, NULL, "read_through_error");
     j_str(&j, NULL, "read_long"); j_str(&j, NULL, "verify"); j_str(&j, NULL, "bootsel");
     j_str(&j, NULL, "persistent_timeouts"); j_str(&j, NULL, "no_retry_reads");
-    j_str(&j, NULL, "corrupt_sector");
+    j_str(&j, NULL, "corrupt_sector"); j_str(&j, NULL, "last_fault");
     j_end(&j);
     j_end(&j);
     return finish_json(buf, R_OK, &j);
@@ -836,7 +839,7 @@ int32_t api_handle(uint8_t lun, const uint8_t *cdb, uint8_t *buf, uint32_t cap) 
         armed_until_ms = now_ms() + ARM_WINDOW_MS;
         return reply_msg(buf, cap, R_OK, "armed for one dangerous pass-through command within 10 s");
     case OP_REBOOT:
-        if (be32(&a[4]) != 0x424F4F54u || a[0] > 1) return reply_msg(buf, cap, R_BAD_ARG, "bad reboot magic/mode");  // "BOOT"
+        if (be32(&a[4]) != 0x424F4F54u || a[0] > 2) return reply_msg(buf, cap, R_BAD_ARG, "bad reboot magic/mode");  // "BOOT"
         reboot_mode = a[0];
         reboot_at_ms = now_ms() + 200;    // let the reply and CSW go out first
         return reply_msg(buf, cap, R_OK, a[0] ? "rebooting to BOOTSEL" : "rebooting");
