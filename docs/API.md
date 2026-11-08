@@ -243,10 +243,11 @@ only does PIO.
   master/slave); the LBA bit and head bits come from the CDB.
 - With CK_COND on a non-data command, the result registers come back as
   descriptor sense (key RECOVERED ERROR, 00h/1Dh) with an ATA Status Return
-  descriptor. ATA errors give HARDWARE ERROR 00h/1Dh with the descriptor;
-  timeouts give HARDWARE ERROR 3Eh/02h with the descriptor. (Not ABORTED
-  COMMAND: Linux retries that even for SG_IO, which would run the ATA
-  command twice.)
+  descriptor. ATA errors give ABORTED COMMAND 00h/1Dh with the descriptor;
+  timeouts, protocol mismatches and bus faults give ABORTED COMMAND 3Eh/02h
+  with the descriptor. Linux never retries ABORTED COMMAND for SG_IO
+  pass-through, but it does retry HARDWARE ERROR on USB storage, which
+  would issue the ATA command twice.
 - Sense data is 22 bytes, so Linux usb-storage switches to 96-byte
   auto-sense after the first one.
 
@@ -265,11 +266,12 @@ Every pass-through command is classified (`firmware/ata_policy.c`):
 - READ10 failures return real sense instead of TinyUSB's "medium not present":
   fixed format, INFORMATION = failing LBA, bytes 8-9 = ATA status/error,
   10-11 = elapsed ms, 14 = ATA command, 15 bit0 = timed out, 18 = engine
-  result, 19 = bit0 registers valid / bit1 SRST, 20-21 = sectors done. Keys:
-  UNC → 03/11/00, IDNF → 03/14/01, AMNF → 03/13/00, ABRT → 04/44/00,
-  timeout → 04/3E/02, not ready → 04/04/00, bus fault → 04/47/00. The keys
-  are chosen so the Linux SCSI layer does not retry: a retry re-reads a
-  failing sector the drive has just spent seconds on.
+  result, 19 = bit0 registers valid / bit1 SRST, 20-21 = sectors done.
+  The key is always MEDIUM ERROR with ASC 11h (UNC, timeout as 11h/01h,
+  not ready, bus fault, ABRT), 13h (AMNF) or 14h (IDNF): those are the only
+  codes the Linux SCSI layer completes without retrying. Anything else, even
+  HARDWARE ERROR on USB storage, makes Linux re-read a sector the drive has
+  just spent seconds failing on. Failed writes use 03/0C/00.
 - Mount and unmount raise UNIT ATTENTION 28h/00h on the next ordinary command.
   The vendor and pass-through opcodes don't consume it, so the host's disk
   driver still sees it. `ataboy mount` / `unmount` also ask the kernel to

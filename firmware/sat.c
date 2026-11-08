@@ -113,14 +113,15 @@ int32_t sat_passthrough(uint8_t lun, const uint8_t *cdb, uint8_t *buf, uint32_t 
     drive_record(LOGOP_PASSTHRU, &c, 0, c.sectors);
     last_pt = c;
 
-    // HARDWARE ERROR rather than ABORTED COMMAND: Linux retries ABORTED
-    // COMMAND even for SG_IO, which would issue the ATA command a second time.
+    // Failures use ABORTED COMMAND: for SG_IO pass-through the Linux SCSI
+    // layer never retries it, whereas HARDWARE ERROR is retried on USB
+    // storage and would issue the ATA command a second time.
     if (r == IDE_ATA_ERROR) {
-        sense_set_ata(lun, SCSI_SENSE_HARDWARE_ERROR, ASC_PT_INFO, ASCQ_PT_INFO, &c);
+        sense_set_ata(lun, SCSI_SENSE_ABORTED_COMMAND, ASC_PT_INFO, ASCQ_PT_INFO, &c);
         return -1;
     }
     if (r != IDE_OK) {
-        sense_set_ata(lun, SCSI_SENSE_HARDWARE_ERROR, 0x3E, 0x02, &c);   // timeout / bus trouble
+        sense_set_ata(lun, SCSI_SENSE_ABORTED_COMMAND, 0x3E, 0x02, &c);   // timeout / protocol / bus trouble
         return -1;
     }
     // CK_COND on a non-data command: report the result registers.  (With a
