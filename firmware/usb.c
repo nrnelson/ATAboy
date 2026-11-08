@@ -103,54 +103,44 @@ static int32_t media_fail(uint8_t lun) {
     return -1;
 }
 
+// TinyUSB derives the block size from the host's transfer length
+// (total_bytes / block_count) without checking it against READ CAPACITY, so a
+// malformed CBW gives offsets inside a "block" and lengths that are not whole
+// sectors.  Only whole 512-byte sectors starting on a sector boundary are
+// served; anything else is ILLEGAL REQUEST / INVALID FIELD IN CDB.
+static bool whole_sectors(uint8_t lun, uint32_t offset, uint32_t bufsize) {
+    if (offset == 0 && bufsize > 0 && bufsize % 512 == 0) return true;
+    sense_set(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00);
+    return false;
+}
+
 // ---------------------------------------------------------------------------
-//  READ10 — block transfer with partial first/last sector handling
+//  READ10
 // ---------------------------------------------------------------------------
 
 int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
                           void *buffer, uint32_t bufsize) {
     usbbuf_note((uint8_t *)buffer);
     if (!is_mounted) return -1;
+    if (!whole_sectors(lun, offset, bufsize)) return -1;
 
     uint64_t max = drive_total_sectors();
     if (max == 0) return -1;
 
-    uint32_t remaining = bufsize;
+    uint32_t count = bufsize / 512;
     uint8_t *ptr = (uint8_t *)buffer;
-    uint32_t cur_lba = lba;
-
-    // Partial first sector (non-zero offset)
-    if (offset && remaining > 0 && cur_lba < max) {
-        uint8_t temp[512];
-        if (drive_read(cur_lba, 1, temp) < 0) return media_fail(lun);
-        uint32_t n = 512 - offset;
-        if (n > remaining) n = remaining;
-        memcpy(ptr, temp + offset, n);
-        ptr += n; remaining -= n; cur_lba++;
+    if (lba < max) {
+        uint32_t n = count;
+        if ((uint64_t)lba + n > max) n = (uint32_t)(max - lba);
+        if (drive_read(lba, n, ptr) < 0) return media_fail(lun);
+        ptr += n * 512; count -= n;
     }
-
-    // Aligned middle sectors — single ATA command
-    uint32_t aligned = remaining / 512;
-    if (aligned > 0 && cur_lba < max) {
-        if (cur_lba + aligned > max) aligned = (uint32_t)(max - cur_lba);
-        if (drive_read(cur_lba, aligned, ptr) < 0) return media_fail(lun);
-        ptr += aligned * 512; remaining -= aligned * 512; cur_lba += aligned;
-    }
-
-    // Partial last sector
-    if (remaining > 0 && cur_lba < max) {
-        uint8_t temp[512];
-        if (drive_read(cur_lba, 1, temp) < 0) return media_fail(lun);
-        memcpy(ptr, temp, remaining);
-        ptr += remaining; remaining = 0;
-    }
-
-    if (remaining > 0) memset(ptr, 0, remaining);
+    if (count > 0) memset(ptr, 0, count * 512);
     return (int32_t)bufsize;
 }
 
 // ---------------------------------------------------------------------------
-//  WRITE10 — block transfer with partial first/last read-modify-write
+//  WRITE10
 // ---------------------------------------------------------------------------
 
 int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
@@ -161,42 +151,16 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
         sense_set(lun, SCSI_SENSE_DATA_PROTECT, 0x27, 0x00);
         return -1;
     }
+    if (!whole_sectors(lun, offset, bufsize)) return -1;
 
     uint64_t max = drive_total_sectors();
     if (max == 0) return -1;
 
-    uint32_t remaining = bufsize;
-    uint8_t *ptr = buffer;
-    uint32_t cur_lba = lba;
-
-    // Partial first sector — read-modify-write
-    if (offset && remaining > 0 && cur_lba < max) {
-        uint8_t temp[512];
-        if (drive_read(cur_lba, 1, temp) < 0) return media_fail(lun);
-        uint32_t n = 512 - offset;
-        if (n > remaining) n = remaining;
-        memcpy(temp + offset, ptr, n);
-        if (drive_write(cur_lba, 1, temp) < 0) return media_fail(lun);
-        ptr += n; remaining -= n; cur_lba++;
+    if (lba < max) {
+        uint32_t n = bufsize / 512;
+        if ((uint64_t)lba + n > max) n = (uint32_t)(max - lba);
+        if (drive_write(lba, n, buffer) < 0) return media_fail(lun);
     }
-
-    // Aligned middle sectors — single ATA command
-    uint32_t aligned = remaining / 512;
-    if (aligned > 0 && cur_lba < max) {
-        if (cur_lba + aligned > max) aligned = (uint32_t)(max - cur_lba);
-        if (drive_write(cur_lba, aligned, ptr) < 0) return media_fail(lun);
-        ptr += aligned * 512; remaining -= aligned * 512; cur_lba += aligned;
-    }
-
-    // Partial last sector — read-modify-write
-    if (remaining > 0 && cur_lba < max) {
-        uint8_t temp[512];
-        if (drive_read(cur_lba, 1, temp) < 0) return media_fail(lun);
-        memcpy(temp, ptr, remaining);
-        if (drive_write(cur_lba, 1, temp) < 0) return media_fail(lun);
-        remaining = 0;
-    }
-
     return (int32_t)bufsize;
 }
 

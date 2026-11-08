@@ -312,6 +312,10 @@ Every pass-through command is classified (`firmware/ata_policy.c`):
   codes the Linux SCSI layer completes without retrying. Anything else, even
   HARDWARE ERROR on USB storage, makes Linux re-read a sector the drive has
   just spent seconds failing on. Failed writes use 03/0C/00.
+- READ(10) and WRITE(10) are served in whole 512-byte sectors only. A CBW
+  whose data length is not 512 × the CDB's block count (TinyUSB derives the
+  block size from it) fails with ILLEGAL REQUEST 24h/00h instead of being
+  served as partial sectors.
 - Mount (and a write-protect change while mounted) raises UNIT ATTENTION
   28h/00h, delivered on the next TEST UNIT READY. TinyUSB answers most
   standard opcodes itself, so TUR is where the host's disk driver learns
