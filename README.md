@@ -26,6 +26,14 @@
 > To make `smartctl` work without `-d sat`, install the drive database entry:
 > `sudo cp tools/smart_drivedb.h /etc/smart_drivedb.h`.
 >
+> **Acknowledgements.** Several robustness fixes in this fork are based on
+> findings in Tony Atkins' [palimpsest fork](https://github.com/BarelyBooting/ATAboy):
+> the malformed-command guard, strict end-of-drive handling, partial reads,
+> the per-command time budget, CHS self-reset detection, soft-reset
+> hardening, the power-up reset fix, the fault handler, settings checks,
+> per-sector hashes, unique USB serials and the request-id/boot-id ideas.
+> They were reimplemented here, not copied; any bugs are ours.
+>
 > Changes for recovery use: the read timeout is adjustable and persistent (stock
 > resets the drive after 1 s, mid-retry), real ATA errors reach the host instead
 > of "medium not present", failed sectors can be read through the error, and the
