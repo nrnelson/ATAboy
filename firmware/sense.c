@@ -23,8 +23,11 @@ void sense_set(uint8_t lun, uint8_t key, uint8_t asc, uint8_t ascq) {
 static void map_ata(const errlog_entry_t *e, uint8_t *key, uint8_t *asc, uint8_t *ascq) {
     *key = SCSI_SENSE_MEDIUM_ERROR; *asc = 0x11; *ascq = 0x00;     // unrecovered read error
     if (e->op == LOGOP_WRITE) { *asc = 0x0C; *ascq = 0x00; }            // write error
-    if (e->result == IDE_TIMEOUT)        { *asc = 0x3E; *ascq = 0x02; }     // timeout on logical unit
-    else if (e->result == IDE_NOT_READY) { *key = SCSI_SENSE_NOT_READY; *asc = 0x04; *ascq = 0x00; }
+    // Linux retries MEDIUM ERROR unless the ASC is 11h/13h/14h, and always
+    // retries NOT READY / ABORTED COMMAND; HARDWARE ERROR is never retried.
+    // A retry re-hammers a failing sector, so timeouts and not-ready use it.
+    if (e->result == IDE_TIMEOUT)        { *key = SCSI_SENSE_HARDWARE_ERROR; *asc = 0x3E; *ascq = 0x02; }
+    else if (e->result == IDE_NOT_READY) { *key = SCSI_SENSE_HARDWARE_ERROR; *asc = 0x04; *ascq = 0x00; }
     else if (e->result == IDE_BUS_FAULT) { *key = SCSI_SENSE_HARDWARE_ERROR; *asc = 0x47; *ascq = 0x00; }
     else if (e->error & 0x40) { *asc = (e->op == LOGOP_WRITE) ? 0x0C : 0x11; *ascq = 0x00; }  // UNC
     else if (e->error & 0x10) { *asc = 0x14; *ascq = 0x01; }       // IDNF -> record not found
