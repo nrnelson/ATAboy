@@ -319,12 +319,13 @@ static void update_main_menu(void) {
         "  Mount HDD to USB Mass Storage",     // 1 — left,  row 8
         BOX_ARROW " ATAboy Features Setup",    // 2 — right, row 6
         "  Load Setup Defaults",               // 3 — right, row 8
-        "  Save Setup to EEPROM"               // 4 — right, row 10
+        "  Save Setup to EEPROM",              // 4 — right, row 10
+        "  Park Heads for Power-Off"           // 5 — left,  row 10
     };
 
-    for (int i = 0; i < 5; i++) {
-        int col = (i < 2) ? 4 : 43;
-        int row = 6 + (i < 2 ? i : (i - 2)) * 2;
+    for (int i = 0; i < 6; i++) {
+        int col = (i < 2 || i == 5) ? 4 : 43;
+        int row = (i == 5) ? 10 : 6 + (i < 2 ? i : (i - 2)) * 2;
         cdc_printf("\033[%d;%dH", row, col);
         if (i == config.main_selected)
             cdc_printf(SEL_RED " %-28s " RESET BG_BLUE FG_WHITE, items[i]);
@@ -461,6 +462,8 @@ static void draw_confirm_box(const char *message) {
 //  Error box — 52 wide, 7 tall
 // ---------------------------------------------------------------------------
 
+static const char *error_title = "ERROR!";
+
 static void draw_error_box(const char *error_msg, bool show_force) {
     int box_w = 52, start_col = 14, start_row = 9;
 
@@ -471,7 +474,8 @@ static void draw_error_box(const char *error_msg, bool show_force) {
     cdc_printf("\033[%d;%dH", start_row, start_col);
     cdc_puts(BOX_TL); emit_n(BOX_HH, 50); cdc_puts(BOX_TR);
 
-    cdc_printf("\033[%d;%dH" BOX_VH "                      ERROR!                      " BOX_VH, start_row+1, start_col);
+    int tl = (int)strlen(error_title), tp = (50 - tl) / 2;
+    cdc_printf("\033[%d;%dH" BOX_VH "%*s%s%*s" BOX_VH, start_row+1, start_col, tp, "", error_title, 50 - tl - tp, "");
 
     cdc_printf("\033[%d;%dH", start_row+2, start_col);
     cdc_puts(BOX_MLD); emit_n(BOX_HH, 50); cdc_puts(BOX_MRD);
@@ -878,6 +882,7 @@ static void sync_from_api(void) {
 // ---------------------------------------------------------------------------
 
 static void show_notice(const char *msg) {
+    error_title = "NOTICE";
     snprintf(hdd_status_text, sizeof(hdd_status_text), "\033[91;1m%s", msg);
     show_detect_result = true;
     error_is_notice = true;
@@ -922,6 +927,55 @@ static void try_auto_mount(void) {
     int r = drive_mount_ex(0);    // refuses geometry saved for a different drive
     if (r == R_GEO_MISMATCH) show_notice("Saved geometry is for another drive: not mounted");
     else if (r == R_NOT_READY) show_notice("Drive not ready: not mounted");
+}
+
+// ---------------------------------------------------------------------------
+//  Park heads (power-off preparation for drives without automatic parking)
+// ---------------------------------------------------------------------------
+
+static void draw_park_box(const char *digits) {
+    draw_confirm_box("Park heads: landing-zone cylinder?");
+    cdc_printf(SEL_RED "\033[11;16H Optional, for stepper drives.  Enter = none ");
+    cdc_printf("\033[13;16H Esc = cancel   Cylinder: \033[103;30m%-5s\033[0m" SEL_RED, digits);
+    cdc_printf("\033[13;%dH", 42 + (int)strlen(digits));
+}
+
+static void run_park_dialog(void) {
+    char ib[8] = {0};
+    int p = 0;
+    draw_park_box(ib);
+    while (true) {
+        int k = get_input();
+        if (api_took_over()) return;
+        if (k == -1) { tight_loop_contents(); continue; }
+        if (k == KEY_ESC) { cdc_puts(RESET); return; }
+        if (k >= '0' && k <= '9' && p < 5) { ib[p++] = (char)k; ib[p] = '\0'; draw_park_box(ib); }
+        else if ((k == 8 || k == 127) && p > 0) { ib[--p] = '\0'; draw_park_box(ib); }
+        else if (k == KEY_ENTER) {
+            long cyl = p ? atol(ib) : -1;
+            if (cyl > 65535) { p = 0; ib[0] = '\0'; draw_park_box(ib); continue; }
+            draw_confirm_box(cyl >= 0 ? "Seeking to landing zone, then STANDBY..." : "Sending STANDBY IMMEDIATE...");
+            cdc_puts(RESET);
+            drive_park_t r;
+            int res = drive_park(cyl >= 0, cyl >= 0 ? (uint16_t)cyl : 0, &r);
+            sync_from_api();
+            char msg[64];
+            if (res == R_MOUNTED)
+                snprintf(msg, sizeof(msg), "Unmount first");
+            else if (res == R_OK)
+                snprintf(msg, sizeof(msg), "%sParked (%02Xh OK). Power off now.", r.seek_issued ? "Seek OK. " : "",
+                         r.standby.command);
+            else if (r.seek_issued && r.seek.result != IDE_OK)
+                snprintf(msg, sizeof(msg), "SEEK failed (ST %02X ER %02X); STANDBY %s", r.seek.status, r.seek.error,
+                         r.standby.result == IDE_OK ? "OK" : "failed");
+            else
+                snprintf(msg, sizeof(msg), "STANDBY %02Xh failed (ST %02X ER %02X)", r.standby.command,
+                         r.standby.status, r.standby.error);
+            show_notice(msg);
+            error_title = res == R_OK ? "PARKED" : "PARK FAILED";
+            return;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1010,6 +1064,7 @@ void core1_entry(void) {
                     sync_from_config();
                 }
                 error_is_notice = false;
+                error_title = "ERROR!";
                 needs_full_redraw = true;
             } else if (force_detect && (k == 'f' || k == 'F')) {
                 show_detect_result = false; hdd_status_text[0] = '\0';
@@ -1073,18 +1128,16 @@ void core1_entry(void) {
         if (k == KEY_F10) { confirm_return_screen = current_screen; current_screen = SCREEN_CONFIRM; confirm_type = 1; trigger_overlay = true; needs_full_redraw = true; continue; }
 
         if (current_screen == SCREEN_MAIN) {
-            if (k == KEY_UP) {
-                if (config.main_selected == 1 || config.main_selected == 3 || config.main_selected == 4) config.main_selected--;
-            } else if (k == KEY_DOWN) {
-                if (config.main_selected == 0 || config.main_selected == 2 || config.main_selected == 3) config.main_selected++;
-            } else if (k == KEY_RIGHT) {
-                if (config.main_selected == 0) config.main_selected = 2;
-                else if (config.main_selected == 1) config.main_selected = 3;
-            } else if (k == KEY_LEFT) {
-                if (config.main_selected == 2) config.main_selected = 0;
-                else if (config.main_selected == 3) config.main_selected = 1;
-                else if (config.main_selected == 4) config.main_selected = 1;
-            }
+            // Left column 0, 1, 5; right column 2, 3, 4 (rows 6, 8, 10)
+            static const uint8_t up[6]    = {0, 0, 2, 2, 3, 1};
+            static const uint8_t down[6]  = {1, 5, 3, 4, 4, 5};
+            static const uint8_t right[6] = {2, 3, 2, 3, 4, 4};
+            static const uint8_t left[6]  = {0, 1, 0, 1, 5, 5};
+            if (config.main_selected > 5) config.main_selected = 0;
+            if (k == KEY_UP)         config.main_selected = up[config.main_selected];
+            else if (k == KEY_DOWN)  config.main_selected = down[config.main_selected];
+            else if (k == KEY_RIGHT) config.main_selected = right[config.main_selected];
+            else if (k == KEY_LEFT)  config.main_selected = left[config.main_selected];
             else if (k == KEY_ENTER) {
                 if (config.main_selected == 0) {
                     // Auto Detect — single reset, probe master then slave
@@ -1129,6 +1182,7 @@ void core1_entry(void) {
                     current_screen = SCREEN_FEATURES; config.feat_selected = 0; needs_full_redraw = true;
                 } else if (config.main_selected == 3) { current_screen = SCREEN_CONFIRM; confirm_type = 0; trigger_overlay = true; needs_full_redraw = true; }
                 else if (config.main_selected == 4) { current_screen = SCREEN_CONFIRM; confirm_type = 1; trigger_overlay = true; needs_full_redraw = true; }
+                else if (config.main_selected == 5) { run_park_dialog(); needs_full_redraw = true; }
             }
         } else if (current_screen == SCREEN_FEATURES) {
             if (k == KEY_UP && config.feat_selected > 0) config.feat_selected--;

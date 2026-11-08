@@ -33,6 +33,7 @@ extern volatile bool media_changed_waiting;
 #define LOGOP_IDENTIFY  6
 #define LOGOP_READ_DIAG 7
 #define LOGOP_WRITE_LONG 8
+#define LOGOP_PARK      9
 
 typedef struct {
     uint32_t seq;
@@ -111,6 +112,20 @@ int      drive_mount(void);                          // drive_mount_ex(0)
 int      drive_mount_ex(uint8_t flags);
 int      drive_geo_identity(void);                   // GEO_ID_* for the cached drive identity
 int      drive_unmount(void);
+
+// Park the heads before power-off: optional SEEK (70h, CHS, head 0) to a
+// landing-zone cylinder, then STANDBY IMMEDIATE (E0h; 94h if E0h is aborted).
+// Refused while mounted.  Returns the first failure (R_*), else R_OK.
+typedef struct {
+    bool      seek_issued;
+    uint16_t  cylinder;
+    ide_cmd_t seek;
+    ide_cmd_t standby;         // the one that decided the result (94h after a fallback)
+    bool      fallback;        // E0h was aborted, 94h was sent
+    uint8_t   e0_status, e0_error;   // what E0h got, when it fell back
+} drive_park_t;
+
+int      drive_park(bool seek, uint16_t cylinder, drive_park_t *out);
 
 // Logged sector I/O for the mass-storage path.  Return bytes or -1.
 int32_t  drive_read(uint32_t lba, uint32_t count, uint8_t *buf);

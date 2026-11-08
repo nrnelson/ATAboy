@@ -204,6 +204,8 @@ class FakeDevice:
             return self.jreply(op, res, self.status_json(), msg)
         if op == 0x02:
             return self.jreply(op, 0, {"config": dict(self.config)})
+        if op == 0x15:
+            return self.op_park(op, a)
         if op == 0x03:
             key, value = struct.unpack(">B3xI", a[:8])
             names = {v[0]: (k, v[1]) for k, v in ab.CONFIG_KEYS.items()}
@@ -229,6 +231,30 @@ class FakeDevice:
             return self.jreply(op, 0, {"total": len(self.log), "retained": len(self.log), "start": start,
                                        "returned": len(page), "next": nxt, "entries": page})
         return self.jreply(op, R["bad_subop"], message="unknown sub-operation")
+
+    park_e0_aborts = False
+    park_seek_fails = False
+
+    def op_park(self, op, a):
+        if self.mounted:
+            return self.jreply(op, R["mounted"], self.status_json(), "unmount first")
+        seek, cyl = a[0] & 1, struct.unpack(">H", a[2:4])[0]
+        self.park_calls = getattr(self, "park_calls", []) + [(seek, cyl)]
+
+        def cmd(command, ok, err=0x04):
+            return {"command": command, "result": "ok" if ok else "ata_error",
+                    "status": 0x50 if ok else 0x51, "status_bits": "DRDY|DSC" if ok else "DRDY|DSC|ERR",
+                    "error": 0 if ok else err, "error_bits": "" if ok else "ABRT", "elapsed_ms": 5}
+        o = {"seek": None, "fallback": self.park_e0_aborts}
+        res = 0
+        if seek:
+            o["seek"] = dict(cmd(0x70, not self.park_seek_fails), cylinder=cyl)
+            if self.park_seek_fails:
+                res = R["ata_error"]
+        o["standby"] = cmd(0x94 if self.park_e0_aborts else 0xE0, True)
+        if self.park_e0_aborts:
+            o.update(e0_status=0x51, e0_error=0x04)
+        return self.jreply(op, res, o, "heads parked" if res == 0 else "SEEK to the landing zone failed")
 
     def op_read(self, op, a, alloc):
         lba, count, flags, tmo = struct.unpack(">IHBxI", a)
@@ -923,6 +949,51 @@ class TestGeometryOwner(HostTestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(ab.main(["--no-sudo", "-j", "mount", "--no-rescan"]), ab.EXIT_DEVICE)
                 self.assertEqual(ab.main(["--no-sudo", "-j", "mount", "--no-rescan", "--force"]), ab.EXIT_OK)
+        finally:
+            ab.ATAboy = orig
+
+
+class TestPark(HostTestCase):
+    def test_standby_only(self):
+        r = self.dev.park()
+        self.assertTrue(r.ok)
+        self.assertEqual(self.fake.calls[-1], (0x15, bytes(12)))
+        self.assertIsNone(r.json["seek"])
+        self.assertEqual(r.json["standby"]["command"], 0xE0)
+
+    def test_landing_zone_and_fallback(self):
+        self.fake.park_e0_aborts = True
+        r = self.dev.park(cylinder=1023)
+        self.assertTrue(r.ok)
+        self.assertEqual(self.fake.calls[-1][1][:4], bytes([1, 0, 0x03, 0xFF]))
+        self.assertEqual(r.json["seek"]["cylinder"], 1023)
+        self.assertEqual(r.json["standby"]["command"], 0x94)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ab.human_park(r.json)
+        self.assertIn("sent the ATA-1 STANDBY IMMEDIATE 94h", buf.getvalue())
+        self.assertIn("cylinder 1023", buf.getvalue())
+
+    def test_refused_while_mounted_and_bad_cylinder(self):
+        self.fake.mounted = True
+        self.assertEqual(self.dev.park().result_name, "mounted")
+        with self.assertRaises(ValueError):
+            self.dev.park(cylinder=70000)
+
+    def test_cli(self):
+        self.fake.park_seek_fails = True
+        orig = ab.ATAboy
+        ab.ATAboy = lambda path=None: self.dev
+        self.dev.close = lambda: None
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(ab.main(["--no-sudo", "park", "--landing-zone", "0x3ff"]), ab.EXIT_DEVICE)
+            self.assertIn("SEEK to the landing zone failed", out.getvalue())
+            self.assertEqual(self.fake.park_calls[-1], (1, 1023))
+            self.fake.park_seek_fails = False
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(ab.main(["--no-sudo", "-j", "park"]), ab.EXIT_OK)
         finally:
             ab.ATAboy = orig
 

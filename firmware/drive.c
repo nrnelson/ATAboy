@@ -301,6 +301,62 @@ int drive_unmount(void) {
 }
 
 // ---------------------------------------------------------------------------
+//  Park
+// ---------------------------------------------------------------------------
+
+#define PARK_SEEK_MS     10000
+#define PARK_STANDBY_MS  30000     // STANDBY IMMEDIATE returns once the spindle has stopped
+
+static int park_standby(ide_cmd_t *c, uint8_t command) {
+    memset(c, 0, sizeof(*c));
+    c->command = command;
+    c->proto = IDE_PROTO_NONDATA;
+    c->flags = IDE_F_NEED_DRDY | IDE_F_NO_RECOVER;   // no SRST afterwards
+    c->timeout_ms = PARK_STANDBY_MS;
+    int r = ide_exec(c);
+    drive_record(LOGOP_PARK, c, 0, 0);
+    return r;
+}
+
+int drive_park(bool seek, uint16_t cylinder, drive_park_t *p) {
+    memset(p, 0, sizeof(*p));
+    if (is_mounted) return R_MOUNTED;
+    int result = R_OK;
+
+    ide_lock();
+    if (seek) {
+        ide_cmd_t *c = &p->seek;
+        c->command = 0x70;                            // SEEK, CHS: cylinder, head 0, sector 1
+        c->proto = IDE_PROTO_NONDATA;
+        c->lba_lo = 1;
+        c->lba_mid = (uint8_t)cylinder;
+        c->lba_hi = (uint8_t)(cylinder >> 8);
+        c->device = 0x00;
+        c->flags = IDE_F_NEED_DRDY;
+        c->timeout_ms = PARK_SEEK_MS;
+        int r = ide_exec(c);
+        drive_record(LOGOP_PARK, c, cylinder, 0);
+        p->seek_issued = true;
+        p->cylinder = cylinder;
+        if (r != IDE_OK) result = drive_result_from_ide(r);
+        // Carry on: STANDBY parks the heads on drives that do it themselves.
+    }
+
+    int r = park_standby(&p->standby, 0xE0);          // STANDBY IMMEDIATE
+    if (r == IDE_ATA_ERROR && (p->standby.error & 0x04)) {
+        p->fallback = true;                           // ABRT: ATA-1 drive, try 94h
+        p->e0_status = p->standby.status;
+        p->e0_error = p->standby.error;
+        r = park_standby(&p->standby, 0x94);
+    }
+    ide_unlock();
+
+    if (result == R_OK) result = drive_result_from_ide(r);
+    drive.api_gen++;
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 //  Logging
 // ---------------------------------------------------------------------------
 
@@ -328,7 +384,8 @@ void drive_record(uint8_t op, const ide_cmd_t *c, uint32_t lba, uint32_t count) 
     x->elapsed_ms = c->elapsed_us / 1000u;
     x->timeout_ms = c->timeout_ms;
     uint32_t fl;
-    x->fail_lba   = (op != LOGOP_IDENTIFY && op != LOGOP_PASSTHRU && ide_cmd_result_lba(c, &fl)) ? fl : lba + c->done;
+    x->fail_lba   = (op != LOGOP_IDENTIFY && op != LOGOP_PASSTHRU && op != LOGOP_PARK &&
+                     ide_cmd_result_lba(c, &fl)) ? fl : lba + c->done;
     if (c->tf_valid) {
         x->tf[0] = c->out_count;  x->tf[1] = c->out_lba_lo; x->tf[2] = c->out_lba_mid;
         x->tf[3] = c->out_lba_hi; x->tf[4] = c->out_device;
