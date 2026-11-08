@@ -66,7 +66,7 @@ out=$("$A" -j verify 0 "$sectors" --budget 3)
 [[ $(echo "$out" | jq_ 'd["seconds"] < 6') == True ]] && pass "verify honours time budget" || fail "verify overran budget"
 
 # --- SAT pass-through -------------------------------------------------------------
-command -v sg_sat_identify >/dev/null && check "sg_sat_identify" sudo sg_sat_identify "$dev"
+command -v sg_sat_identify >/dev/null && check "sg_sat_identify" sudo sg_sat_identify --readonly "$dev"
 command -v hdparm >/dev/null && check "hdparm -I" sudo hdparm -I "$dev"
 command -v smartctl >/dev/null && check "smartctl -d sat -i" sudo smartctl -d sat -i "$dev"
 out=$("$A" -j ata 0xE5)
@@ -111,7 +111,7 @@ EOF
     "$A" -j ata 0xFF --dangerous >/dev/null
     [[ $("$A" -j status | jq_ 'd["stats"]["passthru_cmds"]') == 1 ]] && pass "armed command executed exactly once" || fail "armed command count"
     "$A" corrupt $((lba + 4)) --bits 32 >/dev/null
-    out=$("$A" -j read $((lba + 4)) --through-error)
+    out=$("$A" -j read $((lba + 4)) --through-error --timeout 15000)
     [[ $(echo "$out" | jq_ 'd["chunks"][0]["error_bits"]') == UNC ]] && pass "corrupt makes UNC sector" || fail "corrupt: $out"
     "$A" image "$work/p.img" --start $((lba)) --count 16 >/dev/null
     grep -q -- "  -$" "$work/p.img.map" && pass "image maps the bad sector" || fail "image map"
