@@ -597,7 +597,10 @@ class ATAboy:
         while cur < end:
             if time_budget_s and time.time() - t0 > time_budget_s:
                 break
-            r = self.verify(cur, end - cur, timeout_ms=timeout_ms)
+            # One firmware VERIFY request may run ~10 s; with a budget, keep each
+            # request small (~2 s at old-drive speeds) so the budget is honoured.
+            n = end - cur if not time_budget_s else min(end - cur, 8192)
+            r = self.verify(cur, n, timeout_ms=timeout_ms)
             requests += 1
             cur += r.done
             if r.result != "ok":
