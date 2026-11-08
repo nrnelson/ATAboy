@@ -665,7 +665,13 @@ Every pass-through command is classified (`firmware/ata_policy.c`):
   sector again. So each host command costs the drive at most one attempt per
   bad sector; a new command (e.g. the host reading the remainder one sector at
   a time) asks the drive again. Earlier firmware discarded the whole 8-sector
-  chunk.
+  chunk. Getting the good sectors depends on the host keeping data received
+  before the endpoint stall that ends the failed command. Under WSL2 with
+  usbipd-win it doesn't: the whole transfer comes back empty (SG_IO residue =
+  full length), even good 4 KiB chunks that were sent before the bad one, so
+  the kernel fails the whole request. Sense data and the one-attempt rule
+  are unaffected, and ddrescue or `ataboy image` re-read the good sectors
+  with later commands.
 - **Time budget.** All drive work for one READ(10) or WRITE(10) shares a
   budget of 10 s from its first chunk (`MSC_RW_BUDGET_MS` in
   `firmware/msc_rw.h`, a build-time constant). Once it is used up no further
