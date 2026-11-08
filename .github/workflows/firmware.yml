@@ -1,0 +1,64 @@
+name: firmware
+
+on:
+  push:
+    branches: [main, automation-api]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # git describe for the version hash
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi libnewlib-arm-none-eabi \
+            libstdc++-arm-none-eabi-newlib cmake ninja-build build-essential
+
+      - name: Fetch pico-sdk 2.2.0
+        run: |
+          git clone --depth 1 --branch 2.2.0 https://github.com/raspberrypi/pico-sdk.git "$RUNNER_TEMP/pico-sdk"
+          git -C "$RUNNER_TEMP/pico-sdk" submodule update --init --depth 1 lib/tinyusb
+
+      - name: Host unit tests
+        run: |
+          cc -Wall -Wextra -Werror -I firmware -o "$RUNNER_TEMP/test_host" \
+            tests/test_host.c firmware/ata_policy.c firmware/json.c
+          "$RUNNER_TEMP/test_host"
+
+      - name: Host tool
+        run: |
+          python3 -m py_compile host/ataboy
+          python3 host/ataboy --help > /dev/null
+          bash -n tools/flash-wsl.sh
+
+      - name: Build firmware
+        env:
+          PICO_SDK_PATH: ${{ runner.temp }}/pico-sdk
+        run: |
+          cmake -S firmware -B firmware/build -G Ninja -DPICO_BOARD=pico2
+          ninja -C firmware/build
+          cp firmware/build/ATAboy.uf2 "ATAboy-$(git describe --always --tags --dirty).uf2"
+          sha256sum ATAboy-*.uf2 | tee SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ATAboy-firmware
+          path: |
+            ATAboy-*.uf2
+            SHA256SUMS
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" ATAboy-*.uf2 SHA256SUMS host/ataboy --generate-notes
