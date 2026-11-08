@@ -14,4 +14,9 @@ void usbbuf_note(uint8_t *buf);          // remember the class buffer address
 void usbbuf_poison(void);                // stamp the tag (after a command completes)
 bool usbbuf_has_host_data(const uint8_t *buf);
 
+// Mass-storage command activity, for the API serial port: true from a
+// command's first callback (usbbuf_note) to its completion (usbbuf_poison).
+// *seq changes with every callback.
+bool usbbuf_msc_active(uint32_t *seq);
+
 #endif

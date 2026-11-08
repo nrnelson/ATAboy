@@ -47,6 +47,8 @@ add_executable(ATAboy
         api.c
         crc32.c
         rid_cache.c
+        apiframe.c
+        api_serial.c
         menus.c
         usb.c
         usb_descriptors.c

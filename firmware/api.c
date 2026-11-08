@@ -11,6 +11,7 @@
 // CHECK CONDITION is only used for malformed CDBs.  See docs/API.md.
 
 #include "api.h"
+#include "api_serial.h"
 #include "drive.h"
 #include "config.h"
 #include "json.h"
@@ -134,6 +135,8 @@ void api_poll(void) {
     uint32_t t = now_ms();
     if (t - state_polled_ms >= 10) { state_polled_ms = t; api_state_counter(); }
     if (reboot_mode < 0 || (int32_t)(now_ms() - reboot_at_ms) < 0) return;
+    // A reply on the API serial port goes out in pieces from the main loop.
+    if (!api_serial_idle() && (int32_t)(now_ms() - reboot_at_ms) < 1000) return;
     if (reboot_mode == 1) reset_usb_boot(0, 0);   // BOOTSEL: UF2 drive + PICOBOOT
     watchdog_reboot(0, 0, 0);
     while (true) tight_loop_contents();
@@ -422,7 +425,7 @@ static uint32_t put_result(uint8_t *p, const ide_cmd_t *c, uint32_t lba, uint32_
 
 static bool op_takes_rid(uint8_t op);
 
-// INFO fields for the extended header and request ids.
+// INFO fields for the extended header, request ids and the API serial port.
 static void json_ext_info(json_t *j) {
     j_uint(j, "boot_id", boot_id);
     j_uint(j, "state_counter", api_state_counter());
@@ -430,6 +433,9 @@ static void json_ext_info(json_t *j) {
     for (int op = 0; op < 256; op++) if (op_takes_rid((uint8_t)op)) j_uint(j, NULL, (uint64_t)op);
     j_end(j);
     j_uint(j, "rid_cache", RID_CACHE_ENTRIES);
+    j_arr(j, "transports");
+    j_str(j, NULL, "scsi"); j_str(j, NULL, "serial");
+    j_end(j);
 }
 
 static int32_t op_info(uint8_t *buf, uint32_t cap) {
@@ -467,7 +473,7 @@ static int32_t op_info(uint8_t *buf, uint32_t cap) {
     j_str(&j, NULL, "read_long"); j_str(&j, NULL, "verify"); j_str(&j, NULL, "bootsel");
     j_str(&j, NULL, "persistent_timeouts"); j_str(&j, NULL, "no_retry_reads");
     j_str(&j, NULL, "corrupt_sector");
-    j_str(&j, NULL, "ext_header"); j_str(&j, NULL, "request_id");
+    j_str(&j, NULL, "ext_header"); j_str(&j, NULL, "request_id"); j_str(&j, NULL, "serial_api");
     j_end(&j);
     json_ext_info(&j);
     j_end(&j);

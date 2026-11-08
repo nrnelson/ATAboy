@@ -1,6 +1,7 @@
 // ATAboy Firmware — Main Entry Point
 // Core 0: TinyUSB task loop + CDC queue bridge; MSC/API/pass-through IDE work
-//         happens inside tud_task() callbacks.
+//         happens inside tud_task() callbacks, API serial-port requests in
+//         api_serial_task() between them.
 // Core 1: Menu system (menus.c)
 // The IDE bus is shared and guarded by ide_lock() (see ide.h).
 // NEVER call tud_task() from callbacks, IDE I/O, or core 1.
@@ -12,6 +13,7 @@
 #include "ide.h"
 #include "config.h"
 #include "api.h"
+#include "api_serial.h"
 #include "pico/util/queue.h"
 
 // ---------------------------------------------------------------------------
@@ -33,7 +35,8 @@ queue_t cdc_rx_queue;
 #define CDC_RX_QUEUE_SIZE 256
 
 // ---------------------------------------------------------------------------
-//  cdc_task() — called from core 0 main loop only
+//  cdc_task() — called from core 0 main loop only (setup UI = CDC instance 0;
+//  instance 1 is the API port, api_serial.c)
 // ---------------------------------------------------------------------------
 
 static void cdc_task(void) {
@@ -93,10 +96,11 @@ int main(void) {
     // Launch menu UI on core 1 (auto-mount runs there too)
     multicore_launch_core1(core1_entry);
 
-    // Core 0 loop: service USB + CDC bridge + deferred API actions
+    // Core 0 loop: service USB + CDC bridge + API serial port + deferred API actions
     while (true) {
         tud_task();
         cdc_task();
+        api_serial_task();
         api_poll();
     }
 }
