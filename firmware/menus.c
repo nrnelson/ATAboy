@@ -126,6 +126,7 @@ static int  confirm_type = 0;
 #define KEY_ENTER 13
 #define KEY_ESC   27
 #define KEY_F10   1010
+#define KEY_CTRL_L 12     // redraw the whole screen
 
 typedef enum {
     SCREEN_MAIN,
@@ -219,8 +220,10 @@ static void print_help(const char *text) {
 // ---------------------------------------------------------------------------
 
 static void draw_bios_frame(void) {
-    cdc_printf(BG_BLUE FG_WHITE CLR_SCR HIDE_CUR "\033[H");
-    cdc_printf("\033[1;1H%80s", "");
+    cdc_printf(RESET BG_BLUE FG_WHITE CLR_SCR HIDE_CUR "\033[H");
+    // Paint every cell blue: terminals without background-color erase
+    // (screen, some serial terminals) clear to their default colour.
+    for (int r = 1; r <= 24; r++) cdc_printf("\033[%d;1H%80s", r, "");
     cdc_printf("\033[1;8H" FG_WHITE "ATAboy Setup Utility v" FW_VERSION " - Copyright (C) 2026 obsoletetech.us");
 
     bool feat = (current_screen == SCREEN_FEATURES);
@@ -279,12 +282,15 @@ static void draw_hdd_status(void) {
     int dev_len = (hdd_model_raw[0] && !is_error) ? (int)strlen(dev_label) : 0;
     int start_x = (80 - (label_len + text_len + dev_len)) / 2;
 
+    // Blank both status rows with spaces rather than erase-to-end-of-line,
+    // which clears to the terminal's default colour without bce.
+    cdc_printf(RESET BG_BLUE FG_WHITE "\033[22;2H%78s\033[23;2H%78s", "", "");
     draw_at(start_x, 22, FG_WHITE "Current HDD: ");
-    if (is_error)        cdc_printf("\033[91;1m%s" RESET BG_BLUE FG_WHITE "\033[K", display);
-    else if (hdd_model_raw[0]) cdc_printf("\033[32;1m%s" FG_YELLOW "%s" RESET BG_BLUE FG_WHITE "\033[K", display, dev_label);
-    else                 cdc_printf(FG_YELLOW "%s" RESET BG_BLUE FG_WHITE "\033[K", display);
+    if (is_error)        cdc_printf("\033[91;1m%s" RESET BG_BLUE FG_WHITE, display);
+    else if (hdd_model_raw[0]) cdc_printf("\033[32;1m%s" FG_YELLOW "%s" RESET BG_BLUE FG_WHITE, display, dev_label);
+    else                 cdc_printf(FG_YELLOW "%s" RESET BG_BLUE FG_WHITE, display);
 
-    cdc_puts(RESET BG_BLUE FG_WHITE "\033[K");
+    cdc_puts(RESET BG_BLUE FG_WHITE);
     cdc_puts("\033[22;78H  " BOX_VH);
 
     char geo_vals[64];
@@ -303,7 +309,7 @@ static void draw_hdd_status(void) {
                     (!use_lba_mode && cur_cyls > 0 && cur_heads > 0 && cur_spt > 0);
     cdc_printf(is_valid ? "\033[92;1m%s" : "\033[91;1m%s", geo_vals);
 
-    cdc_puts(RESET BG_BLUE FG_WHITE "\033[K");
+    cdc_puts(RESET BG_BLUE FG_WHITE);
     cdc_puts("\033[23;78H  " BOX_VH);
     cdc_puts("\033[24;79H");
     cdc_flush();
@@ -619,6 +625,14 @@ static void draw_selection_menu_ex(const uint16_t *id, int selected_idx, bool fo
 // ---------------------------------------------------------------------------
 
 #define PICK_ROW 14                       // MANUAL row of the selection box
+
+// Ctrl+L inside an overlay on the main screen: repaint what's underneath;
+// the caller repaints its overlay.
+static void redraw_main_underlay(void) {
+    draw_bios_frame();
+    update_main_menu();
+}
+
 static const int chs_col[3]    = {9+26, 9+38, 9+48};
 static const int chs_digits[3] = {5, 2, 2};
 
@@ -629,7 +643,8 @@ static bool api_took_over(void) {
 // Ask for C/H/S on the MANUAL row.  Returns 1 with valid values in *c/*h/*s,
 // 0 when aborted (Esc, or the API took over): nothing is applied either way.
 // An out-of-range value leaves a message in 'note' and returns -1.
-static int manual_chs_entry(uint16_t *c, uint8_t *h, uint8_t *s, char *note, size_t note_len) {
+static int manual_chs_entry(const uint16_t *id, bool force_mode, uint16_t *c, uint8_t *h, uint8_t *s,
+                            char *note, size_t note_len) {
     long mf[3] = {detect_cyls, detect_heads, detect_spt};
     for (int f = 0; f < 3; f++) {
         char ib[8] = {0};
@@ -640,6 +655,15 @@ static int manual_chs_entry(uint16_t *c, uint8_t *h, uint8_t *s, char *note, siz
             int k = get_input();
             if (api_took_over()) return 0;
             if (k == -1) { tight_loop_contents(); continue; }
+            if (k == KEY_CTRL_L) {
+                redraw_main_underlay();
+                draw_selection_menu_ex(id, 3, force_mode, note);
+                for (int i = 0; i < f; i++) { draw_at(chs_col[i], PICK_ROW, SEL_RED); cdc_printf("%-5ld", mf[i]); }
+                ib[p] = '\0';
+                draw_at(chs_col[f], PICK_ROW, "\033[103;30m     ");
+                cdc_printf("\033[%d;%dH%s", PICK_ROW, chs_col[f], ib);
+                continue;
+            }
             if (k >= '0' && k <= '9' && p < chs_digits[f]) { ib[p++] = (char)k; cdc_putchar((char)k); }
             else if ((k == 8 || k == 127) && p > 0) { p--; cdc_printf("\b \b\033[%d;%dH", PICK_ROW, chs_col[f] + p); }
             else if (k == KEY_ENTER || k == '\t') {
@@ -673,6 +697,7 @@ static bool run_geometry_picker(const uint16_t *id, bool force_mode) {
         int ch = get_input();
         if (api_took_over()) return false;
         if (ch == -1) { tight_loop_contents(); continue; }
+        if (ch == KEY_CTRL_L) { redraw_main_underlay(); sd = true; continue; }
 
         if (!force_mode && ch == KEY_UP && geo_idx > 0)   { geo_idx--; if (!ls && geo_idx == 2) geo_idx--; sd = true; }
         else if (!force_mode && ch == KEY_DOWN && geo_idx < 3) { geo_idx++; if (!ls && geo_idx == 2) geo_idx++; sd = true; }
@@ -682,7 +707,7 @@ static bool run_geometry_picker(const uint16_t *id, bool force_mode) {
             note[0] = '\0';
             draw_selection_menu_ex(id, geo_idx, force_mode, note);
             uint16_t c; uint8_t h, sp;
-            int m = manual_chs_entry(&c, &h, &sp, note, sizeof(note));
+            int m = manual_chs_entry(id, force_mode, &c, &h, &sp, note, sizeof(note));
             if (api_took_over()) return false;
             if (m == 1) {
                 int r = drive_apply_geometry(GEO_MANUAL, c, h, sp);
@@ -826,7 +851,13 @@ static void run_seek_test(void) {
 
     double x = 0;
     while (true) {
-        if (cdc_getchar_timeout_us(0) == 27) break;
+        int k = cdc_getchar_timeout_us(0);
+        if (k == 27) break;
+        if (k == KEY_CTRL_L) {
+            draw_bios_frame();
+            draw_debug_overlay();
+            debug_print(0, FG_YELLOW, "Seek Test Running...  (Esc stops)");
+        }
         double pos = (sin(x)*0.45)+0.5;
         uint32_t target = (uint32_t)(pos*(max_range-1));
 
@@ -949,6 +980,7 @@ static void run_park_dialog(void) {
         if (api_took_over()) return;
         if (k == -1) { tight_loop_contents(); continue; }
         if (k == KEY_ESC) { cdc_puts(RESET); return; }
+        if (k == KEY_CTRL_L) { redraw_main_underlay(); draw_park_box(ib); continue; }
         if (k >= '0' && k <= '9' && p < 5) { ib[p++] = (char)k; ib[p] = '\0'; draw_park_box(ib); }
         else if ((k == 8 || k == 127) && p > 0) { ib[--p] = '\0'; draw_park_box(ib); }
         else if (k == KEY_ENTER) {
@@ -1052,6 +1084,7 @@ void core1_entry(void) {
         int k = get_input();
         if (k == -1) { tight_loop_contents(); continue; }
         if (drive.api_gen != seen_api_gen) { sync_from_api(); continue; }   // state changed under us
+        if (k == KEY_CTRL_L) { needs_full_redraw = true; continue; }        // every screen and overlay
 
         if (show_detect_result) {
             if (k == KEY_ENTER || k == KEY_ESC) {
