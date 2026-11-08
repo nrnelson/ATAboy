@@ -88,6 +88,8 @@ static void test_json(void) {
     CHECK(strcmp(ide_event_bits(0, evb), "") == 0);
     CHECK(strcmp(ide_event_bits(IDE_EV_HW_RESET, evb), "hw_reset") == 0);
     CHECK(strcmp(ide_event_bits(IDE_EV_HW_RESET | IDE_EV_RESET_FAILED, evb), "hw_reset|reset_failed") == 0);
+    CHECK(strcmp(ide_event_bits(IDE_EV_SELF_RESET | IDE_EV_REINIT, evb), "self_reset|reinit") == 0);
+    CHECK(strcmp(ide_event_bits(IDE_EV_REINIT | IDE_EV_REINIT_FAILED, evb), "reinit|reinit_failed") == 0);
     CHECK(strlen(ide_event_bits(0xFF, evb)) < sizeof(evb));
 }
 

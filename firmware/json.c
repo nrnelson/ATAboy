@@ -97,8 +97,8 @@ const char *ata_status_bits(uint8_t st, char *out) {
 }
 // IDE_EV_* (ide.h), lowest bit first; out needs 96 bytes.
 const char *ide_event_bits(uint8_t ev, char *out) {
-    static const char *const n[8] = {"hw_reset", "reset_failed", "ev2", "ev3",
-                                     "ev4", "ev5", "ev6", "ev7"};
+    static const char *const n[8] = {"hw_reset", "reset_failed", "self_reset", "reinit",
+                                     "reinit_failed", "ev5", "ev6", "ev7"};
     out[0] = '\0';
     for (int b = 0; b < 8; b++) {
         if (ev & (1u << b)) {

@@ -91,12 +91,24 @@ typedef struct {
     uint32_t hw_resets;            // RESET line pulses (fallback or explicit; not the detect probe)
     uint32_t hw_reset_failures;    // drive not back even after RESET
     uint32_t geometry_failures;    // INITIALIZE DEVICE PARAMETERS refused after a reset
+    uint32_t self_resets;          // CHS sentinel gone before a command: the drive reset itself
+    uint32_t reinits;              // 91h re-sent before a command (self-reset or geometry lost)
+    uint32_t reinit_failures;      // ...and refused: the command was not issued
     uint32_t last_reset_ms;        // duration of the last reset (incl. fallback)
     int8_t   last_reset;           // IDE_RST_* of the last reset
 } ide_health_t;
 
 extern ide_health_t ide_health;
 void    ide_health_clear(void);
+
+// CHS self-reset check (see ide.c): state for the API.
+#define IDE_CHK_OFF          0   // not in CHS mode
+#define IDE_CHK_IDLE         1   // CHS, nothing armed (no good command since the last reset/geometry)
+#define IDE_CHK_ARMED        2   // sentinel in place, checked before the next command
+#define IDE_CHK_LOST         3   // geometry lost: 91h goes out before the next command
+#define IDE_CHK_UNSUPPORTED  4   // drive doesn't keep SC/SN: no check until the geometry is set again
+#define IDE_CHK_NO_91H       5   // the drive never accepted 91h: it runs on its default translation
+uint8_t ide_chs_check_state(void);
 
 // --- Generic ATA command engine ---
 typedef enum {
@@ -116,6 +128,9 @@ typedef enum {
 // Events (ide_cmd_t.events)
 #define IDE_EV_HW_RESET      0x01   // the recovery SRST failed and the RESET line was pulsed
 #define IDE_EV_RESET_FAILED  0x02   // the drive didn't come back from the recovery reset
+#define IDE_EV_SELF_RESET    0x04   // CHS: the drive reset itself since the previous command
+#define IDE_EV_REINIT        0x08   // CHS: 91h re-sent before the command
+#define IDE_EV_REINIT_FAILED 0x10   // ...and refused; the command was not issued (IDE_NOT_READY)
 
 // Flags
 #define IDE_F_NEED_DRDY     0x01   // wait for DRDY=1 (not just BSY=0) before issuing

@@ -215,6 +215,17 @@ static void json_resets(json_t *j, const char *key) {
     j_end(j);
 }
 
+static void json_chs_check(json_t *j, const char *key) {
+    static const char *const st[] = {"off", "idle", "armed", "lost", "unsupported", "no_91h"};
+    uint8_t s = ide_chs_check_state();
+    j_obj(j, key);
+    j_str(j, "state", s < 6 ? st[s] : "off");
+    j_uint(j, "self_resets", ide_health.self_resets);
+    j_uint(j, "reinits", ide_health.reinits);
+    j_uint(j, "reinit_failed", ide_health.reinit_failures);
+    j_end(j);
+}
+
 static void json_log_entry(json_t *j, const char *key, const errlog_entry_t *e) {
     char sb[48], eb[48], evb[96];
     j_obj(j, key);
@@ -299,6 +310,7 @@ static void json_status_body(json_t *j) {
     j_str(j, "status_bits", ata_status_bits(alt, sb));
     j_uint(j, "pio_faults", ide_pio_faults);
     json_resets(j, "resets");
+    json_chs_check(j, "chs_check");
     j_end(j);
 
     json_config(j, "config");
