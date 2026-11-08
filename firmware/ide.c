@@ -215,9 +215,28 @@ void ide_hw_init(void) {
                        ADDR_MASK |
                        (1 << IDE_RESET) |
                        (1 << IDE_CS0) | (1 << IDE_CS1);
+    // Active-low lines and their idle (negated) level: RESET-, CS0-, CS1-
+    // and the 74HCT245 output enables high; DIR low (IDE -> Pico) and the
+    // address lines low.  DIOR-/DIOW- are driven high here too until the
+    // PIO state machines take them over with the same level.
+    uint32_t strobes = (1u << IDE_DIOR) | (1u << IDE_DIOW);
+    uint32_t idle_high = (1u << IDE_OE) | (1u << IDE_OE1) | (1u << IDE_RESET) |
+                         (1u << IDE_CS0) | (1u << IDE_CS1) | strobes;
 
-    gpio_init_mask(sio_out);
-    gpio_set_dir_out_masked(sio_out);
+    // Load the output latches and enable the drivers *before* the pads are
+    // handed to SIO.  gpio_init() would clear the latch and gpio_set_dir()
+    // would then drive every line low (a RESET- pulse to the drive and a
+    // chip-select/transceiver glitch on every boot) until bus_idle() ran.
+    // Pull-ups on the active-low lines keep them negated whenever nothing
+    // drives them.
+    for (int i = 0; i < 32; i++) {
+        if (!((sio_out | strobes) & (1u << i))) continue;
+        if (idle_high & (1u << i)) gpio_pull_up(i); else gpio_disable_pulls(i);
+    }
+    sio_hw->gpio_clr = (sio_out | strobes) & ~idle_high;
+    sio_hw->gpio_set = idle_high;
+    sio_hw->gpio_oe_set = sio_out | strobes;
+    gpio_set_function_masked(sio_out | strobes, GPIO_FUNC_SIO);
 
     // INTRQ — active-high from drive, idle low
     gpio_init(IDE_INTRQ);
@@ -236,8 +255,6 @@ void ide_hw_init(void) {
 
     // Bring up PIO state machines
     ide_pio_init();
-
-    gpio_put(IDE_RESET, 1);
     bus_idle();
 
     // nIEN=0: allow INTRQ from the drive

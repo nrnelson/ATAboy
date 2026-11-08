@@ -26,11 +26,6 @@ void ide_pio_init(void) {
     sm_read  = pio_claim_unused_sm(pio, true);
     sm_write = pio_claim_unused_sm(pio, true);
 
-    // Hand GPIO 0-15 (data bus), 26 (DIOR), 27 (DIOW) to PIO
-    for (int i = 0; i < 16; i++) pio_gpio_init(pio, i);
-    pio_gpio_init(pio, 26);
-    pio_gpio_init(pio, 27);
-
     // ---- Read SM (DIOR strobe) ----
     pio_sm_config c_rd = ide_read_program_get_default_config(offset_read);
     sm_config_set_in_pins(&c_rd, 0);                       // in base = GPIO 0
@@ -40,7 +35,7 @@ void ide_pio_init(void) {
 
     pio_sm_init(pio, sm_read, offset_read, &c_rd);
 
-    // Set DIOR HIGH and output before enabling SM (avoids LOW glitch)
+    // Set DIOR HIGH and output before the pin is handed to PIO (avoids LOW glitch)
     pio_sm_set_pins_with_mask(pio, sm_read, 1u << 26, 1u << 26);
     pio_sm_set_consecutive_pindirs(pio, sm_read, 26, 1, true);
 
@@ -57,6 +52,14 @@ void ide_pio_init(void) {
     pio_sm_set_pins_with_mask(pio, sm_write, 1u << 27, 1u << 27);
     pio_sm_set_consecutive_pindirs(pio, sm_write, 27, 1, true);
     pio_sm_set_consecutive_pindirs(pio, sm_write, 0, 16, false);
+
+    // Only now hand GPIO 0-15 (data bus), 26 (DIOR) and 27 (DIOW) to PIO: the
+    // state machines already drive both strobes high and leave the data bus
+    // as inputs, so the switch from SIO (which holds the strobes high, see
+    // ide_hw_init) causes no low glitch on DIOR-/DIOW-.
+    for (int i = 0; i < 16; i++) pio_gpio_init(pio, i);
+    pio_gpio_init(pio, 26);
+    pio_gpio_init(pio, 27);
 
     // Start both SMs (they immediately stall on pull block)
     pio_sm_set_enabled(pio, sm_read, true);
