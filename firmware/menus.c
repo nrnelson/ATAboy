@@ -902,6 +902,8 @@ static void sync_from_api(void) {
         hdd_model_raw[0] = '\0';
     }
     show_detect_result = false;
+    error_is_notice = false;
+    error_title = "ERROR!";
     hdd_status_text[0] = '\0';
     if (is_mounted) current_screen = SCREEN_MOUNTED;
     else if (current_screen == SCREEN_MOUNTED || current_screen == SCREEN_CONFIRM) current_screen = SCREEN_MAIN;
