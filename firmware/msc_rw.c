@@ -15,6 +15,7 @@ static struct {
     bool     write;
     uint32_t next_lba;        // where its next chunk must start
     uint32_t last_ms;         // when the previous chunk returned
+    uint32_t t0_ms;           // when its first chunk arrived (time budget)
     bool     fail_pending;    // the drive failed at next_lba: fail the next chunk with 'fail'
     errlog_entry_t fail;      // copy: the error log may move on before the next chunk
 } cmd;
@@ -34,6 +35,17 @@ static void enter(bool write, uint32_t lba) {
     msc_rw_end();
     cmd.active = true;
     cmd.write = write;
+    cmd.t0_ms = now;
+}
+
+// The command's time budget is used up: fail at 'lba' without starting
+// another drive command.  Everything before it has been transferred.
+static bool over_budget(uint8_t lun, uint32_t lba) {
+    uint32_t elapsed = msc_rw_now_ms() - cmd.t0_ms;
+    if (elapsed < MSC_RW_BUDGET_MS) return false;
+    drive_stats.budget_stops++;
+    sense_set_budget(lun, cmd.write, lba, elapsed);
+    return true;
 }
 
 static void advance(uint32_t lba) {
@@ -89,7 +101,7 @@ int32_t msc_rw_read(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *buf, ui
     }
 
     uint32_t n = in_range(lun, lba, bufsize);
-    if (n == 0) return fail();
+    if (n == 0 || over_budget(lun, lba)) return fail();
 
     uint32_t done = 0;
     if (drive_read(lba, n, buf, &done) == 0) {
@@ -111,7 +123,7 @@ int32_t msc_rw_write(uint8_t lun, uint32_t lba, uint32_t offset, const uint8_t *
     enter(true, lba);
 
     uint32_t n = in_range(lun, lba, bufsize);
-    if (n == 0) return fail();
+    if (n == 0 || over_budget(lun, lba)) return fail();
 
     uint32_t done = 0;
     if (drive_write(lba, n, buf, &done) != 0) return media_fail(lun, drive_last_failure());

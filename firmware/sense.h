@@ -11,6 +11,9 @@
 
 // Fixed-format sense describing a failed READ10/WRITE10 (see docs/API.md).
 void sense_set_media(uint8_t lun, const errlog_entry_t *e);
+// Fixed-format sense for a READ10/WRITE10 stopped by the per-command time
+// budget at 'lba' (no drive command failed; see docs/API.md).
+void sense_set_budget(uint8_t lun, bool write, uint32_t lba, uint32_t elapsed_ms);
 // Plain fixed-format sense.
 void sense_set(uint8_t lun, uint8_t key, uint8_t asc, uint8_t ascq);
 // Descriptor-format sense with the SAT "ATA Status Return" descriptor.

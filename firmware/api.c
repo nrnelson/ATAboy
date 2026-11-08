@@ -293,6 +293,7 @@ static void json_status_body(json_t *j) {
     j_uint(j, "passthru_errors", drive_stats.passthru_errors);
     j_uint(j, "passthru_blocked", drive_stats.passthru_blocked);
     j_uint(j, "api_cmds", drive_stats.api_cmds);
+    j_uint(j, "budget_stops", drive_stats.budget_stops);
     j_end(j);
 
     j_obj(j, "errors");

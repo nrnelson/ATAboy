@@ -161,7 +161,8 @@ before parsing.
              "ecc_len_effective": 4, "no_retry": false, "device": "master"},
   "stats": {"read_cmds": 1200, "read_sectors": 9600, "read_errors": 3, "write_cmds": 0,
             "write_sectors": 0, "write_errors": 0, "timeouts": 0, "recoveries": 0,
-            "passthru_cmds": 4, "passthru_errors": 0, "passthru_blocked": 0, "api_cmds": 17},
+            "passthru_cmds": 4, "passthru_errors": 0, "passthru_blocked": 0, "api_cmds": 17,
+            "budget_stops": 0},
   "errors": {"total": 3, "retained": 3, "last": { "...": "log entry, see LOG" }}
 }
 ```
@@ -194,7 +195,10 @@ command is outstanding. The Linux SCSI timeout for `/dev/sdX`
 up to `read_timeout_ms`, so the host tool raises it to at least
 8 × `read_timeout_ms` + 30 s whenever the timeout is set and on every
 `detect` / `mount` (the timeout may come from flash or the serial menu). It
-never lowers a larger value.
+never lowers a larger value. Linux splits large reads into READ(10)s of up to
+240 sectors (30 chunks), so the firmware also caps each READ(10)/WRITE(10) with
+a 20 s time budget (see *Mass-storage behaviour*): one host command takes at
+most 20 s plus the chunk that is running when the budget runs out.
 The serial menu also freezes during a long wait, because both share core 0's
 USB task.
 
@@ -305,7 +309,8 @@ Every pass-through command is classified (`firmware/ata_policy.c`):
 
 - READ10 failures return real sense instead of TinyUSB's "medium not present":
   fixed format, INFORMATION = failing LBA, bytes 8-9 = ATA status/error,
-  10-11 = elapsed ms, 14 = ATA command, 15 bit0 = timed out, 18 = engine
+  10-11 = elapsed ms, 14 = ATA command, 15 bit0 = timed out, bit1 = stopped
+  by the time budget (below), 18 = engine
   result, 19 = bit0 registers valid / bit1 SRST, 20-21 = sectors done.
   The key is always MEDIUM ERROR with ASC 11h (UNC, timeout as 11h/01h,
   not ready, bus fault, ABRT), 13h (AMNF) or 14h (IDNF): those are the only
@@ -334,6 +339,22 @@ Every pass-through command is classified (`firmware/ata_policy.c`):
   bad sector; a new command (e.g. the host reading the remainder one sector at
   a time) asks the drive again. Earlier firmware discarded the whole 8-sector
   chunk.
+- **Time budget.** All drive work for one READ(10) or WRITE(10) shares a
+  budget of 20 s from its first chunk (`MSC_RW_BUDGET_MS` in
+  `firmware/msc_rw.h`, a build-time constant). Once it is used up no further
+  drive command is started: the sectors read so far are transferred and the
+  command fails at the first sector not tried, so a slow drive can't hold one
+  USB command past Linux's 30 s SCSI timeout (which would reset the device and
+  lose the good data). The sense is fixed format with VALID set, INFORMATION
+  = that sector, bytes 10-11 = ms spent on the command, byte 15 bit1 set, and
+  the ATA fields (8-9, 14, 18-21) zero because no ATA command failed. Reads
+  use MEDIUM ERROR 11h/11h (*read error, loss of streaming*): with ASC 11h
+  Linux keeps the sectors before INFORMATION and doesn't re-send the command,
+  and the next read of the remainder is a new command with a fresh budget.
+  Writes use MEDIUM ERROR 0Ch/00h; Linux re-sends those, which is harmless for
+  a write. STATUS `stats.budget_stops` counts these stops. The first drive
+  command of a host command is never refused, so every command makes
+  progress.
 - Mount (and a write-protect change while mounted) raises UNIT ATTENTION
   28h/00h, delivered on the next TEST UNIT READY. TinyUSB answers most
   standard opcodes itself, so TUR is where the host's disk driver learns

@@ -61,6 +61,7 @@ typedef struct {
     uint32_t timeouts, recoveries;
     uint32_t passthru_cmds, passthru_errors, passthru_blocked;
     uint32_t api_cmds;
+    uint32_t budget_stops;    // USB READ10/WRITE10 stopped by the time budget
 } drive_stats_t;
 
 extern drive_stats_t drive_stats;

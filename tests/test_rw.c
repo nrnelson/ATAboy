@@ -26,7 +26,8 @@ static errlog_entry_t last_fail;
 static bool have_fail;
 static uint8_t disk[1000][512];
 
-static struct { int calls; uint8_t key, asc, ascq; bool media; uint32_t info; } sense;
+static struct { int calls; uint8_t key, asc, ascq; bool media, budget; uint32_t info; } sense;
+drive_stats_t drive_stats;
 
 uint32_t msc_rw_now_ms(void) { return now_ms; }
 uint64_t drive_total_sectors(void) { return total; }
@@ -65,7 +66,13 @@ void sense_set(uint8_t lun, uint8_t key, uint8_t asc, uint8_t ascq) {
     (void)lun; sense.calls++; sense.key = key; sense.asc = asc; sense.ascq = ascq; sense.media = false; sense.info = 0;
 }
 void sense_set_media(uint8_t lun, const errlog_entry_t *e) {
-    (void)lun; sense.calls++; sense.key = 3; sense.asc = 0x11; sense.ascq = 0; sense.media = true; sense.info = e->fail_lba;
+    (void)lun; sense.calls++; sense.key = 3; sense.asc = 0x11; sense.ascq = 0; sense.media = true; sense.budget = false; sense.info = e->fail_lba;
+}
+
+void sense_set_budget(uint8_t lun, bool write, uint32_t lba, uint32_t elapsed_ms) {
+    (void)lun; (void)elapsed_ms;
+    sense.calls++; sense.key = 3; sense.asc = write ? 0x0C : 0x11; sense.ascq = write ? 0 : 0x11;
+    sense.media = false; sense.budget = true; sense.info = lba;
 }
 
 static void reset(void) {
@@ -75,6 +82,7 @@ static void reset(void) {
     have_fail = false;
     total = 1000;
     ms_per_sector = 0;
+    memset(&drive_stats, 0, sizeof(drive_stats));
     now_ms += 100000;
     msc_rw_end();
 }
@@ -226,11 +234,61 @@ static void test_partial_read(void) {
     CHECK(msc_rw_read(0, 13, 0, buf, 512) == 512 && read_cmds == 1);
 }
 
+static void test_budget(void) {
+    reset();
+    bool f;
+    // 240 sectors (Linux's usual max) at 1 s a sector: 30 chunks of 8 s each.
+    // The first chunk always runs; no chunk starts after 20 s.
+    ms_per_sector = 1000;
+    uint32_t t0 = now_ms;
+    memset(data, 0xEE, sizeof(data));
+    static uint8_t big[240 * 512];
+    uint32_t n = scsi_read(100, 240 * 512, 512, big, &f);
+    CHECK(f && n == 24 * 512);          // chunks at 0, 8 and 16 s ran; the one at 24 s did not
+    CHECK(read_cmds == 3);
+    CHECK(sense.budget && sense.key == 3 && sense.asc == 0x11 && sense.ascq == 0x11 && sense.info == 124);
+    CHECK(drive_stats.budget_stops == 1);
+    CHECK(now_ms - t0 == 24000);
+    uint32_t v; memcpy(&v, big + 23 * 512, 4);
+    CHECK(v == 123);
+
+    // the next command (the host reading the rest) gets a fresh budget
+    read_cmds = 0;
+    n = scsi_read(124, 16 * 512, 512, NULL, &f);
+    CHECK(!f && n == 16 * 512 && read_cmds == 2);
+
+    // a fast drive never meets the budget
+    reset();
+    ms_per_sector = 2;
+    n = scsi_read(0, 240 * 512, 512, NULL, &f);
+    CHECK(!f && n == 240 * 512 && drive_stats.budget_stops == 0);
+
+    // a pending bad-sector failure is reported even after the budget ran out
+    reset();
+    bad[103] = 1;
+    ms_per_sector = 6000;               // 3 good sectors + the bad one: 24 s in one chunk
+    uint8_t buf[EP];
+    CHECK(msc_rw_read(0, 100, 0, buf, EP) == 3 * 512);
+    CHECK(msc_rw_read(0, 103, 0, buf, EP) == -1);
+    CHECK(sense.media && !sense.budget && sense.info == 103);
+    CHECK(read_cmds == 1 && drive_stats.budget_stops == 0);
+    msc_rw_end();
+
+    // writes: same budget, WRITE ERROR sense
+    reset();
+    ms_per_sector = 1000;
+    memset(big, 0x11, sizeof(big));
+    n = scsi_write(0, 240 * 512, big, &f);
+    CHECK(f && write_cmds == 3);
+    CHECK(sense.budget && sense.asc == 0x0C && sense.info == 24);
+}
+
 int main(void) {
     test_clean_read();
     test_malformed_cbw();
     test_bounds();
     test_partial_read();
+    test_budget();
     if (failures) { printf("%d failure(s)\n", failures); return 1; }
     printf("all msc_rw tests passed\n");
     return 0;
