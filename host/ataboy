@@ -439,6 +439,8 @@ class ATAboy:
         j = self._json("config_set", struct.pack(">B3xI", num, v))
         if key == "read_timeout_ms":
             self.ensure_kernel_timeout(v)
+        if key == "write_protect" and j.get("config") and self.info_dev:
+            self.rescan(wait_s=1.0)       # kernel re-reads the WP bit (sysfs ro)
         return j["config"]
 
     def save(self):
@@ -576,6 +578,196 @@ class ATAboy:
     def reboot(self, bootsel=False):
         return self._json("reboot", bytes([1 if bootsel else 0, 0, 0, 0]) + b"BOOT")
 
+    # -- multi-step operations (shared by the CLI and the MCP server) --------------
+
+    def scan(self, lba, count, timeout_ms=0, max_errors=0, time_budget_s=0, progress=None):
+        """READ VERIFY scan of [lba, lba+count).  Bad sectors are skipped one at a
+        time.  Returns a dict; 'next_lba' < end means the time budget ran out."""
+        end, cur, bad, t0, requests = lba + count, lba, [], time.time(), 0
+        while cur < end:
+            if time_budget_s and time.time() - t0 > time_budget_s:
+                break
+            r = self.verify(cur, end - cur, timeout_ms=timeout_ms)
+            requests += 1
+            cur += r.done
+            if r.result != "ok":
+                bad.append({"lba": cur, "status": r.status, "error": r.error,
+                            "error_bits": bits(r.error, ER_BITS), "ide_result": r.ide_result})
+                if progress:
+                    progress("bad LBA %d  st %02X err %02X[%s] %s" % (cur, r.status, r.error,
+                                                                    bits(r.error, ER_BITS), r.ide_result))
+                cur += 1
+                if max_errors and len(bad) >= max_errors:
+                    break
+        return {"result": "ok" if not bad else "errors", "start": lba, "count": count,
+                "scanned": cur - lba, "next_lba": cur if cur < end else None,
+                "complete": cur >= end, "bad": bad, "bad_lbas": [b["lba"] for b in bad],
+                "seconds": round(time.time() - t0, 1), "requests": requests}
+
+    def read_range(self, lba, count, out=None, image=False, no_retry=False, through_error=False,
+                   timeout_ms=0, keep_going=False, keep_data=False, time_budget_s=0):
+        """Read [lba, lba+count) through the API in max-size chunks with per-chunk
+        diagnostics.  out: file path written at (lba-start)*512, or at lba*512 when
+        image=True (in place).  After an error, continues sector by sector."""
+        maxn = self.info().get("max_read_sectors", 7)
+        end, cur, chunks, bad, ok_sectors, t0 = lba + count, lba, [], [], 0, time.time()
+        data = bytearray() if keep_data else None
+        f = None
+        if out:
+            f = open(out, "r+b" if image and os.path.exists(out) else "wb")
+        try:
+            while cur < end:
+                if time_budget_s and time.time() - t0 > time_budget_s:
+                    break
+                n = min(maxn, end - cur) if not bad else 1
+                r = self.read(cur, n, no_retry=no_retry, through_error=through_error, timeout_ms=timeout_ms)
+                got = r.done + (1 if r.err_data else 0)
+                if f and got:
+                    f.seek((cur if image else cur - lba) * 512)
+                    f.write(r.data[:got * 512])
+                if data is not None:
+                    data += r.data[:got * 512]
+                ok_sectors += r.done
+                chunks.append(r.to_dict())
+                if r.ok:
+                    cur += n
+                    continue
+                fl = r.fail_lba if r.fail_lba is not None else cur + r.done
+                bad.append(fl)
+                if not keep_going:
+                    cur = fl
+                    break
+                cur = max(fl + 1, cur + max(1, r.done))
+        finally:
+            if f:
+                f.close()
+        res = {"result": "ok" if not bad else "errors", "start": lba, "count": count,
+               "ok_sectors": ok_sectors, "bad_lbas": bad, "next_lba": cur if cur < end else None,
+               "seconds": round(time.time() - t0, 1),
+               "chunks": [c for c in chunks if c["result"] != "ok"] if len(chunks) > 20 else chunks}
+        if data is not None:
+            res["data"] = bytes(data)
+        return res
+
+    def read_long_vote(self, lba, votes=1, ecc_len=0, no_retry=False, timeout_ms=0):
+        """READ LONG 'votes' times and majority-vote every byte.  Returns
+        (payload_or_None, info_dict); payload is 512 data bytes + ECC."""
+        reads = []
+        for _ in range(max(1, votes)):
+            r = self.read_long(lba, ecc_len=ecc_len, no_retry=no_retry, timeout_ms=timeout_ms)
+            reads.append(r)
+            if not r.data:
+                break
+        last = reads[-1]
+        info = last.to_dict()
+        good = [r.data for r in reads if r.data]
+        if not good:
+            return None, info
+        n = len(good[0])
+        voted, unstable = bytearray(n), 0
+        for i in range(n):
+            col = [d[i] for d in good]
+            best = max(set(col), key=col.count)
+            voted[i] = best
+            unstable += len(set(col)) > 1
+        info["vote"] = {"reads": len(good), "unstable_bytes": unstable}
+        info["ecc_hex"] = bytes(voted[512:]).hex()
+        return bytes(voted), info
+
+    def rescue(self, image, mapfile, timeout_ms=15000, votes=5, readlong=True,
+               no_retry_pass=True, max_sectors=0, time_budget_s=0, progress=None):
+        """Targeted recovery after ddrescue: retry only the sectors the mapfile
+        marks non-finished, gentlest first, writing recovered data into the image
+        and updating the mapfile.  READ LONG results go into the image but stay
+        marked bad in the map; they are listed in IMAGE.readlong.json."""
+        m = Mapfile.load(mapfile)
+        targets = m.bad_sectors(max_sectors)
+        t0 = time.time()
+        rec = {"result": "ok", "image": image, "mapfile": mapfile, "candidates": len(targets),
+               "recovered_no_retry": [], "recovered_retry": [], "readlong": [], "still_bad": [],
+               "complete": True}
+        say = progress or (lambda s: None)
+
+        def budget_left():
+            return not time_budget_s or time.time() - t0 < time_budget_s
+
+        with open(image, "r+b") as img:
+            def put(lba, data):
+                img.seek(lba * 512)
+                img.write(data[:512])
+
+            remaining = list(targets)
+            # Pass 1: no drive retries, single sectors (fast fail, gentle)
+            if no_retry_pass:
+                nxt = []
+                for lba in remaining:
+                    if not budget_left():
+                        nxt.append(lba)
+                        continue
+                    r = self.read(lba, 1, no_retry=True, timeout_ms=min(timeout_ms, 5000))
+                    if r.ok:
+                        put(lba, r.data)
+                        m.mark(lba, 1, "+")
+                        rec["recovered_no_retry"].append(lba)
+                        say("LBA %d recovered (no-retry pass)" % lba)
+                    else:
+                        nxt.append(lba)
+                remaining = nxt
+                m.save()
+            # Pass 2: drive retries, long timeout
+            nxt = []
+            for lba in remaining:
+                if not budget_left():
+                    nxt.append(lba)
+                    continue
+                r = self.read(lba, 1, timeout_ms=timeout_ms)
+                if r.ok:
+                    put(lba, r.data)
+                    m.mark(lba, 1, "+")
+                    rec["recovered_retry"].append(lba)
+                    say("LBA %d recovered with drive retries (%.0f ms)" % (lba, r.elapsed_us / 1000))
+                else:
+                    nxt.append(lba)
+            remaining = nxt
+            m.save()
+            # Pass 3: READ LONG majority vote (data without ECC correction)
+            sidecar_path = image + ".readlong.json"
+            sidecar = {}
+            if readlong and remaining:
+                if os.path.exists(sidecar_path):
+                    with open(sidecar_path) as sf:
+                        sidecar = json.load(sf)
+                nxt = []
+                for lba in remaining:
+                    if not budget_left():
+                        nxt.append(lba)
+                        continue
+                    payload, info = self.read_long_vote(lba, votes=votes, timeout_ms=timeout_ms)
+                    if payload is None:
+                        nxt.append(lba)
+                        continue
+                    put(lba, payload)
+                    entry = {"lba": lba, "ecc_hex": info["ecc_hex"], "votes": info["vote"]["reads"],
+                             "unstable_bytes": info["vote"]["unstable_bytes"],
+                             "status": info["status"], "error_bits": info["error_bits"]}
+                    sidecar[str(lba)] = entry
+                    rec["readlong"].append(entry)
+                    nxt.append(lba)          # still bad in the map: data is unverified
+                    say("LBA %d: READ LONG data written (%d unstable bytes over %d reads)"
+                        % (lba, entry["unstable_bytes"], entry["votes"]))
+                with open(sidecar_path, "w") as sf:
+                    json.dump(sidecar, sf, indent=1, sort_keys=True)
+                rec["readlong_sidecar"] = sidecar_path
+                remaining = nxt
+        rec["still_bad"] = remaining
+        rec["complete"] = budget_left()
+        rec["recovered"] = len(rec["recovered_no_retry"]) + len(rec["recovered_retry"])
+        rec["seconds"] = round(time.time() - t0, 1)
+        if remaining:
+            rec["result"] = "partial"
+        m.save()
+        return rec
+
     # -- raw ATA pass-through (SAT ATA PASS-THROUGH 16) ----------------------------
 
     def ata(self, command, feature=0, count=0, lba=0, device=0, ext=False,
@@ -619,6 +811,83 @@ class ATAboy:
             out["ok"] = e.key == 1           # RECOVERED ERROR = ck_cond report on success
         out["data"] = data
         return out
+
+
+class Mapfile:
+    """GNU ddrescue mapfile (byte positions, hex).  Status: '?' non-tried,
+    '*' non-trimmed, '/' non-scraped, '-' bad, '+' finished."""
+
+    def __init__(self, path, header, cur_line, blocks):
+        self.path, self.header, self.cur_line, self.blocks = path, header, cur_line, blocks
+
+    @classmethod
+    def load(cls, path):
+        header, cur_line, blocks = [], None, []
+        with open(path) as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    if not blocks and cur_line is None:
+                        header.append(line.rstrip("\n"))
+                    continue
+                parts = s.split()
+                if cur_line is None:
+                    cur_line = line.rstrip("\n")
+                    continue
+                blocks.append([int(parts[0], 0), int(parts[1], 0), parts[2]])
+        if cur_line is None:
+            raise ValueError("%s: not a ddrescue mapfile" % path)
+        return cls(path, header, cur_line, blocks)
+
+    def bad_sectors(self, limit=0):
+        out = []
+        for pos, size, st in self.blocks:
+            if st == "+":
+                continue
+            for lba in range(pos // 512, (pos + size + 511) // 512):
+                out.append(lba)
+                if limit and len(out) >= limit:
+                    return out
+        return out
+
+    def mark(self, lba, n, status):
+        a, b = lba * 512, (lba + n) * 512
+        new = []
+        for pos, size, st in self.blocks:
+            end = pos + size
+            if end <= a or pos >= b:
+                new.append([pos, size, st])
+                continue
+            if pos < a:
+                new.append([pos, a - pos, st])
+            lo, hi = max(pos, a), min(end, b)
+            new.append([lo, hi - lo, status])
+            if end > b:
+                new.append([b, end - b, st])
+        merged = []
+        for blk in new:
+            if merged and merged[-1][2] == blk[2] and merged[-1][0] + merged[-1][1] == blk[0]:
+                merged[-1][1] += blk[1]
+            else:
+                merged.append(blk)
+        self.blocks = merged
+
+    def summary(self):
+        tot = {}
+        for _, size, st in self.blocks:
+            tot[st] = tot.get(st, 0) + size
+        return tot
+
+    def save(self):
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            for h in self.header:
+                f.write(h + "\n")
+            f.write(self.cur_line + "\n")
+            f.write("#      pos        size  status\n")
+            for pos, size, st in self.blocks:
+                f.write("0x%08X  0x%08X  %s\n" % (pos, size, st))
+        os.replace(tmp, self.path)
 
 
 def parse_ata_return(sense):
@@ -818,66 +1087,23 @@ def cmd_taskfile(args, dev):
 
 def cmd_read(args, dev):
     """Read a range in chunks; per-chunk diagnostics; optional output / image patching."""
-    maxn = dev.info().get("max_read_sectors", 7)
-    lba, end = args.lba, args.lba + args.count
-    results, bad, ok_sectors = [], [], 0
-    out = open(args.out, "r+b" if os.path.exists(args.out) and args.image else "wb") if args.out else None
-    status = EXIT_OK
-    try:
-        while lba < end:
-            n = min(maxn, end - lba) if not bad or args.chunk_after_error == 0 else 1
-            r = dev.read(lba, n, no_retry=args.no_retry, through_error=args.through_error,
-                         timeout_ms=args.timeout)
-            got = r.done + (1 if r.err_data else 0)
-            if out and got:
-                out.seek(((lba if args.image else lba - args.lba)) * 512)
-                out.write(r.data[:got * 512])
-            ok_sectors += r.done
-            results.append(r.to_dict(with_data=args.hex and not out))
-            if not r.ok:
-                status = EXIT_DEVICE
-                fl = r.fail_lba if r.fail_lba is not None else lba + r.done
-                bad.append(fl)
-                if not args.keep_going:
-                    break
-                lba = max(fl + 1, lba + max(1, r.done))
-            else:
-                lba += n
-            if args.hexdump and not args.json and got:
-                _hexdump(r.data[:got * 512], (lba - got) * 512)
-    finally:
-        if out:
-            out.close()
-    summary = {"result": "ok" if not bad else "errors", "start": args.lba, "count": args.count,
-               "ok_sectors": ok_sectors, "bad_lbas": bad, "chunks": results}
-    _emit(args, summary, lambda s: ([human_ata_result(c) for c in s["chunks"] if c["result"] != "ok" or args.verbose],
-                                    print("read %d sectors from LBA %d: %d ok, %d bad%s" % (
-                                        s["count"], s["start"], s["ok_sectors"], len(s["bad_lbas"]),
-                                        (" " + str(s["bad_lbas"][:20])) if s["bad_lbas"] else ""))))
-    return status
+    res = dev.read_range(args.lba, args.count, out=args.out, image=args.image, no_retry=args.no_retry,
+                         through_error=args.through_error, timeout_ms=args.timeout,
+                         keep_going=args.keep_going, keep_data=args.hex or args.hexdump)
+    data = res.pop("data", b"")
+    if args.hex:
+        res["data_hex"] = data.hex()
+    _emit(args, res, lambda s: ([human_ata_result(c) for c in s["chunks"] if c["result"] != "ok" or args.verbose],
+                                print("read %d sectors from LBA %d: %d ok, %d bad%s" % (
+                                    s["count"], s["start"], s["ok_sectors"], len(s["bad_lbas"]),
+                                    (" " + str(s["bad_lbas"][:20])) if s["bad_lbas"] else "")),
+                                args.hexdump and _hexdump(data, args.lba * 512)))
+    return EXIT_OK if res["result"] == "ok" else EXIT_DEVICE
 
 
 def cmd_readlong(args, dev):
-    reads = []
-    for _ in range(max(1, args.vote)):
-        r = dev.read_long(args.lba, ecc_len=args.ecc, no_retry=args.no_retry, timeout_ms=args.timeout)
-        reads.append(r)
-        if not r.data:
-            break
-    last = reads[-1]
-    out = last.to_dict()
-    payload = last.data
-    if args.vote > 1 and all(r.data for r in reads):
-        n = len(reads[0].data)
-        voted = bytearray(n)
-        unstable = 0
-        for i in range(n):
-            col = [r.data[i] for r in reads]
-            best = max(set(col), key=col.count)
-            voted[i] = best
-            unstable += len(set(col)) > 1
-        payload = bytes(voted)
-        out["vote"] = {"reads": len(reads), "unstable_bytes": unstable}
+    payload, out = dev.read_long_vote(args.lba, votes=args.vote, ecc_len=args.ecc,
+                                      no_retry=args.no_retry, timeout_ms=args.timeout)
     if payload:
         out["ecc_hex"] = payload[512:].hex()
         if args.out:
@@ -891,34 +1117,32 @@ def cmd_readlong(args, dev):
             out["patched_image"] = args.image
     _emit(args, out, lambda o: (human_ata_result(o), print("ECC bytes: %s%s" % (o.get("ecc_hex", "-"),
           ("  vote: %d reads, %d unstable bytes" % (o["vote"]["reads"], o["vote"]["unstable_bytes"])) if "vote" in o else ""))))
-    return EXIT_OK if last.data else EXIT_DEVICE
+    return EXIT_OK if payload else EXIT_DEVICE
 
 
 def cmd_verify(args, dev):
-    lba, end = args.lba, args.lba + args.count
-    bad, t0, requests = [], time.time(), 0
-    while lba < end:
-        r = dev.verify(lba, end - lba, timeout_ms=args.timeout)
-        requests += 1
-        lba += r.done
-        if r.result == "ok" and not r.partial and lba >= end:
-            break
-        if r.result != "ok":
-            bad.append({"lba": lba, "status": r.status, "error": r.error, "error_bits": bits(r.error, ER_BITS),
-                        "ide_result": r.ide_result})
-            if not args.json:
-                print("bad LBA %d  st %02X err %02X[%s] %s" % (lba, r.status, r.error, bits(r.error, ER_BITS), r.ide_result),
-                      flush=True)
-            lba += 1
-            if args.max_errors and len(bad) >= args.max_errors:
-                break
-        if not args.json and args.progress:
-            print("  ... %d / %d" % (lba - args.lba, args.count), file=sys.stderr, flush=True)
-    out = {"result": "ok" if not bad else "errors", "start": args.lba, "count": args.count,
-           "scanned": lba - args.lba, "bad": bad, "seconds": round(time.time() - t0, 1), "requests": requests}
-    _emit(args, out, lambda o: print("verified %d sectors from LBA %d in %.1f s: %d bad" % (
-        o["scanned"], o["start"], o["seconds"], len(o["bad"]))))
-    return EXIT_OK if not bad else EXIT_DEVICE
+    prog = None if args.json else (lambda s: print(s, flush=True))
+    out = dev.scan(args.lba, args.count, timeout_ms=args.timeout, max_errors=args.max_errors,
+                   time_budget_s=args.budget, progress=prog)
+    _emit(args, out, lambda o: print("verified %d sectors from LBA %d in %.1f s: %d bad%s" % (
+        o["scanned"], o["start"], o["seconds"], len(o["bad"]),
+        "" if o["complete"] else " (stopped early; resume at LBA %s)" % o["next_lba"])))
+    return EXIT_OK if not out["bad"] else EXIT_DEVICE
+
+
+def cmd_rescue(args, dev):
+    prog = None if args.json else (lambda s: print(s, flush=True))
+    before = Mapfile.load(args.mapfile).summary()
+    out = dev.rescue(args.image, args.mapfile, timeout_ms=args.timeout, votes=args.vote,
+                     readlong=not args.no_readlong, no_retry_pass=not args.no_fast_pass,
+                     max_sectors=args.max_sectors, time_budget_s=args.budget, progress=prog)
+    out["map_before"] = before
+    out["map_after"] = Mapfile.load(args.mapfile).summary()
+    _emit(args, out, lambda o: print("rescue: %d candidate sectors, %d recovered (%d fast, %d with retries), "
+                                     "%d READ LONG, %d still bad%s" % (
+        o["candidates"], o["recovered"], len(o["recovered_no_retry"]), len(o["recovered_retry"]),
+        len(o["readlong"]), len(o["still_bad"]), "" if o["complete"] else " (time budget ran out)")))
+    return EXIT_OK if not out["still_bad"] else EXIT_DEVICE
 
 
 def cmd_log(args, dev):
@@ -1081,7 +1305,17 @@ def build_parser():
     x.add_argument("count", type=_int)
     x.add_argument("--timeout", type=int, default=0, help="per-command timeout ms")
     x.add_argument("--max-errors", type=int, default=0)
-    x.add_argument("--progress", action="store_true")
+    x.add_argument("--budget", type=float, default=0, help="stop after N seconds (resume at next_lba)")
+    x = add("rescue", cmd_rescue, "after ddrescue: retry only the mapfile's bad sectors (no-retry pass, "
+                                  "drive retries, READ LONG vote), patch the image, update the map")
+    x.add_argument("image", help="ddrescue output image (written in place)")
+    x.add_argument("mapfile", help="ddrescue mapfile (updated in place)")
+    x.add_argument("--timeout", type=int, default=15000, help="per-sector timeout for the retry pass (ms)")
+    x.add_argument("--vote", type=int, default=5, help="READ LONG reads per sector")
+    x.add_argument("--no-readlong", action="store_true", help="skip the READ LONG pass")
+    x.add_argument("--no-fast-pass", action="store_true", help="skip the no-retry pass")
+    x.add_argument("--max-sectors", type=int, default=0, help="only the first N bad sectors")
+    x.add_argument("--budget", type=float, default=0, help="stop after N seconds")
     x = add("log", cmd_log, "error log: every failed command with ATA status/error/registers")
     x.add_argument("--clear", action="store_true", help="clear after reading")
     x = add("clear", cmd_clear, "clear the error log (and/or statistics)")

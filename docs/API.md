@@ -30,6 +30,7 @@ ataboy -j read 19969 --through-error --out sector.bin
 ataboy readlong 19969 --vote 5 --image disk.img
 ataboy verify 0 336260              # drive-internal READ VERIFY scan, lists bad LBAs
 ataboy log                          # every failed command with ATA status/error/registers
+ataboy rescue disk.img disk.map     # after ddrescue: retry just the bad sectors, patch image + map
 smartctl -d sat -a /dev/sdX         # standard tools via SAT pass-through
 ataboy reboot --bootsel             # UF2 bootloader for a firmware update
 ```
