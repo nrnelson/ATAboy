@@ -103,6 +103,7 @@ uint8_t  drive_ecc_len(void);                       // effective READ LONG ECC l
 
 int      drive_detect(uint8_t only_dev, uint8_t geo_mode, uint16_t c, uint8_t h, uint8_t s, uint8_t flags);
 int      drive_apply_geometry(uint8_t mode, uint16_t c, uint8_t h, uint8_t s);
+void     drive_clear_geometry(void);
 int      drive_mount(void);
 int      drive_unmount(void);
 

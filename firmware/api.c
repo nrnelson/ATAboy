@@ -473,7 +473,7 @@ static int32_t op_detect(uint8_t *buf, uint32_t cap, const uint8_t *a) {
     else if (r == R_NO_DRIVE) msg = "no device answered on the selected position(s)";
     else if (r == R_IDENTIFY_FAILED) msg = "device present but IDENTIFY failed; retry, or use force with manual geometry";
     else if (r == R_UNSUPPORTED) msg = "drive does not support LBA";
-    else if (r == R_BAD_ARG) msg = "invalid manual geometry (heads 1..16, cyls/spt > 0)";
+    else if (r == R_BAD_ARG) msg = "invalid manual geometry (cyls 1..65535, heads 1..16, spt 1..63)";
     return reply_status(buf, cap, r, msg);
 }
 

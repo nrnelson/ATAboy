@@ -128,7 +128,7 @@ before parsing.
 | 04 | CONFIG_SAVE | — | JSON config; writes flash |
 | 05 | CONFIG_DEFAULTS | — | JSON config (not saved; refused while mounted) |
 | 10 | DETECT | [4] device 0 auto / 1 master / 2 slave · [5] geometry 0 auto / 1 normal / 2 large / 3 lba / 4 manual / 5 keep · [6-7] cyls · [8] heads · [9] spt · [10] flags: bit0 skip probe, bit1 mount, bit2 force | JSON status |
-| 11 | GEOMETRY | [5] mode 1 normal / 2 large / 3 lba / 4 manual · [6-7] cyls · [8] heads · [9] spt | JSON status |
+| 11 | GEOMETRY | [5] mode 1 normal / 2 large / 3 lba / 4 manual · [6-7] cyls · [8] heads · [9] spt (manual: 1..65535 / 1..16 / 1..63) | JSON status |
 | 12 | MOUNT | — | JSON status |
 | 13 | UNMOUNT | — | JSON status |
 | 14 | RESET | [4] 0 soft (SRST) / 1 hard (RESET line, recalibrate) | JSON status |

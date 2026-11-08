@@ -119,6 +119,7 @@ int drive_apply_geometry(uint8_t mode, uint16_t c, uint8_t h, uint8_t s) {
         break;
     }
     case GEO_MANUAL:
+        if (!config_chs_valid(c, h, s)) return R_BAD_ARG;
         break;
     default:
         return R_BAD_ARG;
@@ -136,6 +137,17 @@ int drive_apply_geometry(uint8_t mode, uint16_t c, uint8_t h, uint8_t s) {
     if (!lba) ide_set_geometry(h, s);   // INITIALIZE DEVICE PARAMETERS
     ide_unlock();
     return R_OK;
+}
+
+void drive_clear_geometry(void) {
+    ide_lock();
+    config.use_lba_mode = false;
+    config.lba_sectors = 0;
+    config.cyls = 0;
+    config.heads = 0;
+    config.spt = 0;
+    config.geo_mode = GEO_NONE;
+    ide_unlock();
 }
 
 int drive_detect(uint8_t only_dev, uint8_t geo_mode, uint16_t c, uint8_t h, uint8_t s, uint8_t flags) {

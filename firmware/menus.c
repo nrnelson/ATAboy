@@ -106,6 +106,7 @@ static bool     use_lba_mode = false;
 static uint32_t seen_api_gen = 0;      // drive.api_gen the menu last synced to
 static bool show_detect_result = false;
 static bool force_detect = false;
+static bool error_is_notice = false;   // error box is informational: dismissing it changes nothing
 static int  confirm_type = 0;
 
 #define RESET       "\033[0m"
@@ -504,7 +505,7 @@ static void draw_error_box(const char *error_msg, bool show_force) {
 //  Geometry selection overlay — 64 wide, 14 tall
 // ---------------------------------------------------------------------------
 
-static void draw_selection_menu_ex(uint16_t *id, int selected_idx, bool force_mode) {
+static void draw_selection_menu_ex(const uint16_t *id, int selected_idx, bool force_mode, const char *note) {
     int box_w = 64, start_col = 9, start_row = 5;
 
     uint16_t n_cyl = id[1];
@@ -601,7 +602,10 @@ static void draw_selection_menu_ex(uint16_t *id, int selected_idx, bool force_mo
     cdc_puts(BOX_MLD); emit_n(BOX_HH, 62); cdc_puts(BOX_MRD);
 
     cdc_printf("\033[%d;%dH" BOX_VH "  " BOX_ARRU " " BOX_ARRD ": Mode    TAB: Change CHS     Enter: Select    Esc: Quit " BOX_VH, start_row+11, start_col);
-    cdc_printf("\033[%d;%dH" BOX_VH "  \033[33m   LBA Recommended for modern drives; NORMAL for legacy.    \033[0m" SEL_RED BOX_VH, start_row+12, start_col);
+    if (note && note[0])
+        cdc_printf("\033[%d;%dH" BOX_VH "\033[93;1m%-62.62s\033[0m" SEL_RED BOX_VH, start_row+12, start_col, note);
+    else
+        cdc_printf("\033[%d;%dH" BOX_VH "  \033[33m   LBA Recommended for modern drives; NORMAL for legacy.    \033[0m" SEL_RED BOX_VH, start_row+12, start_col);
 
     // Row 13: bottom
     cdc_printf("\033[%d;%dH", start_row+13, start_col);
@@ -611,8 +615,91 @@ static void draw_selection_menu_ex(uint16_t *id, int selected_idx, bool force_mo
     cdc_flush();
 }
 
-static void draw_selection_menu(uint16_t *id, int selected_idx) {
-    draw_selection_menu_ex(id, selected_idx, false);
+// ---------------------------------------------------------------------------
+//  Geometry picker + manual CHS entry (Auto Detect and F: Force)
+// ---------------------------------------------------------------------------
+
+#define PICK_ROW 14                       // MANUAL row of the selection box
+static const int chs_col[3]    = {9+26, 9+38, 9+48};
+static const int chs_digits[3] = {5, 2, 2};
+
+static bool api_took_over(void) {
+    return drive.api_gen != seen_api_gen || is_mounted;
+}
+
+// Ask for C/H/S on the MANUAL row.  Returns 1 with valid values in *c/*h/*s,
+// 0 when aborted (Esc, or the API took over): nothing is applied either way.
+// An out-of-range value leaves a message in 'note' and returns -1.
+static int manual_chs_entry(uint16_t *c, uint8_t *h, uint8_t *s, char *note, size_t note_len) {
+    long mf[3] = {detect_cyls, detect_heads, detect_spt};
+    for (int f = 0; f < 3; f++) {
+        char ib[8] = {0};
+        int p = 0;
+        draw_at(chs_col[f], PICK_ROW, "\033[103;30m     \033[0m");
+        cdc_printf("\033[103;30m\033[%d;%dH", PICK_ROW, chs_col[f]);
+        while (true) {
+            int k = get_input();
+            if (api_took_over()) return 0;
+            if (k == -1) { tight_loop_contents(); continue; }
+            if (k >= '0' && k <= '9' && p < chs_digits[f]) { ib[p++] = (char)k; cdc_putchar((char)k); }
+            else if ((k == 8 || k == 127) && p > 0) { p--; cdc_printf("\b \b\033[%d;%dH", PICK_ROW, chs_col[f] + p); }
+            else if (k == KEY_ENTER || k == '\t') {
+                if (p > 0) mf[f] = atol(ib);
+                draw_at(chs_col[f], PICK_ROW, RESET SEL_RED);
+                cdc_printf("%-5ld", mf[f]);
+                break;
+            }
+            else if (k == KEY_ESC) { cdc_puts(RESET); return 0; }
+        }
+    }
+    cdc_puts(RESET);
+    if (mf[0] < 1 || mf[0] > 65535) { snprintf(note, note_len, "  Cylinders must be 1..65535"); return -1; }
+    if (mf[1] < 1 || mf[1] > 16)    { snprintf(note, note_len, "  Heads must be 1..16"); return -1; }
+    if (mf[2] < 1 || mf[2] > 63)    { snprintf(note, note_len, "  Sectors per track must be 1..63"); return -1; }
+    detect_cyls = (uint16_t)mf[0]; detect_heads = (uint8_t)mf[1]; detect_spt = (uint8_t)mf[2];
+    *c = detect_cyls; *h = detect_heads; *s = detect_spt;
+    return 1;
+}
+
+// Geometry selection for the drive in drive.id[] (force_mode: no IDENTIFY
+// data, MANUAL only).  Returns true once a geometry has been applied.
+static bool run_geometry_picker(const uint16_t *id, bool force_mode) {
+    bool ls = !force_mode && (id[49] & 0x0200);
+    int geo_idx = force_mode ? 3 : (ls ? 2 : 0);
+    bool sd = true;
+    char note[64] = "";
+
+    while (true) {
+        if (sd) { draw_selection_menu_ex(id, geo_idx, force_mode, note); sd = false; }
+        int ch = get_input();
+        if (api_took_over()) return false;
+        if (ch == -1) { tight_loop_contents(); continue; }
+
+        if (!force_mode && ch == KEY_UP && geo_idx > 0)   { geo_idx--; if (!ls && geo_idx == 2) geo_idx--; sd = true; }
+        else if (!force_mode && ch == KEY_DOWN && geo_idx < 3) { geo_idx++; if (!ls && geo_idx == 2) geo_idx++; sd = true; }
+        else if (ch == KEY_ESC) return false;
+        else if (ch == '\t' || (ch == KEY_ENTER && geo_idx == 3)) {
+            geo_idx = 3;
+            note[0] = '\0';
+            draw_selection_menu_ex(id, geo_idx, force_mode, note);
+            uint16_t c; uint8_t h, sp;
+            int m = manual_chs_entry(&c, &h, &sp, note, sizeof(note));
+            if (api_took_over()) return false;
+            if (m == 1) {
+                int r = drive_apply_geometry(GEO_MANUAL, c, h, sp);
+                if (r == R_OK) return true;
+                snprintf(note, sizeof(note), "  Geometry rejected (error %d)", r);
+            }
+            sd = true;
+        } else if (ch == KEY_ENTER) {
+            uint8_t mode = geo_idx == 0 ? GEO_NORMAL : geo_idx == 1 ? GEO_LARGE : GEO_LBA;
+            int r = drive_apply_geometry(mode, 0, 0, 0);
+            if (r == R_OK) return true;
+            snprintf(note, sizeof(note), r == R_UNSUPPORTED ? "  Not supported by this drive"
+                                                            : "  Not usable here (needs 1..16 heads); try MANUAL");
+            sd = true;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -847,6 +934,7 @@ void core1_entry(void) {
         // Defaults are already in effect (no geometry, nothing to mount): just say so.
         strcpy(hdd_status_text, "\033[91;1mSaved settings corrupt - defaults loaded");
         show_detect_result = true;
+        error_is_notice = true;
         force_detect = false;
     }
     try_auto_mount();
@@ -911,55 +999,23 @@ void core1_entry(void) {
 
         if (show_detect_result) {
             if (k == KEY_ENTER || k == KEY_ESC) {
-                show_detect_result = false; hdd_status_text[0] = '\0'; hdd_model_raw[0] = '\0';
-                cur_cyls = 0; cur_heads = 0; cur_spt = 0;
-                total_lba_sectors = 0; use_lba_mode = false; is_mounted = false;
-                sync_to_config(); needs_full_redraw = true;
+                show_detect_result = false; hdd_status_text[0] = '\0';
+                if (!error_is_notice) {
+                    // A failed detect leaves no usable drive: forget the geometry too.
+                    hdd_model_raw[0] = '\0';
+                    drive_unmount();                     // flags the media change if it was mounted
+                    drive_clear_geometry();
+                    sync_from_config();
+                }
+                error_is_notice = false;
+                needs_full_redraw = true;
             } else if (force_detect && (k == 'f' || k == 'F')) {
                 show_detect_result = false; hdd_status_text[0] = '\0';
                 force_detect = false;
                 strcpy(hdd_model_raw, "Manually Forced Drive");
                 drive_note_forced();
-
-                // Force geometry — manual entry only, no IDENTIFY data
-                uint16_t dummy_id[256];
-                memset(dummy_id, 0, sizeof(dummy_id));
-                int geo_idx = 3;
-                bool waiting = true, sd = true;
-
-                while (waiting) {
-                    if (sd) { draw_selection_menu_ex(dummy_id, geo_idx, true); sd = false; }
-                    int ch = get_input();
-                    if (drive.api_gen != seen_api_gen || is_mounted) { waiting = false; break; }   // API took over
-                    if (ch == -1) { tight_loop_contents(); continue; }
-                    if (ch == KEY_ESC) { waiting = false; }
-                    else if (ch == '\t' || ch == KEY_ENTER) {
-                        geo_idx = 3; draw_selection_menu_ex(dummy_id, geo_idx, true);
-                        int mf[3] = {detect_cyls, detect_heads, detect_spt};
-                        int mc[3] = {9+26, 9+38, 9+48};
-                        for (int f = 0; f < 3; f++) {
-                            char ib[7] = {0}; int p = 0;
-                            draw_at(mc[f], 14, "\033[103;30m     \033[0m");
-                            cdc_printf("\033[%d;%dH", 14, mc[f]);
-                            while (true) {
-                                int c = get_input();
-                                if (c >= '0' && c <= '9' && p < 5) { ib[p++] = (char)c; cdc_putchar(c); }
-                                else if ((c == 8 || c == 127) && p > 0) { p--; cdc_printf("\b \b\033[%d;%dH", 14, mc[f]+p); }
-                                else if (c == KEY_ENTER || c == '\t') { ib[p] = '\0'; if (p > 0) mf[f] = atoi(ib); draw_at(mc[f], 14, RESET "\033[41;37;1m"); cdc_printf("%-5d", mf[f]); break; }
-                                else if (c == KEY_ESC) { f = 3; break; }
-                                tight_loop_contents();
-                            }
-                        }
-                        detect_cyls = (uint16_t)mf[0]; detect_heads = (uint8_t)mf[1]; detect_spt = (uint8_t)mf[2];
-                        if (detect_cyls > 0 && detect_heads > 0 && detect_spt > 0) {
-                            use_lba_mode = false;
-                            cur_cyls = detect_cyls; cur_heads = detect_heads; cur_spt = detect_spt;
-                            ide_set_geometry(cur_heads, cur_spt);
-                            config.geo_mode = GEO_MANUAL;
-                            sync_to_config(); waiting = false;
-                        } else { sd = true; }
-                    }
-                }
+                // Manual entry only, no IDENTIFY data
+                if (run_geometry_picker(drive.id, true)) sync_from_config();
                 needs_full_redraw = true;
             }
             continue;
@@ -1031,68 +1087,11 @@ void core1_entry(void) {
                     if (detected) drive_note_identify(id_buf); else drive_clear_identity();
                     if (!detected) ide_select_device(config.dev_base);
                     if (detected) {
-                            for (int i = 0; i < 20; i++) {
-                                uint16_t val = id_buf[27+i];
-                                hdd_model_raw[i*2] = (char)(val>>8); hdd_model_raw[i*2+1] = (char)(val&0xFF);
-                            }
-                            hdd_model_raw[40] = '\0'; sanitize_identify_model(hdd_model_raw);
-
-                            bool ls = (id_buf[49] & 0x0200);
-                            int geo_idx = ls ? 2 : 0;
-                            bool waiting = true, sd = true;
-
-                            while (waiting) {
-                                if (sd) { draw_selection_menu(id_buf, geo_idx); sd = false; }
-                                int ch = get_input();
-                                if (drive.api_gen != seen_api_gen || is_mounted) { waiting = false; break; }   // API took over
-                                if (ch == -1) { tight_loop_contents(); continue; }
-
-                                if (ch == KEY_UP && geo_idx > 0) { geo_idx--; if (!ls && geo_idx == 2) geo_idx--; sd = true; }
-                                else if (ch == KEY_DOWN && geo_idx < 3) { geo_idx++; if (!ls && geo_idx == 2) geo_idx++; sd = true; }
-                                else if (ch == KEY_ESC) { waiting = false; }
-                                else if (ch == '\t' || (ch == KEY_ENTER && geo_idx == 3)) {
-                                    geo_idx = 3; draw_selection_menu(id_buf, geo_idx);
-                                    int mf[3] = {detect_cyls, detect_heads, detect_spt};
-                                    int mc[3] = {9+26, 9+38, 9+48};
-                                    for (int f = 0; f < 3; f++) {
-                                        char ib[7] = {0}; int p = 0;
-                                        draw_at(mc[f], 14, "\033[103;30m     \033[0m");
-                                        cdc_printf("\033[%d;%dH", 14, mc[f]);
-                                        while (true) {
-                                            int c = get_input();
-                                            if (c >= '0' && c <= '9' && p < 5) { ib[p++] = (char)c; cdc_putchar(c); }
-                                            else if ((c == 8 || c == 127) && p > 0) { p--; cdc_printf("\b \b\033[%d;%dH", 14, mc[f]+p); }
-                                            else if (c == KEY_ENTER || c == '\t') { ib[p] = '\0'; if (p > 0) mf[f] = atoi(ib); draw_at(mc[f], 14, RESET "\033[41;37;1m"); cdc_printf("%-5d", mf[f]); break; }
-                                            else if (c == KEY_ESC) { f = 3; break; }
-                                            tight_loop_contents();
-                                        }
-                                    }
-                                    detect_cyls = (uint16_t)mf[0]; detect_heads = (uint8_t)mf[1]; detect_spt = (uint8_t)mf[2];
-                                    if (detect_cyls > 0 && detect_heads > 0 && detect_spt > 0) {
-                                        use_lba_mode = false;
-                                        cur_cyls = detect_cyls; cur_heads = detect_heads; cur_spt = detect_spt;
-                                        ide_set_geometry(cur_heads, cur_spt);
-                                        config.geo_mode = GEO_MANUAL;
-                                        sync_to_config(); waiting = false;
-                                    } else { sd = true; }
-                                } else if (ch == KEY_ENTER) {
-                                    bool valid = false;
-                                    if (geo_idx == 0) { use_lba_mode = false; cur_cyls = id_buf[1]; cur_heads = (uint8_t)id_buf[3]; cur_spt = (uint8_t)id_buf[6]; valid = true; }
-                                    else if (geo_idx == 1) { use_lba_mode = false; get_large_geometry(id_buf[1],(uint8_t)id_buf[3],(uint8_t)id_buf[6],&cur_cyls,&cur_heads); cur_spt = (uint8_t)id_buf[6]; valid = true; }
-                                    else if (geo_idx == 2 && ls) {
-                                        use_lba_mode = true; cur_cyls = id_buf[1]; cur_heads = (uint8_t)id_buf[3]; cur_spt = (uint8_t)id_buf[6];
-                                        uint64_t l48 = ((uint64_t)id_buf[103]<<48)|((uint64_t)id_buf[102]<<32)|((uint64_t)id_buf[101]<<16)|((uint64_t)id_buf[100]);
-                                        total_lba_sectors = l48; if (!total_lba_sectors) total_lba_sectors = id_buf[60]|((uint32_t)id_buf[61]<<16);
-                                        valid = true;
-                                    }
-
-                                    if (valid) {
-                                        config.geo_mode = geo_idx == 0 ? GEO_NORMAL : geo_idx == 1 ? GEO_LARGE : GEO_LBA;
-                                        if (!use_lba_mode) ide_set_geometry(cur_heads, cur_spt);
-                                        sync_to_config(); waiting = false;
-                                    }
-                                }
-                            }
+                        strncpy(hdd_model_raw, drive.model, sizeof(hdd_model_raw) - 1);
+                        hdd_model_raw[sizeof(hdd_model_raw) - 1] = '\0';
+                        if (!run_geometry_picker(id_buf, false) && !config.use_lba_mode && config.heads && config.spt)
+                            ide_set_geometry(config.heads, config.spt);   // kept: the probe's reset cleared INIT PARAMS
+                        sync_from_config();
                     } else {
                         if (found) {
                             strcpy(hdd_status_text, "\033[91;1mIDENTIFY failed");
