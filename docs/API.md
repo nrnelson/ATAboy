@@ -316,6 +316,14 @@ Every pass-through command is classified (`firmware/ata_policy.c`):
   whose data length is not 512 × the CDB's block count (TinyUSB derives the
   block size from it) fails with ILLEGAL REQUEST 24h/00h instead of being
   served as partial sectors.
+- Only real sectors are returned. A READ(10) or WRITE(10) that starts at or
+  beyond the end of the configured geometry fails with ILLEGAL REQUEST 21h/00h
+  (LBA out of range); one that straddles the end transfers the sectors before
+  the end and then fails the same way (the CSW residue counts the rest).
+  Earlier firmware zero-filled reads past the end and silently dropped writes
+  there, both reported as success. That matters when the geometry is smaller
+  than the drive (e.g. NORMAL CHS on a larger LBA drive) and a tool sizes its
+  reads from the drive's real capacity.
 - Mount (and a write-protect change while mounted) raises UNIT ATTENTION
   28h/00h, delivered on the next TEST UNIT READY. TinyUSB answers most
   standard opcodes itself, so TUR is where the host's disk driver learns

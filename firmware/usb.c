@@ -114,6 +114,21 @@ static bool whole_sectors(uint8_t lun, uint32_t offset, uint32_t bufsize) {
     return false;
 }
 
+// Failures staged through sense.c: TinyUSB overwrites its own copy of the
+// sense with NOT READY / MEDIUM NOT PRESENT whenever a READ10/WRITE10
+// callback fails, but the host's REQUEST SENSE gets the staged sense.
+static int32_t not_present(uint8_t lun) {
+    sense_set(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);   // staged too, so no older sense leaks out
+    return -1;
+}
+
+// At or beyond the end of the configured geometry: ILLEGAL REQUEST / LOGICAL
+// BLOCK ADDRESS OUT OF RANGE.
+static int32_t out_of_range(uint8_t lun) {
+    sense_set(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x21, 0x00);
+    return -1;
+}
+
 // ---------------------------------------------------------------------------
 //  READ10
 // ---------------------------------------------------------------------------
@@ -121,22 +136,19 @@ static bool whole_sectors(uint8_t lun, uint32_t offset, uint32_t bufsize) {
 int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
                           void *buffer, uint32_t bufsize) {
     usbbuf_note((uint8_t *)buffer);
-    if (!is_mounted) return -1;
+    if (!is_mounted) return not_present(lun);
     if (!whole_sectors(lun, offset, bufsize)) return -1;
 
     uint64_t max = drive_total_sectors();
-    if (max == 0) return -1;
+    if (max == 0) return not_present(lun);
 
-    uint32_t count = bufsize / 512;
-    uint8_t *ptr = (uint8_t *)buffer;
-    if (lba < max) {
-        uint32_t n = count;
-        if ((uint64_t)lba + n > max) n = (uint32_t)(max - lba);
-        if (drive_read(lba, n, ptr) < 0) return media_fail(lun);
-        ptr += n * 512; count -= n;
-    }
-    if (count > 0) memset(ptr, 0, count * 512);
-    return (int32_t)bufsize;
+    // Only real sectors: a chunk that runs past the end returns the sectors
+    // before it, and TinyUSB's call for the rest lands at max and fails.
+    if (lba >= max) return out_of_range(lun);
+    uint32_t n = bufsize / 512;
+    if ((uint64_t)lba + n > max) n = (uint32_t)(max - lba);
+    if (drive_read(lba, n, (uint8_t *)buffer) < 0) return media_fail(lun);
+    return (int32_t)(n * 512);
 }
 
 // ---------------------------------------------------------------------------
@@ -146,7 +158,7 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
 int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
                            uint8_t *buffer, uint32_t bufsize) {
     usbbuf_note(buffer);
-    if (!is_mounted) return -1;
+    if (!is_mounted) return not_present(lun);
     if (config.drive_write_protected) {
         sense_set(lun, SCSI_SENSE_DATA_PROTECT, 0x27, 0x00);
         return -1;
@@ -154,14 +166,13 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
     if (!whole_sectors(lun, offset, bufsize)) return -1;
 
     uint64_t max = drive_total_sectors();
-    if (max == 0) return -1;
+    if (max == 0) return not_present(lun);
 
-    if (lba < max) {
-        uint32_t n = bufsize / 512;
-        if ((uint64_t)lba + n > max) n = (uint32_t)(max - lba);
-        if (drive_write(lba, n, buffer) < 0) return media_fail(lun);
-    }
-    return (int32_t)bufsize;
+    if (lba >= max) return out_of_range(lun);
+    uint32_t n = bufsize / 512;
+    if ((uint64_t)lba + n > max) n = (uint32_t)(max - lba);
+    if (drive_write(lba, n, buffer) < 0) return media_fail(lun);
+    return (int32_t)(n * 512);    // short: TinyUSB hands the rest back at max
 }
 
 // ---------------------------------------------------------------------------
