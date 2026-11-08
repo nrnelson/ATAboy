@@ -47,6 +47,7 @@ add_executable(ATAboy
         api.c
         menus.c
         usb.c
+        msc_rw.c
         usb_descriptors.c
         config.c)
 

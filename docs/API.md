@@ -324,6 +324,16 @@ Every pass-through command is classified (`firmware/ata_policy.c`):
   there, both reported as success. That matters when the geometry is smaller
   than the drive (e.g. NORMAL CHS on a larger LBA drive) and a tool sizes its
   reads from the drive's real capacity.
+- A READ(10) that runs into a bad sector returns the good sectors before it,
+  then fails with the MEDIUM ERROR sense above (INFORMATION = the bad LBA, CSW
+  residue = everything from the bad sector on). The firmware reads a chunk of
+  up to 8 sectors with one drive command; when that command fails part way it
+  hands the good sectors to USB and fails the rest of the SCSI command at the
+  bad sector from the remembered failure, without sending the drive that
+  sector again. So each host command costs the drive at most one attempt per
+  bad sector; a new command (e.g. the host reading the remainder one sector at
+  a time) asks the drive again. Earlier firmware discarded the whole 8-sector
+  chunk.
 - Mount (and a write-protect change while mounted) raises UNIT ATTENTION
   28h/00h, delivered on the next TEST UNIT READY. TinyUSB answers most
   standard opcodes itself, so TUR is where the host's disk driver learns

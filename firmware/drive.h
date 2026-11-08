@@ -106,9 +106,11 @@ int      drive_apply_geometry(uint8_t mode, uint16_t c, uint8_t h, uint8_t s);
 int      drive_mount(void);
 int      drive_unmount(void);
 
-// Logged sector I/O for the mass-storage path.  Return bytes or -1.
-int32_t  drive_read(uint32_t lba, uint32_t count, uint8_t *buf);
-int32_t  drive_write(uint32_t lba, uint32_t count, const uint8_t *buf);
+// Logged sector I/O for the mass-storage path.  Return 0 on success, -1 on
+// failure (see drive_last_failure()); *done = sectors transferred without
+// error, which on a failed read are valid data in buf.
+int      drive_read(uint32_t lba, uint32_t count, uint8_t *buf, uint32_t *done);
+int      drive_write(uint32_t lba, uint32_t count, const uint8_t *buf, uint32_t *done);
 
 // Record a finished command in stats and (if it failed) the error log.
 void     drive_record(uint8_t op, const ide_cmd_t *c, uint32_t lba, uint32_t count);

@@ -35,6 +35,11 @@ jobs:
             tests/test_host.c firmware/ata_policy.c firmware/json.c
           "$RUNNER_TEMP/test_host"
 
+      - name: USB disk data path tests
+        run: |
+          cc -Wall -Wextra -Werror -I firmware -o "$RUNNER_TEMP/test_rw" tests/test_rw.c firmware/msc_rw.c
+          "$RUNNER_TEMP/test_rw"
+
       - name: Host tool
         run: |
           python3 -m py_compile host/ataboy
