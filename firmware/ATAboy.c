@@ -1,6 +1,8 @@
 // ATAboy Firmware — Main Entry Point
-// Core 0: TinyUSB task loop + CDC queue bridge
+// Core 0: TinyUSB task loop + CDC queue bridge; MSC/API/pass-through IDE work
+//         happens inside tud_task() callbacks.
 // Core 1: Menu system (menus.c)
+// The IDE bus is shared and guarded by ide_lock() (see ide.h).
 // NEVER call tud_task() from callbacks, IDE I/O, or core 1.
 
 #include "pico/stdlib.h"
@@ -9,10 +11,11 @@
 #include "class/cdc/cdc_device.h"
 #include "ide.h"
 #include "config.h"
+#include "api.h"
 #include "pico/util/queue.h"
 
 // ---------------------------------------------------------------------------
-//  Shared state (accessed by usb.c callbacks and menus.c)
+//  Shared state (accessed by usb.c callbacks, api.c and menus.c)
 // ---------------------------------------------------------------------------
 
 volatile bool is_mounted = false;
@@ -65,13 +68,14 @@ static void cdc_task(void) {
 extern void core1_entry(void);
 
 // ---------------------------------------------------------------------------
-//  main — core 0 (USB only — no IDE operations here)
+//  main — core 0
 // ---------------------------------------------------------------------------
 
 int main(void) {
     // No pico_stdio — all console I/O goes through TinyUSB CDC via queues
     config_load();
     ide_hw_init();
+    ide_select_device(config.dev_base);
 
     // Init CDC queues
     queue_init(&cdc_tx_queue, sizeof(char), CDC_TX_QUEUE_SIZE);
@@ -80,15 +84,17 @@ int main(void) {
     // Init TinyUSB
     tusb_init();
 
-    // Allow core 1 to be paused for flash writes (config_save)
+    // Either core may save config to flash and must be able to pause the
+    // other; core 1 registers itself in core1_entry().
     multicore_lockout_victim_init();
 
     // Launch menu UI on core 1 (auto-mount runs there too)
     multicore_launch_core1(core1_entry);
 
-    // Core 0 loop: service USB + CDC bridge
+    // Core 0 loop: service USB + CDC bridge + deferred API actions
     while (true) {
         tud_task();
         cdc_task();
+        api_poll();
     }
 }

@@ -5,13 +5,21 @@
 #include "hardware/structs/sio.h"
 #include "pico/stdlib.h"
 #include "pico/time.h"
+#include "pico/sync.h"
+#include <string.h>
 
 static uint8_t dev_base = 0xA0;   // 0xA0 = master, 0xB0 = slave
+static recursive_mutex_t ide_mtx;
 
-void ide_select_device(uint8_t base) { dev_base = base; }
+void ide_lock(void)   { recursive_mutex_enter_blocking(&ide_mtx); }
+void ide_unlock(void) { recursive_mutex_exit(&ide_mtx); }
+
+void    ide_select_device(uint8_t base) { dev_base = (base == 0xB0) ? 0xB0 : 0xA0; }
+uint8_t ide_selected_device(void)       { return dev_base; }
 
 // ---------------------------------------------------------------------------
 //  Bus helpers — address, transceiver, and chip-select (all SIO-managed)
+//  Everything static in this file assumes the caller holds ide_mtx.
 // ---------------------------------------------------------------------------
 
 static void bus_idle(void) {
@@ -40,68 +48,167 @@ static void xcvr_write(void) {
 }
 
 // ---------------------------------------------------------------------------
-//  Register I/O — single 8-bit reads/writes via PIO strobes
+//  Register I/O — single 8-bit reads/writes via PIO strobes (unlocked)
 // ---------------------------------------------------------------------------
 
-void ide_write_reg(uint8_t reg, uint8_t val) {
+static void wr(uint8_t reg, uint8_t val) {
     set_address(reg);
     xcvr_write();
     sio_hw->gpio_clr = (1 << IDE_CS0);
-
     uint16_t word = (uint16_t)val;
     ide_pio_write(1, &word);
-
     sio_hw->gpio_set = (1 << IDE_CS0);
     bus_idle();
 }
 
-uint8_t ide_read_reg(uint8_t reg) {
+static uint8_t rd(uint8_t reg) {
     set_address(reg);
     xcvr_read();
     sio_hw->gpio_clr = (1 << IDE_CS0);
-
-    uint16_t val;
+    uint16_t val = 0xFFFF;
     ide_pio_read(1, &val);
-
     sio_hw->gpio_set = (1 << IDE_CS0);
     bus_idle();
     return (uint8_t)(val & 0xFF);
 }
 
-uint8_t ide_read_alt_status(void) {
+static uint8_t rd_alt(void) {
     set_address(6);
     xcvr_read();
     sio_hw->gpio_clr = (1 << IDE_CS1);
-
-    uint16_t val;
+    uint16_t val = 0xFFFF;
     ide_pio_read(1, &val);
-
     sio_hw->gpio_set = (1 << IDE_CS1);
     bus_idle();
     return (uint8_t)(val & 0xFF);
 }
 
-void ide_write_control(uint8_t val) {
+static void wr_ctl(uint8_t val) {
     set_address(6);
     xcvr_write();
     sio_hw->gpio_clr = (1 << IDE_CS1);
-
     uint16_t word = (uint16_t)val;
     ide_pio_write(1, &word);
-
     sio_hw->gpio_set = (1 << IDE_CS1);
     bus_idle();
 }
+
+// 16-bit data register bursts
+static bool data_in(uint16_t *buf, uint32_t words) {
+    set_address(0);
+    xcvr_read();
+    sio_hw->gpio_clr = (1 << IDE_CS0);
+    bool ok = ide_pio_read(words, buf);
+    sio_hw->gpio_set = (1 << IDE_CS0);
+    bus_idle();
+    return ok;
+}
+
+static bool data_out(const uint16_t *buf, uint32_t words) {
+    set_address(0);
+    xcvr_write();
+    sio_hw->gpio_clr = (1 << IDE_CS0);
+    bool ok = ide_pio_write(words, buf);
+    sio_hw->gpio_set = (1 << IDE_CS0);
+    bus_idle();
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+//  Public locked register access
+// ---------------------------------------------------------------------------
+
+void ide_write_reg(uint8_t reg, uint8_t val) { ide_lock(); wr(reg, val); ide_unlock(); }
+uint8_t ide_read_reg(uint8_t reg)  { ide_lock(); uint8_t v = rd(reg); ide_unlock(); return v; }
+uint8_t ide_read_alt_status(void)  { ide_lock(); uint8_t v = rd_alt(); ide_unlock(); return v; }
+void ide_write_control(uint8_t val) { ide_lock(); wr_ctl(val); ide_unlock(); }
 
 void ide_set_iordy(bool enabled) {
     gpio_set_inover(IDE_IORDY, enabled ? GPIO_OVERRIDE_NORMAL : GPIO_OVERRIDE_HIGH);
 }
 
 // ---------------------------------------------------------------------------
-//  Init / Reset / Polling
+//  Status polling (unlocked)
+// ---------------------------------------------------------------------------
+
+// Wait for BSY=0 (and DRDY=1 if need_drdy).  *st = last status read.
+static bool wait_ready(uint32_t timeout_ms, bool need_drdy, uint8_t *st) {
+    uint32_t t0 = time_us_32();
+    uint32_t limit = timeout_ms * 1000u;
+    uint8_t s;
+    for (;;) {
+        s = rd(7);
+        if (!(s & ATA_ST_BSY) && (!need_drdy || (s & ATA_ST_DRDY))) { if (st) *st = s; return true; }
+        if (time_us_32() - t0 >= limit) { if (st) *st = s; return false; }
+        busy_wait_us_32(10);
+    }
+}
+
+// Wait for DRQ (data ready) or ERR.  Status bits are only trusted with BSY=0.
+// Returns 1 = DRQ, 0 = ERR/DF without data, -1 = timeout.
+// take_err_data: ERR and DRQ both set -> report DRQ (caller reads the block).
+static int wait_drq(uint32_t limit_us, bool take_err_data, uint8_t *st_out) {
+    uint32_t t0 = time_us_32();
+    uint8_t st;
+    for (;;) {
+        st = rd(7);   // reading STATUS also clears INTRQ
+        if (!(st & ATA_ST_BSY)) {
+            if (take_err_data && (st & ATA_ST_DRQ)) { *st_out = st; return 1; }
+            if (st & (ATA_ST_ERR | ATA_ST_DF)) { *st_out = st; return 0; }
+            if (st & ATA_ST_DRQ) { *st_out = st; return 1; }
+        }
+        if (time_us_32() - t0 >= limit_us) { *st_out = st; return -1; }
+        busy_wait_us_32(10);
+    }
+}
+
+// Wait for BSY=0 after a command or the last data block.  -1 = timeout.
+static int wait_not_busy(uint32_t limit_us, uint8_t *st_out) {
+    uint32_t t0 = time_us_32();
+    uint8_t st;
+    for (;;) {
+        st = rd(7);
+        if (!(st & ATA_ST_BSY)) { *st_out = st; return 0; }
+        if (time_us_32() - t0 >= limit_us) { *st_out = st; return -1; }
+        busy_wait_us_32(10);
+    }
+}
+
+static void drain_sector(void) {
+    uint16_t discard[256];
+    data_in(discard, 256);
+}
+
+static bool set_geometry(uint8_t heads, uint8_t spt) {
+    wr(6, dev_base | ((heads - 1) & 0x0F));
+    wr(2, spt);
+    wr(7, 0x91);                          // INITIALIZE DEVICE PARAMETERS
+    uint8_t st;
+    if (!wait_ready(1000, true, &st)) return false;
+    return !(st & ATA_ST_ERR);
+}
+
+// SRST aborts whatever the drive is doing and clears INITIALIZE DEVICE
+// PARAMETERS, so CHS geometry is re-applied afterwards.
+static void soft_reset(void) {
+    wr_ctl(0x04);
+    busy_wait_us_32(10);
+    wr_ctl(0x00);
+    busy_wait_us_32(2000);
+    wait_ready(2000, true, NULL);
+    if (!config.use_lba_mode && config.heads && config.spt)
+        set_geometry(config.heads, config.spt);
+    else
+        wr(6, dev_base);
+}
+
+// ---------------------------------------------------------------------------
+//  Init / Reset
 // ---------------------------------------------------------------------------
 
 void ide_hw_init(void) {
+    recursive_mutex_init(&ide_mtx);
+
     // SIO-controlled output pins
     uint32_t sio_out = (1 << IDE_DIR) | (1 << IDE_DIR1) |
                        (1 << IDE_OE)  | (1 << IDE_OE1)  |
@@ -134,13 +241,14 @@ void ide_hw_init(void) {
     bus_idle();
 
     // nIEN=0: allow INTRQ from the drive
-    ide_write_control(0x00);
+    wr_ctl(0x00);
 
     // Restore IORDY based on config (override was HIGH for safe init)
     ide_set_iordy(config.iordy_enabled);
 }
 
 void ide_reset_drive(void) {
+    ide_lock();
     // Force IORDY HIGH during reset — drive holds it LOW during POST
     ide_set_iordy(false);
 
@@ -148,19 +256,31 @@ void ide_reset_drive(void) {
     sleep_ms(50);
     gpio_put(IDE_RESET, 1);
     sleep_ms(100);
-    ide_write_control(0x00);
-    ide_wait_until_ready(10000);
+    wr_ctl(0x00);
+    wait_ready(10000, true, NULL);
 
     // Recalibrate — seek heads to track 0 (required by some pre-ATA drives)
-    ide_write_reg(6, dev_base);
-    ide_write_reg(7, 0x10);
-    ide_wait_until_ready(10000);
+    wr(6, dev_base);
+    wr(7, 0x10);
+    wait_ready(10000, true, NULL);
+
+    // Hardware reset also clears INITIALIZE DEVICE PARAMETERS
+    if (!config.use_lba_mode && config.heads && config.spt)
+        set_geometry(config.heads, config.spt);
 
     // Restore IORDY to config setting — drive is ready for normal operation
     ide_set_iordy(config.iordy_enabled);
+    ide_unlock();
 }
 
-uint8_t ide_probe_devices(void) {
+void ide_soft_reset(void) {
+    ide_lock();
+    soft_reset();
+    ide_unlock();
+}
+
+uint8_t ide_probe_devices(uint8_t only) {
+    ide_lock();
     ide_set_iordy(false);
 
     // Single hardware reset — both devices see it
@@ -168,429 +288,286 @@ uint8_t ide_probe_devices(void) {
     sleep_ms(50);
     gpio_put(IDE_RESET, 1);
     sleep_ms(2000);           // generous POST delay (not status-based)
-    ide_write_control(0x00);  // nIEN=0
+    wr_ctl(0x00);             // nIEN=0
 
     static const uint8_t addrs[] = {0xA0, 0xB0};
-    for (int i = 0; i < 2; i++) {
-        ide_write_reg(6, addrs[i]);       // select device
+    uint8_t found = 0;
+    for (int i = 0; i < 2 && !found; i++) {
+        if (only && addrs[i] != only) continue;
+        wr(6, addrs[i]);                  // select device
         busy_wait_us_32(50);              // let selection settle
 
         // Floating bus filter: 0xFF means no device (bus floats high)
-        uint8_t st = ide_read_reg(7);
+        uint8_t st = rd(7);
         if (st == 0xFF) continue;
 
         // Device present — wait for BSY to clear (not DRDY; some older
         // drives won't assert DRDY until after INITIALIZE DRIVE PARAMETERS)
         dev_base = addrs[i];
-        uint32_t start = to_ms_since_boot(get_absolute_time());
-        bool bsy_clear = false;
-        while (to_ms_since_boot(get_absolute_time()) - start < 10000) {
-            st = ide_read_reg(7);
-            if (!(st & 0x80)) { bsy_clear = true; break; }
-            busy_wait_us_32(10);
-        }
-        if (!bsy_clear) continue;
+        if (!wait_ready(10000, false, &st)) continue;
 
         // Recalibrate (required by some pre-ATA drives)
-        ide_write_reg(6, addrs[i]);
-        ide_write_reg(7, 0x10);
-        ide_wait_until_ready(10000);
-
-        ide_set_iordy(config.iordy_enabled);
-        return addrs[i];
+        wr(6, addrs[i]);
+        wr(7, 0x10);
+        wait_ready(10000, true, NULL);
+        found = addrs[i];
     }
 
     ide_set_iordy(config.iordy_enabled);
-    return 0;  // no device found
+    ide_unlock();
+    return found;
 }
 
 bool ide_wait_until_ready(uint32_t timeout_ms) {
-    uint32_t start = to_ms_since_boot(get_absolute_time());
-    while (to_ms_since_boot(get_absolute_time()) - start < timeout_ms) {
-        uint8_t st = ide_read_reg(7);
-        if (!(st & 0x80) && (st & 0x40)) return true;   // BSY=0, DRDY=1
-        busy_wait_us_32(10);
-    }
-    return false;
+    ide_lock();
+    bool ok = wait_ready(timeout_ms, true, NULL);
+    ide_unlock();
+    return ok;
 }
 
 bool ide_set_geometry(uint8_t heads, uint8_t spt) {
-    ide_write_reg(6, dev_base | ((heads - 1) & 0x0F));
-    ide_write_reg(2, spt);
-    ide_write_reg(7, 0x91);
-    return ide_wait_until_ready(1000);
+    if (heads == 0 || spt == 0) return false;
+    ide_lock();
+    bool ok = set_geometry(heads, spt);
+    ide_unlock();
+    return ok;
+}
+
+void ide_drain_sector(void) {
+    ide_lock();
+    drain_sector();
+    ide_unlock();
+}
+
+void ide_read_taskfile(uint8_t tf[8]) {
+    ide_lock();
+    for (int i = 1; i <= 7; i++) tf[i] = rd(i);
+    ide_unlock();
 }
 
 // ---------------------------------------------------------------------------
-//  IDENTIFY DEVICE (0xEC)
+//  Generic command engine
 // ---------------------------------------------------------------------------
 
-bool ide_identify(uint16_t *buf) {
-    if (!ide_wait_until_ready(1000)) return false;
-    if (ide_read_reg(7) & 0x08) ide_drain_sector();   // drain stranded DRQ before command
-    ide_write_reg(6, dev_base);
-    ide_write_reg(7, 0xEC);
-    busy_wait_us_32(1);             // give drive time to assert BSY
+int ide_exec(ide_cmd_t *c) {
+    c->status = c->error = 0;
+    c->out_count = c->out_lba_lo = c->out_lba_mid = c->out_lba_hi = c->out_device = 0;
+    c->out_hob_count = c->out_hob_lba_lo = c->out_hob_lba_mid = c->out_hob_lba_hi = 0;
+    c->tf_valid = c->err_data = c->recovered = false;
+    c->done = 0;
+    c->elapsed_us = 0;
 
-    // Poll for DRQ — INTRQ provides early-exit if enabled, otherwise pure polling
-    for (uint32_t t = 0; t < 100000; t++) {
-        if (config.intrq_enabled && gpio_get(IDE_INTRQ)) ide_read_reg(7);  // clear INTRQ
-        uint8_t st = ide_read_reg(7);
-        if (st & 0x01) { if (st & 0x08) ide_drain_sector(); return false; }  // ERR — drain stranded DRQ
-        if (!(st & 0x80) && (st & 0x08)) goto ready;     // BSY=0, DRQ=1
-        busy_wait_us_32(50);
+    uint32_t limit_us = (c->timeout_ms ? c->timeout_ms : 1000) * 1000u;
+    uint8_t dh = dev_base | (c->device & 0x4F);
+    uint8_t st = 0;
+    int res = IDE_OK;
+    bool leftover = false;
+
+    ide_lock();
+
+    // Select the device and wait until it can take a command.
+    wr(6, dh);
+    busy_wait_us_32(1);
+    if (!wait_ready(c->ready_ms ? c->ready_ms : 5000, c->flags & IDE_F_NEED_DRDY, &st)) {
+        c->status = st;
+        c->result = IDE_NOT_READY;
+        ide_unlock();
+        return IDE_NOT_READY;
     }
-    return false;
+    if (st & ATA_ST_DRQ) drain_sector();          // stranded data from an earlier command
 
-ready:
-    // Burst-read 256 words through PIO
-    set_address(0);
-    xcvr_read();
-    sio_hw->gpio_clr = (1 << IDE_CS0);
+    if (c->ext) {
+        wr(1, c->hob_feature);
+        wr(2, c->hob_count);
+        wr(3, c->hob_lba_lo);
+        wr(4, c->hob_lba_mid);
+        wr(5, c->hob_lba_hi);
+    }
+    wr(1, c->feature);
+    wr(2, c->count);
+    wr(3, c->lba_lo);
+    wr(4, c->lba_mid);
+    wr(5, c->lba_hi);
+    wr(6, dh);
 
-    ide_pio_read(256, buf);
+    uint32_t t0 = time_us_32();
+    wr(7, c->command);
+    rd_alt();                                     // >= 400 ns before STATUS is valid
 
-    sio_hw->gpio_set = (1 << IDE_CS0);
-    bus_idle();
+    uint16_t *w = (uint16_t *)c->buf;
+
+    if (c->proto == IDE_PROTO_PIO_IN) {
+        for (uint32_t b = 0; b < c->sectors; b++) {
+            int r = wait_drq(limit_us, c->flags & IDE_F_TAKE_ERR_DATA, &st);
+            if (r < 0) { res = IDE_TIMEOUT; break; }
+            if (r == 0) { res = IDE_ATA_ERROR; break; }
+            if (!data_in(w + b * 256, 256)) { res = IDE_BUS_FAULT; break; }
+            if (c->ecc_len && b == c->sectors - 1) {
+                // READ LONG: vendor ECC bytes follow as 8-bit transfers on DD0-7
+                for (uint8_t i = 0; i < c->ecc_len; i++)
+                    c->buf[(b + 1) * 512 + i] = rd(0);
+            }
+            if (st & (ATA_ST_ERR | ATA_ST_DF)) { c->err_data = true; res = IDE_ATA_ERROR; break; }
+            c->done = b + 1;
+        }
+        if (res == IDE_OK) {
+            if (wait_not_busy(limit_us, &st) < 0) res = IDE_TIMEOUT;
+            else if (st & (ATA_ST_ERR | ATA_ST_DF)) res = IDE_ATA_ERROR;
+            else if (st & ATA_ST_DRQ) { leftover = true; res = IDE_PROTOCOL; }
+        }
+    } else if (c->proto == IDE_PROTO_PIO_OUT) {
+        for (uint32_t b = 0; b < c->sectors; b++) {
+            int r = wait_drq(limit_us, false, &st);
+            if (r < 0) { res = IDE_TIMEOUT; break; }
+            if (r == 0) { res = IDE_ATA_ERROR; break; }
+            if (!data_out(w + b * 256, 256)) { res = IDE_BUS_FAULT; break; }
+            c->done = b;                          // committed once the drive moves on
+        }
+        if (res == IDE_OK) {
+            if (wait_not_busy(limit_us, &st) < 0) res = IDE_TIMEOUT;
+            else if (st & (ATA_ST_ERR | ATA_ST_DF)) res = IDE_ATA_ERROR;
+            else if (st & ATA_ST_DRQ) { leftover = true; res = IDE_PROTOCOL; }
+            else c->done = c->sectors;
+        }
+    } else {
+        if (wait_not_busy(limit_us, &st) < 0) res = IDE_TIMEOUT;
+        else if (st & (ATA_ST_ERR | ATA_ST_DF)) res = IDE_ATA_ERROR;
+        else if (st & ATA_ST_DRQ) { leftover = true; res = IDE_PROTOCOL; }
+    }
+
+    c->elapsed_us = time_us_32() - t0;
+    c->status = st;
+
+    // Result registers are only meaningful with BSY=0; while BSY is set every
+    // register reads back as STATUS.
+    if (!(st & ATA_ST_BSY)) {
+        c->error       = rd(1);
+        c->out_count   = rd(2);
+        c->out_lba_lo  = rd(3);
+        c->out_lba_mid = rd(4);
+        c->out_lba_hi  = rd(5);
+        c->out_device  = rd(6);
+        if (c->ext) {
+            wr_ctl(0x80);                         // HOB=1: read the "previous" bytes
+            c->out_hob_count   = rd(2);
+            c->out_hob_lba_lo  = rd(3);
+            c->out_hob_lba_mid = rd(4);
+            c->out_hob_lba_hi  = rd(5);
+            wr_ctl(0x00);
+        }
+        c->tf_valid = true;
+        if (!(st & (ATA_ST_ERR | ATA_ST_DF))) c->error = 0;   // error reg is undefined without ERR
+    }
+
+    if ((res == IDE_TIMEOUT || res == IDE_BUS_FAULT || leftover) && !(c->flags & IDE_F_NO_RECOVER)) {
+        soft_reset();
+        c->recovered = true;
+    }
+
+    c->result = res;
+    ide_unlock();
+    return res;
+}
+
+bool ide_cmd_address(ide_cmd_t *c, uint32_t lba, uint32_t count, bool allow_ext) {
+    if (count == 0) return false;
+    c->ext = false;
+    c->hob_feature = c->hob_count = c->hob_lba_lo = c->hob_lba_mid = c->hob_lba_hi = 0;
+
+    if (config.use_lba_mode) {
+        bool lba48 = config.lba_sectors > 0x0FFFFFFF;
+        if (lba48 && allow_ext) {
+            if (count > 65536) return false;
+            c->ext = true;
+            c->hob_count  = (uint8_t)((count & 0xFFFF) >> 8);
+            c->hob_lba_lo = (uint8_t)(lba >> 24);
+            c->count   = (uint8_t)count;
+            c->lba_lo  = (uint8_t)lba;
+            c->lba_mid = (uint8_t)(lba >> 8);
+            c->lba_hi  = (uint8_t)(lba >> 16);
+            c->device  = 0x40;
+            return true;
+        }
+        if (count > 256 || lba + count > 0x10000000u) return false;
+        c->count   = (uint8_t)count;              // 256 -> 0
+        c->lba_lo  = (uint8_t)lba;
+        c->lba_mid = (uint8_t)(lba >> 8);
+        c->lba_hi  = (uint8_t)(lba >> 16);
+        c->device  = 0x40 | ((lba >> 24) & 0x0F);
+        return true;
+    }
+
+    if (!config.heads || !config.spt || config.heads > 16 || count > 256) return false;
+    uint32_t tmp  = lba / config.spt;
+    uint8_t  sec  = (uint8_t)(lba % config.spt) + 1;   // 1-based
+    uint8_t  head = (uint8_t)(tmp % config.heads);
+    uint32_t cyl  = tmp / config.heads;
+    if (cyl > 0xFFFF) return false;
+    c->count   = (uint8_t)count;
+    c->lba_lo  = sec;
+    c->lba_mid = (uint8_t)cyl;
+    c->lba_hi  = (uint8_t)(cyl >> 8);
+    c->device  = head & 0x0F;
+    return true;
+}
+
+bool ide_cmd_result_lba(const ide_cmd_t *c, uint32_t *lba) {
+    if (!c->tf_valid) return false;
+    if (c->ext) {
+        *lba = (uint32_t)c->out_lba_lo | ((uint32_t)c->out_lba_mid << 8) |
+               ((uint32_t)c->out_lba_hi << 16) | ((uint32_t)c->out_hob_lba_lo << 24);
+        return true;
+    }
+    if (c->device & 0x40) {
+        *lba = (uint32_t)c->out_lba_lo | ((uint32_t)c->out_lba_mid << 8) |
+               ((uint32_t)c->out_lba_hi << 16) | ((uint32_t)(c->out_device & 0x0F) << 24);
+        return true;
+    }
+    if (!config.heads || !config.spt || c->out_lba_lo == 0) return false;
+    uint32_t cyl = c->out_lba_mid | ((uint32_t)c->out_lba_hi << 8);
+    uint32_t head = c->out_device & 0x0F;
+    *lba = (cyl * config.heads + head) * config.spt + (c->out_lba_lo - 1);
     return true;
 }
 
 // ---------------------------------------------------------------------------
-//  Drain one sector of DRQ data (discard 256 words)
+//  Convenience wrappers used by the menu
 // ---------------------------------------------------------------------------
 
-void ide_drain_sector(void) {
-    uint16_t discard[256];
-    set_address(0);
-    xcvr_read();
-    sio_hw->gpio_clr = (1 << IDE_CS0);
-    ide_pio_read(256, discard);
-    sio_hw->gpio_set = (1 << IDE_CS0);
-    bus_idle();
-}
-
-// ---------------------------------------------------------------------------
-//  Sector I/O — LBA28, single-sector loop
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-//  Recovery additions: adjustable read timeout + last-error capture
-// ---------------------------------------------------------------------------
-
-// Per-sector DRQ wait for reads.  Default ~= stock (100000 x 10us polls).
-volatile uint32_t ide_read_timeout_ms = 1000;
-
-// Snapshot of the last failed read, taken BEFORE the soft reset clears it.
-ide_error_t ide_last_error;
-
-// Program sector count + address registers (LBA28/LBA48/CHS) for 'count' sectors.
-static bool ide_setup_address(uint32_t lba, uint32_t count) {
-    bool use_lba48 = config.use_lba_mode && (config.lba_sectors > 0x0FFFFFFF);
-
-    if (config.use_lba_mode) {
-        if (use_lba48) {
-            ide_write_reg(2, 0);                               // sector count high
-            ide_write_reg(3, (lba >> 24) & 0xFF);              // LBA 24-31
-            ide_write_reg(4, 0);                               // LBA 32-39 (0 for uint32_t)
-            ide_write_reg(5, 0);                               // LBA 40-47 (0 for uint32_t)
-            ide_write_reg(2, (uint8_t)count);                  // sector count low
-            ide_write_reg(3, lba & 0xFF);                      // LBA 0-7
-            ide_write_reg(4, (lba >> 8) & 0xFF);               // LBA 8-15
-            ide_write_reg(5, (lba >> 16) & 0xFF);              // LBA 16-23
-            ide_write_reg(6, dev_base | 0x40);                 // LBA mode, no address bits
-        } else {
-            ide_write_reg(2, (uint8_t)count);
-            ide_write_reg(3, lba & 0xFF);
-            ide_write_reg(4, (lba >> 8) & 0xFF);
-            ide_write_reg(5, (lba >> 16) & 0xFF);
-            ide_write_reg(6, (dev_base | 0x40) | ((lba >> 24) & 0x0F));
-        }
-    } else {
-        uint32_t tmp  = lba / config.spt;
-        uint8_t  sec  = (lba % config.spt) + 1;           // 1-based
-        uint8_t  head = tmp % config.heads;
-        uint16_t cyl  = tmp / config.heads;
-        ide_write_reg(2, (uint8_t)count);
-        ide_write_reg(3, sec);
-        ide_write_reg(4, cyl & 0xFF);
-        ide_write_reg(5, (cyl >> 8) & 0xFF);
-        ide_write_reg(6, dev_base | (head & 0x0F));
-    }
-    return use_lba48;
-}
-
-// Wait for DRQ (data ready) or ERR, up to ide_read_timeout_ms.
-// Returns 1 = DRQ, 0 = ERR, -1 = timeout.  *st_out = last status seen.
-// prefer_data: if ERR and DRQ are both set, take the data (READ LONG).
-static int ide_wait_drq(uint8_t *st_out, bool prefer_data) {
-    uint32_t start = time_us_32();
-    uint32_t limit_us = ide_read_timeout_ms * 1000u;
-    uint8_t st = 0;
-    for (;;) {
-        if (config.intrq_enabled && gpio_get(IDE_INTRQ)) ide_read_reg(7);  // clear INTRQ
-        st = ide_read_reg(7);
-        if (!(st & 0x80)) {                               // BSY=0: status bits valid
-            if (prefer_data && (st & 0x08)) { *st_out = st; return 1; }
-            if (st & 0x01) { *st_out = st; return 0; }    // ERR
-            if (st & 0x08) { *st_out = st; return 1; }    // DRQ
-        }
-        if ((uint32_t)(time_us_32() - start) >= limit_us) { *st_out = st; return -1; }
-        busy_wait_us_32(10);
-    }
-}
-
-// Record the failure (status/error/address registers) before any reset.
-static void ide_capture_error(uint8_t cmd, uint32_t lba, uint8_t st,
-                              bool timed_out, uint32_t t0_us) {
-    ide_last_error.lba       = lba;
-    ide_last_error.cmd       = cmd;
-    ide_last_error.status    = st;
-    ide_last_error.error     = timed_out ? 0 : ide_read_reg(1);
-    ide_last_error.timed_out = timed_out;
-    ide_last_error.elapsed_ms = (time_us_32() - t0_us) / 1000u;
-    ide_last_error.timeout_ms = ide_read_timeout_ms;
-    ide_last_error.tf_sn = ide_read_reg(3);
-    ide_last_error.tf_cl = ide_read_reg(4);
-    ide_last_error.tf_ch = ide_read_reg(5);
-    ide_last_error.tf_dh = ide_read_reg(6);
-}
-
-// Soft-reset to abort any stuck command, then restore CHS geometry.
-static void ide_abort_and_recover(void) {
-    ide_write_control(0x04);
-    busy_wait_us_32(10);
-    ide_write_control(0x00);
-    ide_wait_until_ready(2000);
-    // SRST clears INITIALIZE DRIVE PARAMETERS — restore CHS geometry
-    if (!config.use_lba_mode)
-        ide_set_geometry(config.heads, config.spt);
-}
-
-static void ide_capture_not_ready(uint8_t cmd, uint32_t lba) {
-    ide_last_error = (ide_error_t){0};
-    ide_last_error.lba = lba;
-    ide_last_error.cmd = cmd;
-    ide_last_error.status = ide_read_reg(7);
-    ide_last_error.timed_out = true;
-    ide_last_error.elapsed_ms = 5000;
-    ide_last_error.timeout_ms = 5000;
-}
-
-int32_t ide_read_sectors(uint32_t lba, uint32_t count, uint8_t *buf) {
-    if (count == 0) return -1;
-    if (!ide_wait_until_ready(5000)) { ide_capture_not_ready(0x00, lba); return -1; }
-
-    uint32_t t0 = time_us_32();
-    bool use_lba48 = ide_setup_address(lba, count);
-    uint8_t cmd = use_lba48 ? 0x24 : 0x20;               // READ SECTORS EXT / READ SECTORS
-    ide_write_reg(7, cmd);
-
-    uint16_t *wbuf = (uint16_t *)buf;
-
-    for (uint32_t s = 0; s < count; s++) {
-        uint8_t st;
-        int r = ide_wait_drq(&st, false);
-        if (r <= 0) {
-            ide_capture_error(cmd, lba + s, st, r < 0, t0);
-            ide_abort_and_recover();
-            return -1;
-        }
-
-        set_address(0);
-        xcvr_read();
-        sio_hw->gpio_clr = (1 << IDE_CS0);
-
-        ide_pio_read(256, wbuf + s * 256);
-
-        sio_hw->gpio_set = (1 << IDE_CS0);
-        bus_idle();
-    }
-
-    return (int32_t)(count * 512);
-}
-
-// READ LONG (ATA-1): 512 data bytes + 'ecc_len' vendor ECC bytes, returned
-// WITHOUT ECC correction — so a sector that fails READ SECTORS with UNC may
-// still yield its raw (possibly bit-damaged) contents.
-// cmd 0x22 = with drive retries, 0x23 = without.  Returns 0 on data transfer,
-// -1 on ERR/timeout (details in ide_last_error).  *st_end = final status.
-int32_t ide_read_long(uint32_t lba, bool retries, uint8_t ecc_len,
-                      uint8_t *buf, uint8_t *st_end) {
-    if (!ide_wait_until_ready(5000)) {
-        ide_capture_not_ready(0x00, lba);
-        *st_end = ide_last_error.status;
-        return -1;
-    }
-
-    uint32_t t0 = time_us_32();
-    ide_setup_address(lba, 1);
-    uint8_t cmd = retries ? 0x22 : 0x23;
-    ide_write_reg(7, cmd);
-
-    uint8_t st;
-    int r = ide_wait_drq(&st, true);
-    if (r <= 0) {
-        ide_capture_error(cmd, lba, st, r < 0, t0);
-        ide_abort_and_recover();
-        *st_end = st;
-        return -1;
-    }
-
-    set_address(0);
-    xcvr_read();
-    sio_hw->gpio_clr = (1 << IDE_CS0);
-    ide_pio_read(256, (uint16_t *)buf);
-    sio_hw->gpio_set = (1 << IDE_CS0);
-    bus_idle();
-
-    // ECC bytes are transferred as 8-bit accesses on DD0-7
-    for (uint8_t i = 0; i < ecc_len; i++) {
-        buf[512 + i] = ide_read_reg(0);
-    }
-
-    busy_wait_us_32(5);
-    *st_end = ide_read_reg(7);
-    // Record the outcome too (ERR here means drive flagged the read, data still raw)
-    ide_capture_error(cmd, lba, *st_end, false, t0);
-    if (*st_end & 0x08) ide_abort_and_recover();          // leftover DRQ: wrong ECC length
-    return 0;
-}
-
-int32_t ide_write_sectors(uint32_t lba, uint32_t count, const uint8_t *buf) {
-    if (count == 0) return -1;
-    if (!ide_wait_until_ready(5000)) return -1;
-
-    bool use_lba48 = config.use_lba_mode && (config.lba_sectors > 0x0FFFFFFF);
-
-    if (config.use_lba_mode) {
-        if (use_lba48) {
-            ide_write_reg(2, 0);                               // sector count high
-            ide_write_reg(3, (lba >> 24) & 0xFF);              // LBA 24-31
-            ide_write_reg(4, 0);                               // LBA 32-39
-            ide_write_reg(5, 0);                               // LBA 40-47
-            ide_write_reg(2, (uint8_t)count);                  // sector count low
-            ide_write_reg(3, lba & 0xFF);                      // LBA 0-7
-            ide_write_reg(4, (lba >> 8) & 0xFF);               // LBA 8-15
-            ide_write_reg(5, (lba >> 16) & 0xFF);              // LBA 16-23
-            ide_write_reg(6, dev_base | 0x40);                 // LBA mode, no address bits
-        } else {
-            ide_write_reg(2, (uint8_t)count);
-            ide_write_reg(3, lba & 0xFF);
-            ide_write_reg(4, (lba >> 8) & 0xFF);
-            ide_write_reg(5, (lba >> 16) & 0xFF);
-            ide_write_reg(6, (dev_base | 0x40) | ((lba >> 24) & 0x0F));
-        }
-    } else {
-        uint32_t tmp  = lba / config.spt;
-        uint8_t  sec  = (lba % config.spt) + 1;
-        uint8_t  head = tmp % config.heads;
-        uint16_t cyl  = tmp / config.heads;
-        ide_write_reg(2, (uint8_t)count);
-        ide_write_reg(3, sec);
-        ide_write_reg(4, cyl & 0xFF);
-        ide_write_reg(5, (cyl >> 8) & 0xFF);
-        ide_write_reg(6, dev_base | (head & 0x0F));
-    }
-
-    ide_write_reg(7, use_lba48 ? 0x34 : 0x30);            // WRITE SECTORS EXT / WRITE SECTORS
-
-    const uint16_t *wbuf = (const uint16_t *)buf;
-
-    bool write_ok = true;
-
-    for (uint32_t s = 0; s < count; s++) {
-        // Poll for DRQ — INTRQ not asserted for first sector of PIO write per ATA spec;
-        // for s > 0 it provides early-exit if enabled, otherwise pure polling
-        bool got_drq = false;
-        for (uint32_t t = 0; t < 100000; t++) {
-            if (s > 0 && config.intrq_enabled && gpio_get(IDE_INTRQ)) ide_read_reg(7);
-            uint8_t st = ide_read_reg(7);
-            if (st & 0x01) { write_ok = false; break; }
-            if (!(st & 0x80) && (st & 0x08)) { got_drq = true; break; }
-            busy_wait_us_32(10);
-        }
-        if (!write_ok || !got_drq) { write_ok = false; break; }
-
-        set_address(0);
-        xcvr_write();
-        sio_hw->gpio_clr = (1 << IDE_CS0);
-
-        ide_pio_write(256, wbuf + s * 256);
-
-        sio_hw->gpio_set = (1 << IDE_CS0);
-        bus_idle();
-    }
-
-    // Wait for drive to commit the last sector to media (BSY=0)
-    if (write_ok) {
-        for (uint32_t t = 0; t < 100000; t++) {
-            if (config.intrq_enabled && gpio_get(IDE_INTRQ)) ide_read_reg(7);
-            uint8_t st = ide_read_reg(7);
-            if (st & 0x01) { write_ok = false; break; }
-            if (!(st & 0x80)) return (int32_t)(count * 512);
-            busy_wait_us_32(10);
-        }
-    }
-
-    // Soft-reset to abort any stuck command (drive may be retrying internally)
-    ide_write_control(0x04);
-    busy_wait_us_32(10);
-    ide_write_control(0x00);
-    ide_wait_until_ready(2000);
-    // SRST clears INITIALIZE DRIVE PARAMETERS — restore CHS geometry
-    if (!config.use_lba_mode)
-        ide_set_geometry(config.heads, config.spt);
-    return -1;
-}
-
-// ---------------------------------------------------------------------------
-//  Diagnostics — task file snapshot and seek/read-one
-// ---------------------------------------------------------------------------
-
-void ide_read_taskfile(uint8_t tf[8]) {
-    for (int i = 1; i <= 7; i++) tf[i] = ide_read_reg(i);
+bool ide_identify(uint16_t *buf) {
+    ide_cmd_t c = {0};
+    c.command = 0xEC;
+    c.proto = IDE_PROTO_PIO_IN;
+    c.buf = (uint8_t *)buf;
+    c.sectors = 1;
+    c.flags = IDE_F_NEED_DRDY;
+    c.ready_ms = 1000;
+    c.timeout_ms = 5000;
+    return ide_exec(&c) == IDE_OK;
 }
 
 uint8_t ide_seek_read_one(uint32_t target, bool lba) {
-    bool use_lba48 = lba && (config.lba_sectors > 0x0FFFFFFF);
-
+    static uint8_t scratch[512];
+    ide_cmd_t c = {0};
     if (lba) {
-        if (use_lba48) {
-            ide_write_reg(2, 0);                                   // sector count high
-            ide_write_reg(3, (target >> 24) & 0xFF);               // LBA 24-31
-            ide_write_reg(4, 0);                                   // LBA 32-39
-            ide_write_reg(5, 0);                                   // LBA 40-47
-            ide_write_reg(2, 1);                                   // sector count low
-            ide_write_reg(3, target & 0xFF);                       // LBA 0-7
-            ide_write_reg(4, (target >> 8) & 0xFF);                // LBA 8-15
-            ide_write_reg(5, (target >> 16) & 0xFF);               // LBA 16-23
-            ide_write_reg(6, dev_base | 0x40);                     // LBA mode
-        } else {
-            ide_write_reg(2, 1);
-            ide_write_reg(3, target & 0xFF);
-            ide_write_reg(4, (target >> 8) & 0xFF);
-            ide_write_reg(5, (target >> 16) & 0xFF);
-            ide_write_reg(6, (dev_base | 0x40) | ((target >> 24) & 0x0F));
-        }
+        bool use_lba48 = config.lba_sectors > 0x0FFFFFFF;
+        c.count = 1;
+        c.lba_lo = (uint8_t)target; c.lba_mid = (uint8_t)(target >> 8); c.lba_hi = (uint8_t)(target >> 16);
+        if (use_lba48) { c.ext = true; c.hob_lba_lo = (uint8_t)(target >> 24); c.device = 0x40; }
+        else c.device = 0x40 | ((target >> 24) & 0x0F);
+        c.command = use_lba48 ? 0x24 : 0x20;
     } else {
-        uint16_t cyl = (uint16_t)target;
-        ide_write_reg(2, 1);
-        ide_write_reg(3, 1);                                   // sector 1 (1-based)
-        ide_write_reg(4, cyl & 0xFF);
-        ide_write_reg(5, (cyl >> 8) & 0xFF);
-        ide_write_reg(6, dev_base);                            // head 0, CHS
+        c.count = 1;
+        c.lba_lo = 1;                              // sector 1 (1-based)
+        c.lba_mid = (uint8_t)target; c.lba_hi = (uint8_t)(target >> 8);
+        c.device = 0;                              // head 0, CHS
+        c.command = 0x20;
     }
-    ide_write_reg(7, use_lba48 ? 0x24 : 0x20);                // READ SECTORS EXT / READ SECTORS
-
-    // Wait for BSY to clear
-    for (uint32_t t = 0; t < 10000; t++) {
-        if (config.intrq_enabled && gpio_get(IDE_INTRQ)) ide_read_reg(7);  // clear INTRQ
-        if (!(ide_read_reg(7) & 0x80)) break;
-        busy_wait_us_32(10);
-    }
-
-    // Drain DRQ data if present
-    if (ide_read_reg(7) & 0x08) ide_drain_sector();
-
-    return ide_read_reg(7);
+    c.proto = IDE_PROTO_PIO_IN;
+    c.buf = scratch;
+    c.sectors = 1;
+    c.timeout_ms = 100;
+    c.flags = IDE_F_NO_RECOVER | IDE_F_TAKE_ERR_DATA;
+    ide_exec(&c);
+    return c.status;
 }

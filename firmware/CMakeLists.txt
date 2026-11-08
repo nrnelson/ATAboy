@@ -39,13 +39,35 @@ add_executable(ATAboy
         ATAboy.c
         ide_pio.c
         ide.c
+        drive.c
+        ata_policy.c
+        sat.c
+        sense.c
+        json.c
+        api.c
         menus.c
         usb.c
         usb_descriptors.c
         config.c)
 
+# Version string reported by the API comes from version.h; the git hash is
+# baked in so a host can tell exactly which build is flashed.
+find_package(Git QUIET)
+set(FW_GIT_HASH "unknown")
+if (GIT_FOUND)
+    execute_process(COMMAND ${GIT_EXECUTABLE} describe --always --dirty --abbrev=10
+                    WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
+                    OUTPUT_VARIABLE FW_GIT_HASH OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET)
+    if (NOT FW_GIT_HASH)
+        set(FW_GIT_HASH "unknown")
+    endif()
+endif()
+target_compile_definitions(ATAboy PRIVATE FW_GIT_HASH="${FW_GIT_HASH}")
+target_compile_options(ATAboy PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation)
+
 pico_set_program_name(ATAboy "ATAboy")
-pico_set_program_version(ATAboy "0.6f3-recovery")
+pico_set_program_version(ATAboy "0.6f3-api1")
 
 # Generate PIO header
 pico_generate_pio_header(ATAboy ${CMAKE_CURRENT_LIST_DIR}/ataboy.pio)
@@ -63,6 +85,9 @@ target_link_libraries(ATAboy
         hardware_pio
         hardware_dma
         hardware_clocks
+        hardware_watchdog
+        pico_bootrom
+        pico_unique_id
         tinyusb_device
         tinyusb_board
         )

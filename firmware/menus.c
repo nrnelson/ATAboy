@@ -9,8 +9,11 @@
 #include <stdarg.h>
 #include <math.h>
 #include "pico/stdlib.h"
+#include "pico/multicore.h"
 #include "ide.h"
 #include "config.h"
+#include "drive.h"
+#include "version.h"
 #include "pico/util/queue.h"
 
 // ---------------------------------------------------------------------------
@@ -221,7 +224,7 @@ static void print_help(const char *text) {
 static void draw_bios_frame(void) {
     cdc_printf(BG_BLUE FG_WHITE CLR_SCR HIDE_CUR "\033[H");
     cdc_printf("\033[1;1H%80s", "");
-    cdc_printf("\033[1;10H" FG_WHITE "ATAboy Setup Utility v0.6f3R - Copyright (C) 2026 obsoletetech.us");
+    cdc_printf("\033[1;8H" FG_WHITE "ATAboy Setup Utility v" FW_VERSION " - Copyright (C) 2026 obsoletetech.us");
 
     bool feat = (current_screen == SCREEN_FEATURES);
 
@@ -343,13 +346,27 @@ static void update_main_menu(void) {
 //  Features Menu
 // ---------------------------------------------------------------------------
 
+#define FEAT_ITEMS 7
+#define FEAT_DEBUG 6
+
+static void cycle_read_timeout(void) {
+    static const uint32_t steps[] = {1000, 2000, 5000, 10000, 15000, 30000, 60000};
+    int n = sizeof(steps) / sizeof(steps[0]);
+    int i = 0;
+    while (i < n && steps[i] <= config.read_timeout_ms) i++;
+    config.read_timeout_ms = (i < n) ? steps[i] : steps[0];
+}
+
 static void update_features_menu(void) {
-    const char *labels[] = {"Write Protect", "Auto Mount at Start", "IORDY", "INTRQ", "Debug Mode"};
+    const char *labels[] = {"Write Protect", "Auto Mount at Start", "IORDY", "INTRQ",
+                            "Read Timeout", "No-Retry Reads", "Debug Mode"};
     const char *helps[] = {
         "Prevents any write commands from reaching the HDD.",
         "Automatically mounts the drive to USB on power-up sequence.",
         "Enables hardware IORDY (pin 27) flow control on the IDE bus.  Toggling this may help with picky drives.",
         "Enables hardware INTRQ (pin 28) for faster IDE command completion.  Toggling this may help with picky drives.",
+        "How long to wait for each sector before giving up. Longer lets a failing drive finish its own retries. Enter cycles.",
+        "Read with the drive's internal retries off (old drives only). Fast first pass over bad areas.",
         "Open low-level drive diagnostics and register status screen."
     };
 
@@ -359,7 +376,7 @@ static void update_features_menu(void) {
     emit_n(BOX_HL, 24);
     cdc_puts(BOX_MR);
 
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < FEAT_ITEMS; i++) {
         int row = 4 + i;
         cdc_printf("\033[%d;4H" FG_WHITE "%-25s", row, labels[i]);
         cdc_printf("\033[%d;35H" FG_YELLOW "[", row);
@@ -369,7 +386,11 @@ static void update_features_menu(void) {
         else if (i == 1) cdc_printf("%-8s", config.auto_mount ? "Enabled" : "Disabled");
         else if (i == 2) cdc_printf("%-8s", config.iordy_enabled ? "Enabled" : "Disabled");
         else if (i == 3) cdc_printf("%-8s", config.intrq_enabled ? "Enabled" : "Disabled");
-        else if (i == 4) cdc_printf("%-8s", "Enter");
+        else if (i == 4) { char t[12]; snprintf(t, sizeof(t), "%lu s", (unsigned long)(config.read_timeout_ms / 1000));
+                           if (config.read_timeout_ms < 1000) snprintf(t, sizeof(t), "%lu ms", (unsigned long)config.read_timeout_ms);
+                           cdc_printf("%-8s", t); }
+        else if (i == 5) cdc_printf("%-8s", config.no_retry ? "Enabled" : "Disabled");
+        else if (i == 6) cdc_printf("%-8s", "Enter");
 
         cdc_puts(RESET BG_BLUE FG_WHITE "]");
         if (i == config.feat_selected) print_help(helps[i]);
@@ -749,6 +770,29 @@ static void sync_to_config(void) {
 }
 
 // ---------------------------------------------------------------------------
+//  Follow changes made through the USB API (detect, geometry, mount, config)
+// ---------------------------------------------------------------------------
+
+static uint32_t seen_api_gen = 0;
+
+static void sync_from_api(void) {
+    if (drive.api_gen == seen_api_gen) return;
+    seen_api_gen = drive.api_gen;
+    sync_from_config();
+    if (drive.identified || drive.forced) {
+        strncpy(hdd_model_raw, drive.model, sizeof(hdd_model_raw) - 1);
+        hdd_model_raw[sizeof(hdd_model_raw) - 1] = '\0';
+    } else {
+        hdd_model_raw[0] = '\0';
+    }
+    show_detect_result = false;
+    hdd_status_text[0] = '\0';
+    if (is_mounted) current_screen = SCREEN_MOUNTED;
+    else if (current_screen == SCREEN_MOUNTED || current_screen == SCREEN_CONFIRM) current_screen = SCREEN_MAIN;
+    needs_full_redraw = true;
+}
+
+// ---------------------------------------------------------------------------
 //  Auto-mount — runs on core 1 so IDE ops never block USB on core 0
 // ---------------------------------------------------------------------------
 
@@ -784,6 +828,7 @@ static void try_auto_mount(void) {
         hdd_model_raw[i*2] = (char)(val>>8); hdd_model_raw[i*2+1] = (char)(val&0xFF);
     }
     hdd_model_raw[40] = '\0'; sanitize_identify_model(hdd_model_raw);
+    drive_note_identify(id_buf);
 
     if (!config.use_lba_mode)
         ide_set_geometry(config.heads, config.spt);
@@ -797,6 +842,7 @@ static void try_auto_mount(void) {
 // ---------------------------------------------------------------------------
 
 void core1_entry(void) {
+    multicore_lockout_victim_init();   // core 0 may save config to flash
     sync_from_config();
     try_auto_mount();
     bool trigger_overlay = false;
@@ -809,6 +855,7 @@ void core1_entry(void) {
     }
 
     while (true) {
+        sync_from_api();
         bool connected = cdc_connected;
         if (connected && !last_cdc_connected) { sleep_ms(200); needs_full_redraw = true; }
         last_cdc_connected = connected;
@@ -855,6 +902,7 @@ void core1_entry(void) {
         cdc_puts("\033[24;79H"); cdc_flush();
         int k = get_input();
         if (k == -1) { tight_loop_contents(); continue; }
+        if (drive.api_gen != seen_api_gen) { sync_from_api(); continue; }   // state changed under us
 
         if (show_detect_result) {
             if (k == KEY_ENTER || k == KEY_ESC) {
@@ -866,6 +914,7 @@ void core1_entry(void) {
                 show_detect_result = false; hdd_status_text[0] = '\0';
                 force_detect = false;
                 strcpy(hdd_model_raw, "Manually Forced Drive");
+                drive_note_forced();
 
                 // Force geometry — manual entry only, no IDENTIFY data
                 uint16_t dummy_id[256];
@@ -900,6 +949,7 @@ void core1_entry(void) {
                             use_lba_mode = false;
                             cur_cyls = detect_cyls; cur_heads = detect_heads; cur_spt = detect_spt;
                             ide_set_geometry(cur_heads, cur_spt);
+                            config.geo_mode = GEO_MANUAL;
                             sync_to_config(); waiting = false;
                         } else { sd = true; }
                     }
@@ -965,12 +1015,14 @@ void core1_entry(void) {
                     // Auto Detect — single reset, probe master then slave
                     uint16_t id_buf[256];
                     bool detected = false;
-                    uint8_t found = ide_probe_devices();
+                    uint8_t found = ide_probe_devices(0);
+                    drive.present = (found != 0);
                     if (found) {
                         ide_select_device(found);
                         config.dev_base = found;
                         if (ide_identify(id_buf)) detected = true;
                     }
+                    if (detected) drive_note_identify(id_buf); else drive_clear_identity();
                     if (!detected) ide_select_device(config.dev_base);
                     if (detected) {
                             for (int i = 0; i < 20; i++) {
@@ -1013,6 +1065,7 @@ void core1_entry(void) {
                                         use_lba_mode = false;
                                         cur_cyls = detect_cyls; cur_heads = detect_heads; cur_spt = detect_spt;
                                         ide_set_geometry(cur_heads, cur_spt);
+                                        config.geo_mode = GEO_MANUAL;
                                         sync_to_config(); waiting = false;
                                     } else { sd = true; }
                                 } else if (ch == KEY_ENTER) {
@@ -1026,7 +1079,11 @@ void core1_entry(void) {
                                         valid = true;
                                     }
 
-                                    if (valid) { if (!use_lba_mode) ide_set_geometry(cur_heads, cur_spt); sync_to_config(); waiting = false; }
+                                    if (valid) {
+                                        config.geo_mode = geo_idx == 0 ? GEO_NORMAL : geo_idx == 1 ? GEO_LARGE : GEO_LBA;
+                                        if (!use_lba_mode) ide_set_geometry(cur_heads, cur_spt);
+                                        sync_to_config(); waiting = false;
+                                    }
                                 }
                             }
                     } else {
@@ -1056,14 +1113,16 @@ void core1_entry(void) {
             }
         } else if (current_screen == SCREEN_FEATURES) {
             if (k == KEY_UP && config.feat_selected > 0) config.feat_selected--;
-            else if (k == KEY_DOWN && config.feat_selected < 4) config.feat_selected++;
+            else if (k == KEY_DOWN && config.feat_selected < FEAT_ITEMS - 1) config.feat_selected++;
             else if (k == KEY_ESC) current_screen = SCREEN_MAIN;
             else if (k == KEY_ENTER) {
                 if (config.feat_selected == 0) config.drive_write_protected = !config.drive_write_protected;
                 else if (config.feat_selected == 1) config.auto_mount = !config.auto_mount;
                 else if (config.feat_selected == 2) { config.iordy_enabled = !config.iordy_enabled; ide_set_iordy(config.iordy_enabled); }
                 else if (config.feat_selected == 3) config.intrq_enabled = !config.intrq_enabled;
-                else if (config.feat_selected == 4) current_screen = SCREEN_DEBUG;
+                else if (config.feat_selected == 4) cycle_read_timeout();
+                else if (config.feat_selected == 5) config.no_retry = !config.no_retry;
+                else if (config.feat_selected == FEAT_DEBUG) current_screen = SCREEN_DEBUG;
             }
             needs_full_redraw = true;
         }
