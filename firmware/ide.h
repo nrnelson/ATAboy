@@ -103,7 +103,7 @@ typedef struct {
     ide_proto_t proto;
     uint8_t  *buf;            // data in/out, sectors*512 (+ ecc_len) bytes
     uint32_t sectors;         // 512-byte blocks to transfer
-    uint8_t  ecc_len;         // READ LONG: extra 8-bit bytes after the last block
+    uint8_t  ecc_len;         // READ/WRITE LONG: extra 8-bit bytes after the last block
     uint8_t  flags;           // IDE_F_*
     uint32_t timeout_ms;      // per-block DRQ wait and completion wait (0 = 1000)
     uint32_t ready_ms;        // wait for drive ready before issuing (0 = 5000)

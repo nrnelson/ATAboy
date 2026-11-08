@@ -421,6 +421,11 @@ int ide_exec(ide_cmd_t *c) {
             if (r < 0) { res = IDE_TIMEOUT; break; }
             if (r == 0) { res = IDE_ATA_ERROR; break; }
             if (!data_out(w + b * 256, 256)) { res = IDE_BUS_FAULT; break; }
+            if (c->ecc_len && b == c->sectors - 1) {
+                // WRITE LONG: vendor ECC bytes follow as 8-bit transfers on DD0-7
+                for (uint8_t i = 0; i < c->ecc_len; i++)
+                    wr(0, c->buf[(b + 1) * 512 + i]);
+            }
             c->done = b;                          // committed once the drive moves on
         }
         if (res == IDE_OK) {

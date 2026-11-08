@@ -216,7 +216,7 @@ OPS = {
     "info": 0x00, "status": 0x01, "config_get": 0x02, "config_set": 0x03,
     "config_save": 0x04, "config_defaults": 0x05, "detect": 0x10, "geometry": 0x11,
     "mount": 0x12, "unmount": 0x13, "reset": 0x14, "identify": 0x20, "taskfile": 0x21,
-    "read": 0x22, "read_long": 0x23, "verify": 0x24, "log": 0x30, "log_clear": 0x31,
+    "read": 0x22, "read_long": 0x23, "verify": 0x24, "corrupt": 0x25, "log": 0x30, "log_clear": 0x31,
     "arm": 0x40, "reboot": 0x41,
 }
 
@@ -557,6 +557,16 @@ class ATAboy:
             raise ApiError(r)
         return AtaResult(r.payload, r.result)
 
+    def corrupt(self, lba, bits=16, ecc_len=0):
+        """DESTRUCTIVE test helper: flip 'bits' data bits in a sector and write it
+        back with its old ECC (WRITE LONG), creating a correctable or UNC sector.
+        Needs write protect off; arms itself.  Rewrite the sector to repair it."""
+        self.arm()
+        r = self.call("corrupt", struct.pack(">IBB", lba, bits, ecc_len), timeout_ms=60000)
+        if r.ctype != CT_BINARY:
+            raise ApiError(r)
+        return AtaResult(r.payload, r.result)
+
     def log(self):
         """All retained error-log entries (pages through the device log)."""
         entries, start, total = [], 0, 0
@@ -673,6 +683,88 @@ class ATAboy:
         info["vote"] = {"reads": len(good), "unstable_bytes": unstable}
         info["ecc_hex"] = bytes(voted[512:]).hex()
         return bytes(voted), info
+
+    def image(self, out, mapfile=None, start=0, count=None, chunk_sectors=128, time_budget_s=0,
+              progress=None):
+        """Image the mounted drive through the USB disk (/dev/sdX, O_DIRECT) into
+        'out', keeping a ddrescue-compatible mapfile so the run can be resumed
+        and then handed to rescue().  Chunks that fail are re-read sector by
+        sector; unreadable sectors are marked '-'."""
+        import mmap
+        if not self.info_dev:
+            raise TransportError("imaging needs the block device of a discovered ATAboy")
+        st = self.status()
+        if not st["mounted"]:
+            raise ApiError(Reply(b"AB\x01\x00\x04\x01\x00\x00" + bytes(8)))
+        total = st["geometry"]["sectors"]
+        end = total if count is None else min(total, start + count)
+        mapfile = mapfile or out + ".map"
+        if os.path.exists(mapfile):
+            m = Mapfile.load(mapfile)
+        else:
+            m = Mapfile(mapfile, ["# Mapfile. Created by ataboy " + __version__],
+                        "0x00000000     ?               1", [[0, total * 512, "?"]])
+        todo = []
+        for pos, size, s in m.blocks:
+            if s == "?":
+                a, b = max(pos // 512, start), min((pos + size) // 512, end)
+                if a < b:
+                    todo.append((a, b))
+        fd = os.open(self.info_dev["block"], os.O_RDONLY | os.O_DIRECT)
+        buf = mmap.mmap(-1, chunk_sectors * 512)
+        one = mmap.mmap(-1, 4096)
+        mode = "r+b" if os.path.exists(out) else "w+b"
+        t0, done, bad, last_save = time.time(), 0, [], time.time()
+        complete = True
+        try:
+            with open(out, mode) as img:
+                img.truncate(max(os.path.getsize(out), total * 512))
+                for a, b in todo:
+                    lba = a
+                    while lba < b:
+                        if time_budget_s and time.time() - t0 > time_budget_s:
+                            complete = False
+                            break
+                        n = min(chunk_sectors, b - lba)
+                        try:
+                            got = os.preadv(fd, [memoryview(buf)[:n * 512]], lba * 512)
+                            if got != n * 512:
+                                raise OSError(errno.EIO, "short read")
+                            img.seek(lba * 512)
+                            img.write(memoryview(buf)[:n * 512])
+                            m.mark(lba, n, "+")
+                            done += n
+                        except OSError:
+                            for s in range(lba, lba + n):          # isolate the bad sector(s)
+                                try:
+                                    if os.preadv(fd, [memoryview(one)[:512]], s * 512) != 512:
+                                        raise OSError(errno.EIO, "short read")
+                                    img.seek(s * 512)
+                                    img.write(memoryview(one)[:512])
+                                    m.mark(s, 1, "+")
+                                    done += 1
+                                except OSError:
+                                    m.mark(s, 1, "-")
+                                    bad.append(s)
+                                    if progress:
+                                        progress("bad LBA %d" % s)
+                        lba += n
+                        if time.time() - last_save > 10:
+                            m.save()
+                            last_save = time.time()
+                            if progress:
+                                progress("  %d sectors imaged, %d bad, %.0f kB/s" % (
+                                    done, len(bad), done * 0.512 / max(0.001, time.time() - t0)))
+                    if not complete:
+                        break
+        finally:
+            os.close(fd)
+            m.save()
+        secs = time.time() - t0
+        return {"result": "ok" if not bad else "errors", "image": out, "mapfile": mapfile,
+                "imaged_sectors": done, "bad_lbas": bad, "complete": complete,
+                "map": m.summary(), "seconds": round(secs, 1),
+                "kB_per_s": round(done * 0.512 / secs, 1) if secs else None}
 
     def rescue(self, image, mapfile, timeout_ms=15000, votes=5, readlong=True,
                no_retry_pass=True, max_sectors=0, time_budget_s=0, progress=None):
@@ -1130,6 +1222,16 @@ def cmd_verify(args, dev):
     return EXIT_OK if not out["bad"] else EXIT_DEVICE
 
 
+def cmd_image(args, dev):
+    prog = None if args.json else (lambda s: print(s, flush=True))
+    out = dev.image(args.out, mapfile=args.mapfile, start=args.start, count=args.count,
+                    time_budget_s=args.budget, progress=prog)
+    _emit(args, out, lambda o: print("imaged %d sectors in %.1f s (%s kB/s), %d bad%s; map %s" % (
+        o["imaged_sectors"], o["seconds"], o["kB_per_s"], len(o["bad_lbas"]),
+        "" if o["complete"] else " (time budget ran out; run again to resume)", o["mapfile"])))
+    return EXIT_OK if not out["bad_lbas"] else EXIT_DEVICE
+
+
 def cmd_rescue(args, dev):
     prog = None if args.json else (lambda s: print(s, flush=True))
     before = Mapfile.load(args.mapfile).summary()
@@ -1143,6 +1245,12 @@ def cmd_rescue(args, dev):
         o["candidates"], o["recovered"], len(o["recovered_no_retry"]), len(o["recovered_retry"]),
         len(o["readlong"]), len(o["still_bad"]), "" if o["complete"] else " (time budget ran out)")))
     return EXIT_OK if not out["still_bad"] else EXIT_DEVICE
+
+
+def cmd_corrupt(args, dev):
+    r = dev.corrupt(args.lba, bits=args.bits, ecc_len=args.ecc)
+    _emit(args, r.to_dict(), human_ata_result)
+    return EXIT_OK if r.ok else EXIT_DEVICE
 
 
 def cmd_log(args, dev):
@@ -1306,6 +1414,13 @@ def build_parser():
     x.add_argument("--timeout", type=int, default=0, help="per-command timeout ms")
     x.add_argument("--max-errors", type=int, default=0)
     x.add_argument("--budget", type=float, default=0, help="stop after N seconds (resume at next_lba)")
+    x = add("image", cmd_image, "image the mounted drive to a file with a ddrescue-compatible mapfile "
+                                "(resumable; follow with rescue)")
+    x.add_argument("out", help="image file")
+    x.add_argument("--mapfile", help="default: OUT.map")
+    x.add_argument("--start", type=_int, default=0)
+    x.add_argument("--count", type=_int)
+    x.add_argument("--budget", type=float, default=0, help="stop after N seconds")
     x = add("rescue", cmd_rescue, "after ddrescue: retry only the mapfile's bad sectors (no-retry pass, "
                                   "drive retries, READ LONG vote), patch the image, update the map")
     x.add_argument("image", help="ddrescue output image (written in place)")
@@ -1316,6 +1431,11 @@ def build_parser():
     x.add_argument("--no-fast-pass", action="store_true", help="skip the no-retry pass")
     x.add_argument("--max-sectors", type=int, default=0, help="only the first N bad sectors")
     x.add_argument("--budget", type=float, default=0, help="stop after N seconds")
+    x = add("corrupt", cmd_corrupt, "DESTRUCTIVE test helper: damage a sector on purpose (READ LONG, flip "
+                                    "bits, WRITE LONG with stale ECC) to exercise recovery tools")
+    x.add_argument("lba", type=_int)
+    x.add_argument("--bits", type=int, default=16, help="data bits to flip (default 16)")
+    x.add_argument("--ecc", type=int, default=0, help="ECC bytes (default: IDENTIFY word 22, else 4)")
     x = add("log", cmd_log, "error log: every failed command with ATA status/error/registers")
     x.add_argument("--clear", action="store_true", help="clear after reading")
     x = add("clear", cmd_clear, "clear the error log (and/or statistics)")

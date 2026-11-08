@@ -38,6 +38,7 @@
 #define OP_READ          0x22
 #define OP_READ_LONG     0x23
 #define OP_VERIFY        0x24
+#define OP_CORRUPT       0x25
 #define OP_LOG           0x30
 #define OP_LOG_CLEAR     0x31
 #define OP_ARM           0x40
@@ -130,6 +131,7 @@ static const char *op_name(uint8_t op) {
     case LOGOP_PASSTHRU:  return "passthrough";
     case LOGOP_IDENTIFY:  return "identify";
     case LOGOP_READ_DIAG: return "read_diag";
+    case LOGOP_WRITE_LONG: return "write_long";
     default:           return "unknown";
     }
 }
@@ -384,6 +386,7 @@ static int32_t op_info(uint8_t *buf, uint32_t cap) {
     j_uint(&j, "reset", OP_RESET);         j_uint(&j, "identify", OP_IDENTIFY);
     j_uint(&j, "taskfile", OP_TASKFILE);   j_uint(&j, "read", OP_READ);
     j_uint(&j, "read_long", OP_READ_LONG); j_uint(&j, "verify", OP_VERIFY);
+    j_uint(&j, "corrupt", OP_CORRUPT);
     j_uint(&j, "log", OP_LOG);             j_uint(&j, "log_clear", OP_LOG_CLEAR);
     j_uint(&j, "arm", OP_ARM);             j_uint(&j, "reboot", OP_REBOOT);
     j_end(&j);
@@ -392,6 +395,7 @@ static int32_t op_info(uint8_t *buf, uint32_t cap) {
     j_str(&j, NULL, "pio_out"); j_str(&j, NULL, "read_through_error");
     j_str(&j, NULL, "read_long"); j_str(&j, NULL, "verify"); j_str(&j, NULL, "bootsel");
     j_str(&j, NULL, "persistent_timeouts"); j_str(&j, NULL, "no_retry_reads");
+    j_str(&j, NULL, "corrupt_sector");
     j_end(&j);
     j_end(&j);
     return finish(buf, R_OK, CT_JSON, j.len);
@@ -632,6 +636,58 @@ static int32_t op_verify(uint8_t *buf, uint32_t cap, const uint8_t *a) {
     return finish(buf, drive_result_from_ide(r), CT_BINARY, RES_LEN);
 }
 
+// CORRUPT: make a deliberately damaged sector for testing recovery tools.
+// READ LONG the sector, flip 'bits' data bits, WRITE LONG it back with the
+// original ECC bytes, so the stored ECC no longer matches the data.  Few bits
+// are usually corrected by the drive; more give UNC.  Rewriting the sector
+// normally repairs it.  Needs write protect off and an ARM (consumed).
+static int32_t op_corrupt(uint8_t *buf, uint32_t cap, const uint8_t *a) {
+    uint32_t lba = be32(&a[0]);
+    uint8_t bits = a[4];
+    uint8_t ecc = a[5] ? a[5] : drive_ecc_len();
+    bool armed_ok = api_take_arm();
+    if (config.drive_write_protected) return reply_msg(buf, cap, R_WRITE_PROTECTED, "turn write protect off first");
+    if (!armed_ok) return reply_msg(buf, cap, R_NOT_ARMED, "ARM first (destructive)");
+    if (bits == 0 || ecc > 64) return reply_msg(buf, cap, R_BAD_ARG, "bits must be 1..255, ecc_len 0..64");
+    if (!drive_geometry_valid()) return reply_msg(buf, cap, R_NO_GEOMETRY, "detect or set geometry first");
+    if ((uint64_t)lba >= drive_total_sectors()) return reply_msg(buf, cap, R_BAD_ARG, "beyond end of drive");
+
+    static uint8_t sec[512 + 64];
+    ide_cmd_t c = {0};
+    if (!ide_cmd_address(&c, lba, 1, false)) return reply_msg(buf, cap, R_BAD_ARG, "needs a CHS/LBA28 address");
+    c.command = 0x22;
+    c.proto = IDE_PROTO_PIO_IN;
+    c.buf = sec;
+    c.sectors = 1;
+    c.ecc_len = ecc;
+    c.flags = IDE_F_NEED_DRDY | IDE_F_TAKE_ERR_DATA;
+    c.timeout_ms = config.read_timeout_ms;
+    int r = ide_exec(&c);
+    drive_record(LOGOP_READ_LONG, &c, lba, 1);
+    if (!(c.done == 1 || c.err_data)) {
+        put_result(buf + HDR_LEN, &c, lba, 1, false);
+        return finish(buf, drive_result_from_ide(r), CT_BINARY, RES_LEN);
+    }
+    for (uint32_t i = 0; i < bits; i++) {          // spread the flips over the sector
+        uint32_t bit = (i * 1031u + 7u) % 4096u;
+        sec[bit >> 3] ^= (uint8_t)(1u << (bit & 7));
+    }
+    ide_cmd_t w = {0};
+    ide_cmd_address(&w, lba, 1, false);
+    w.command = 0x32;                              // WRITE LONG (with retries)
+    w.proto = IDE_PROTO_PIO_OUT;
+    w.buf = sec;
+    w.sectors = 1;
+    w.ecc_len = ecc;
+    w.flags = IDE_F_NEED_DRDY;
+    w.timeout_ms = config.write_timeout_ms;
+    r = ide_exec(&w);
+    drive_record(LOGOP_WRITE_LONG, &w, lba, 1);
+    w.done = (r == IDE_OK) ? 1 : 0;
+    put_result(buf + HDR_LEN, &w, lba, 1, false);
+    return finish(buf, drive_result_from_ide(r), CT_BINARY, RES_LEN);
+}
+
 static int32_t op_log(uint8_t *buf, uint32_t cap, const uint8_t *a) {
     uint32_t start = be32(&a[0]);
     uint32_t n = drive_log_count();
@@ -707,6 +763,7 @@ int32_t api_handle(uint8_t lun, const uint8_t *cdb, uint8_t *buf, uint32_t cap) 
     case OP_READ:       return op_read(buf, cap, a);
     case OP_READ_LONG:  return op_read_long(buf, cap, a);
     case OP_VERIFY:     return op_verify(buf, cap, a);
+    case OP_CORRUPT:    return op_corrupt(buf, cap, a);
     case OP_LOG:        return op_log(buf, cap, a);
     case OP_LOG_CLEAR:
         if (a[0] & 1) drive_log_clear();

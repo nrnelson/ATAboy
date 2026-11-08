@@ -32,6 +32,7 @@ extern volatile bool media_changed_waiting;
 #define LOGOP_PASSTHRU  5
 #define LOGOP_IDENTIFY  6
 #define LOGOP_READ_DIAG 7
+#define LOGOP_WRITE_LONG 8
 
 typedef struct {
     uint32_t seq;
