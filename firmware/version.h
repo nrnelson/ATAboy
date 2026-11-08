@@ -11,6 +11,12 @@
 // only for incompatible changes; new fields/sub-ops are added compatibly.
 #define API_PROTO_VERSION 1
 
+// FW_GIT_HASH comes from git_version.h, generated at build time (CMakeLists.txt).
+#if defined(__has_include)
+#if __has_include("git_version.h")
+#include "git_version.h"
+#endif
+#endif
 #ifndef FW_GIT_HASH
 #define FW_GIT_HASH "unknown"
 #endif

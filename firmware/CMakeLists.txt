@@ -60,19 +60,18 @@ add_executable(ATAboy
         config_check.c)
 
 # Version string reported by the API comes from version.h; the git hash is
-# baked in so a host can tell exactly which build is flashed.
+# baked in so a host can tell exactly which build is flashed.  It is taken at
+# build time (not configure time), so a rebuild after a commit reports the
+# new hash.
 find_package(Git QUIET)
-set(FW_GIT_HASH "unknown")
-if (GIT_FOUND)
-    execute_process(COMMAND ${GIT_EXECUTABLE} describe --always --dirty --abbrev=10
-                    WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
-                    OUTPUT_VARIABLE FW_GIT_HASH OUTPUT_STRIP_TRAILING_WHITESPACE
-                    ERROR_QUIET)
-    if (NOT FW_GIT_HASH)
-        set(FW_GIT_HASH "unknown")
-    endif()
-endif()
-target_compile_definitions(ATAboy PRIVATE FW_GIT_HASH="${FW_GIT_HASH}"
+add_custom_target(git_version
+        COMMAND ${CMAKE_COMMAND} -DGIT=${GIT_EXECUTABLE} -DSRC=${CMAKE_CURRENT_LIST_DIR}
+                -DOUT=${CMAKE_CURRENT_BINARY_DIR}/git_version.h -P ${CMAKE_CURRENT_LIST_DIR}/cmake/git_version.cmake
+        BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/git_version.h
+        COMMENT "git version")
+add_dependencies(ATAboy git_version)
+target_include_directories(ATAboy PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+target_compile_definitions(ATAboy PRIVATE
         PICO_STACK_SIZE=0x1000          # core 0 (SCRATCH_Y, 4 KiB): TinyUSB callbacks + IDE + JSON
         PICO_CORE1_STACK_SIZE=0x1000)   # core 1 (SCRATCH_X, 4 KiB): menu (vsnprintf, IDENTIFY buffers)
 target_compile_options(ATAboy PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation)
