@@ -1154,6 +1154,7 @@ class ATAboy:
         f = None
         if out:
             f = open(out, "r+b" if image and os.path.exists(out) else "wb")
+            give_back(out)
         try:
             while cur < end:
                 if time_budget_s and time.time() - t0 > time_budget_s:
@@ -1274,6 +1275,7 @@ class ATAboy:
         complete = True
         try:
             with open(out, mode) as img:
+                give_back(out)
                 img.truncate(max(os.path.getsize(out), total * 512))
                 for a, b in todo:
                     lba = a
@@ -1463,6 +1465,7 @@ class ATAboy:
                     with open(tmp, "w") as sf:
                         json.dump(sidecar, sf, indent=1, sort_keys=True)
                     os.replace(tmp, sidecar_path)
+                    give_back(sidecar_path)
         rec["still_bad"] = remaining
         rec["complete"] = not (state["budget_hit"] or state["interrupted"])
         rec["map_saves"] = state["saves"] + 1
@@ -1606,6 +1609,7 @@ class Mapfile:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, self.path)
+        give_back(self.path)
 
 
 def parse_ata_return(sense):
@@ -2829,7 +2833,6 @@ def build_parser():
 
 NO_DEVICE_CMDS = {"list", "wait", "whatfile"}
 SG_CMDS = {"ata"}                  # SAT pass-through: SG_IO even on the serial transport
-BLOCK_CMDS = {"image"}             # read /dev/sdX directly
 
 
 def _serial_usable(args):
@@ -2842,8 +2845,6 @@ def _serial_usable(args):
     try:
         d = select_device(find_devices(), args.serial)
     except TransportError:
-        return False
-    if args.cmd in BLOCK_CMDS and not (d["block"] and os.access(d["block"], os.R_OK)):
         return False
     return bool(d["tty"]) and os.access(d["tty"], os.R_OK | os.W_OK)
 
@@ -2866,6 +2867,17 @@ def _maybe_sudo(args, argv):
         os.execvp("sudo", ["sudo", "-n", "--"] + cmd)
     if sys.stdin.isatty():
         os.execvp("sudo", ["sudo", "--"] + cmd)
+
+
+def give_back(path):
+    """When the CLI re-ran itself under sudo, hand files it creates back to
+    the user who ran it, so a later run without root can still update them."""
+    uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
+    if os.geteuid() == 0 and uid and gid:
+        try:
+            os.chown(path, int(uid), int(gid))
+        except OSError:
+            pass
 
 
 def _boot_id_file():

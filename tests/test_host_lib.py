@@ -23,6 +23,7 @@ import io
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 sys.dont_write_bytecode = True          # no __pycache__ next to host/ataboy
 
@@ -1552,12 +1553,24 @@ class TestTransportChoice(unittest.TestCase):
             self.assertTrue(ab._serial_usable(parse(["status"])))
             self.assertFalse(ab._serial_usable(parse(["--transport", "sgio", "status"])))
             self.assertFalse(ab._serial_usable(parse(["ata", "0xEC", "--read", "1"])))   # SAT needs SG_IO
-            self.assertFalse(ab._serial_usable(parse(["image", "x.img"])))               # /dev/sdz unreadable
+            self.assertTrue(ab._serial_usable(parse(["image", "x.img"])))   # /dev/sdz unreadable: API reads, no sudo
             os.chmod(tty.name, 0)
             if os.geteuid() != 0:
                 self.assertFalse(ab._serial_usable(parse(["status"])))
         self.dev_entry["tty"] = None
         self.assertFalse(ab._serial_usable(ab.build_parser().parse_args(["status"])))
+
+    def test_give_back_only_under_sudo(self):
+        calls = []
+        with mock.patch.object(ab.os, "chown", lambda p, u, g: calls.append((p, u, g))), \
+             mock.patch.object(ab.os, "geteuid", lambda: 0), \
+             mock.patch.dict(ab.os.environ, {"SUDO_UID": "1000", "SUDO_GID": "1001"}):
+            ab.give_back("f")
+        self.assertEqual(calls, [("f", 1000, 1001)])
+        with mock.patch.object(ab.os, "chown", lambda p, u, g: calls.append((p, u, g))), \
+             mock.patch.object(ab.os, "geteuid", lambda: 1000):
+            ab.give_back("g")
+        self.assertEqual(len(calls), 1)
 
     def test_sgio_and_explicit_paths(self):
         self.assertEqual(ab.ATAboy(transport="sgio").transport, "sgio")
