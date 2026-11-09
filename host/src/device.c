@@ -327,8 +327,10 @@ int ab_call(ab_dev *dev, uint8_t op, const uint8_t *args, size_t nargs, uint32_t
     memcpy(cdb + 4, a, 12);
     int rc = send_req(dev, cdb, alloc ? alloc : API_MAX_REPLY, timeout_ms ? timeout_ms : 60000,
                       api_op_read_only(op) || rid != 0, r);
+    // (5/24/00 also means "allocation too small", so only an adequate
+    // allocation makes it evidence of old firmware.)
     if (rc == AB_ERR_CHECK && ext && dev->ext == -1 && dev->sense[0] == 5 && dev->sense[1] == 0x24 &&
-        dev->sense[2] == 0) {
+        dev->sense[2] == 0 && (alloc == 0 || alloc >= API_MIN_ALLOC)) {
         // Firmware without the extended header refuses the signature before
         // running anything: basic requests from now on.
         dev->ext = 0;
