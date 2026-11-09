@@ -25,6 +25,12 @@ int main(void) {
     CHECK(s && !strcmp(s, "\"\\ufffd\\ufffd|\\ufffd\\ufffd\\ufffd|\\ufffd|\\ufffd(|\\ud83d\\ude00|\\u20ac\""));
     free(s);
     cJSON_Delete(j);
+
+    j = cJSON_CreateString("a\x7f\x01" "b");          // json.dumps escapes DEL and control characters
+    s = ab_json_print(j, 0);
+    CHECK(s && !strcmp(s, "\"a\\u007f\\u0001b\""));
+    free(s);
+    cJSON_Delete(j);
     if (failures) { printf("%d failure(s)\n", failures); return 1; }
     printf("all libataboy tests passed\n");
     return 0;

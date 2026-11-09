@@ -1,0 +1,120 @@
+vol  LBA 0-95  type -  superfloppy  [FAT12 TESTVOL, 31 files, 3 dirs, 3 deleted entries]
+
+         0  vol FAT12  boot sector
+         1  vol FAT12  FAT copy 1 of 2 (entries for clusters 0-340); other FAT copies hold the same entries
+         2  vol FAT12  FAT copy 1 of 2 (entries for clusters 341-682); other FAT copies hold the same entries
+         3  vol FAT12  FAT copy 1 of 2 (entries for clusters 682-1023); other FAT copies hold the same entries
+         4  vol FAT12  FAT copy 1 of 2 (entries for clusters 1024-1364); other FAT copies hold the same entries
+         5  vol FAT12  FAT copy 1 of 2 (entries for clusters 1365-1706); other FAT copies hold the same entries
+         6  vol FAT12  FAT copy 1 of 2 (entries for clusters 1706-2047); other FAT copies hold the same entries
+         7  vol FAT12  FAT copy 1 of 2 (entries for clusters 2048-2388); other FAT copies hold the same entries
+         8  vol FAT12  FAT copy 1 of 2 (entries for clusters 2389-2730); other FAT copies hold the same entries
+         9  vol FAT12  FAT copy 1 of 2 (entries for clusters 2730-2848); other FAT copies hold the same entries
+        10  vol FAT12  FAT copy 2 of 2 (entries for clusters 0-340); other FAT copies hold the same entries
+        11  vol FAT12  FAT copy 2 of 2 (entries for clusters 341-682); other FAT copies hold the same entries
+        12  vol FAT12  FAT copy 2 of 2 (entries for clusters 682-1023); other FAT copies hold the same entries
+        13  vol FAT12  FAT copy 2 of 2 (entries for clusters 1024-1364); other FAT copies hold the same entries
+        14  vol FAT12  FAT copy 2 of 2 (entries for clusters 1365-1706); other FAT copies hold the same entries
+        15  vol FAT12  FAT copy 2 of 2 (entries for clusters 1706-2047); other FAT copies hold the same entries
+        16  vol FAT12  FAT copy 2 of 2 (entries for clusters 2048-2388); other FAT copies hold the same entries
+        17  vol FAT12  FAT copy 2 of 2 (entries for clusters 2389-2730); other FAT copies hold the same entries
+        18  vol FAT12  FAT copy 2 of 2 (entries for clusters 2730-2848); other FAT copies hold the same entries
+        19  vol FAT12  root directory /  [entries: TESTVOL (label), A long file name.txt, readme, SUBDIR/, deleted file.dat (deleted), _LDDIR/ (deleted), +4 more]
+        20  vol FAT12  root directory /  [entries: NOTMIN~1.TXT, EMPTY, BADTIME.TXT]
+        21  vol FAT12  root directory /  [no entries in this sector]
+        22  vol FAT12  root directory /  [no entries in this sector]
+        23  vol FAT12  root directory /  [no entries in this sector]
+        24  vol FAT12  root directory /  [no entries in this sector]
+        25  vol FAT12  root directory /  [no entries in this sector]
+        26  vol FAT12  root directory /  [no entries in this sector]
+        27  vol FAT12  root directory /  [no entries in this sector]
+        28  vol FAT12  root directory /  [no entries in this sector]
+        29  vol FAT12  root directory /  [no entries in this sector]
+        30  vol FAT12  root directory /  [no entries in this sector]
+        31  vol FAT12  root directory /  [no entries in this sector]
+        32  vol FAT12  root directory /  [no entries in this sector]
+        33  vol FAT12  free 2
+        34  vol FAT12  file /A long file name.txt  [offset 0 of 1500 bytes, cluster 3]
+        35  vol FAT12  file /A long file name.txt  [offset 512 of 1500 bytes, cluster 4]
+        36  vol FAT12  file /A long file name.txt  [offset 1024 of 1500 bytes, cluster 5]
+        37  vol FAT12  file /readme  [offset 0 of 100 bytes, cluster 6]
+        38  vol FAT12  directory /SUBDIR  [entries: Nested Folder/, F0000000.TXT, F0000001.TXT, F0000002.TXT, F0000003.TXT, F0000004.TXT, +7 more]
+        39  vol FAT12  file /FRAG.BIN  [offset 0 of 2048 bytes, cluster 8]
+        40  vol FAT12  file /FRAG.BIN  [offset 1024 of 2048 bytes, cluster 9]
+        41  vol FAT12  file /FRAG.BIN  [offset 512 of 2048 bytes, cluster 10]
+        42  vol FAT12  file /FRAG.BIN  [offset 1536 of 2048 bytes, cluster 11]
+        43  vol FAT12  directory /SUBDIR  [entries: F0000012.TXT, F0000013.TXT, F0000014.TXT, F0000015.TXT, F0000016.TXT, F0000017.TXT, +3 more]
+        44  vol FAT12  file /LOOP.BIN  [offset 0 of 4096 bytes, cluster 13]
+        45  vol FAT12  file /LOOP.BIN  [offset 512 of 4096 bytes, cluster 14]
+        46  vol FAT12  file /σSIGMA.TXT  [offset 0 of 10 bytes, cluster 15]
+        47  vol FAT12  free 16
+        48  vol FAT12  file /NOTMIN~1.TXT  [offset 0 of 600 bytes, cluster 17]
+        49  vol FAT12  file /NOTMIN~1.TXT  [offset 512 of 600 bytes, cluster 18]
+        50  vol FAT12  file /BADTIME.TXT  [offset 0 of 1 bytes, cluster 19]
+        51  vol FAT12  deleted (best effort) /deleted file.dat  [cluster 20, first cluster of the deleted entry; offset 0 of 1100 bytes]
+        52  vol FAT12  directory /SUBDIR/Nested Folder  [entries: DEEP.TXT, SELF/]
+        53  vol FAT12  file /SUBDIR/INSUB.DAT  [offset 0 of 700 bytes, cluster 22]
+        54  vol FAT12  file /SUBDIR/INSUB.DAT  [offset 512 of 700 bytes, cluster 23]
+        55  vol FAT12  deleted (best effort) /_LDDIR/  [cluster 24, first cluster of the deleted entry; entries: CHILD.TXT (deleted)]
+        56  vol FAT12  deleted (best effort) /_LDDIR/CHILD.TXT  [cluster 25, first cluster of the deleted entry; offset 0 of 300 bytes]
+        57  vol FAT12  file /SUBDIR/Nested Folder/DEEP.TXT  [offset 0 of 5 bytes, cluster 26]
+        58  vol FAT12  lost 27  (allocated in the FAT but not reachable from any directory)
+        59  vol FAT12  bad cluster 28  (marked bad in the FAT)
+        60  vol FAT12  free 29
+        61  vol FAT12  free 30
+        62  vol FAT12  free 31
+        63  vol FAT12  free 32
+        64  vol FAT12  free 33
+        65  vol FAT12  free 34
+        66  vol FAT12  free 35
+        67  vol FAT12  free 36
+        68  vol FAT12  free 37
+        69  vol FAT12  free 38
+        70  vol FAT12  free 39
+        71  vol FAT12  free 40
+        72  vol FAT12  free 41
+        73  vol FAT12  free 42
+        74  vol FAT12  free 43
+        75  vol FAT12  free 44
+        76  vol FAT12  free 45
+        77  vol FAT12  free 46
+        78  vol FAT12  free 47
+        79  vol FAT12  free 48
+        80  vol FAT12  free 49
+        81  vol FAT12  free 50
+        82  vol FAT12  free 51
+        83  vol FAT12  free 52
+        84  vol FAT12  free 53
+        85  vol FAT12  free 54
+        86  vol FAT12  free 55
+        87  vol FAT12  free 56
+        88  vol FAT12  free 57
+        89  vol FAT12  free 58
+        90  vol FAT12  free 59
+        91  vol FAT12  free 60
+        92  vol FAT12  free 61
+        93  vol FAT12  free 62
+        94  vol FAT12  free 63
+        95  vol FAT12  free 64
+        96  -          beyond image
+        97  -          beyond image
+    100000  -          beyond image
+8589934592  -          beyond image
+        -1  -          invalid
+
+affected objects:
+  root_dir  vol /  14 sectors: 19 20 21 22 23 24 25 26 ...
+  file      vol /A long file name.txt  3 sectors: 34 35 36
+  file      vol /readme  1 sector: 37
+  directory vol /SUBDIR  2 sectors: 38 43
+  file      vol /FRAG.BIN  4 sectors: 39 40 41 42
+  file      vol /LOOP.BIN  2 sectors: 44 45
+  file      vol /σSIGMA.TXT  1 sector: 46
+  file      vol /NOTMIN~1.TXT  2 sectors: 48 49
+  file      vol /BADTIME.TXT  1 sector: 50
+  deleted   vol /deleted file.dat  1 sector: 51
+  directory vol /SUBDIR/Nested Folder  1 sector: 52
+  file      vol /SUBDIR/INSUB.DAT  2 sectors: 53 54
+  deleted   vol /_LDDIR  1 sector: 55
+  deleted   vol /_LDDIR/CHILD.TXT  1 sector: 56
+  file      vol /SUBDIR/Nested Folder/DEEP.TXT  1 sector: 57

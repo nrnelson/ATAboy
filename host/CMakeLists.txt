@@ -61,7 +61,8 @@ set(FW_SHARED ${FW}/apiframe.c ${FW}/crc32.c ${FW}/api_proto.c ${FW}/json.c)
 
 set(LIB_SRC
     src/device.c src/binops.c src/recover.c src/jsonout.c src/transport_serial.c
-    src/mapfile.c src/imaging.c src/hashes.c src/sha256.c)
+    src/mapfile.c src/imaging.c src/hashes.c src/sha256.c
+    src/ata.c src/fatmap.c)
 if (WIN32)
     list(APPEND LIB_SRC src/plat_win.c src/discover_win.c)
 elseif (APPLE)
@@ -96,6 +97,20 @@ add_executable(test_lib tests/test_lib.c)
 target_include_directories(test_lib PRIVATE src ${FW})
 target_link_libraries(test_lib PRIVATE ataboy_lib)
 add_test(NAME test_lib COMMAND test_lib)
+
+# whatfile / ata unit tests (no hardware)
+add_executable(test_fat tests/test_fat.c)
+target_include_directories(test_fat PRIVATE src ${FW})
+target_link_libraries(test_fat PRIVATE ataboy_lib)
+add_test(NAME test_fat COMMAND test_fat ${CMAKE_CURRENT_LIST_DIR}/tests/corpus/fuzz_fat
+                                        ${CMAKE_CURRENT_LIST_DIR}/tests/whatfile)
+# The CLI's human whatfile output against the Python tool's (golden .txt)
+foreach(img fat12_floppy fat16_mbr_logical fat16_superfloppy fat32_mbr wrong_types)
+    add_test(NAME whatfile_human_${img}
+             COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:ataboy> -DIMG=${img}.img
+                     -DDIR=${CMAKE_CURRENT_LIST_DIR}/tests -P ${CMAKE_CURRENT_LIST_DIR}/tests/whatfile_human.cmake)
+endforeach()
+
 
 # Mapfiles, SHA-256, HASHES pages, image and rescue against a fake device.
 foreach(t test_mapfile test_sha256 test_recover)
@@ -147,10 +162,17 @@ foreach (src IN LISTS FUZZ_SOURCES)
     if (seed_files)
         set(seeds ${corpus})
     endif()
+    # A file that includes fuzz_main.h brings its own main() for non-fuzz
+    # builds (seed replay plus -mutate=N random mutations).
+    file(STRINGS ${src} own_main REGEX "#include \"fuzz_main.h\"")
     if (ATABOY_FUZZ)
         add_executable(${name} ${src})
+        target_compile_definitions(${name} PRIVATE AB_LIBFUZZER)
         target_link_options(${name} PRIVATE -fsanitize=fuzzer)
         add_test(NAME ${name}_corpus COMMAND ${name} -runs=0 ${seeds})
+    elseif (own_main)
+        add_executable(${name} ${src})
+        add_test(NAME ${name}_corpus COMMAND ${name} -mutate=2000 ${seed_files})
     else()
         add_executable(${name} ${src} tests/fuzz_replay_main.c)
         add_test(NAME ${name}_corpus COMMAND ${name} ${seeds})

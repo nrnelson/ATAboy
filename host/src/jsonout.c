@@ -70,7 +70,7 @@ static void put_string(sbuf *b, const char *s) {
         else if (c == '\t') { puts_(b, "\\t"); p++; }
         else if (c == '\b') { puts_(b, "\\b"); p++; }
         else if (c == '\f') { puts_(b, "\\f"); p++; }
-        else if (c < 0x20 || c == 0x7F) { if (c == 0x7F) put(b, (const char *)p, 1); else put_u16(b, c); p++; }
+        else if (c < 0x20 || c == 0x7F) { put_u16(b, c); p++; }      // Python escapes DEL too
         else if (c < 0x80) { put(b, (const char *)p, 1); p++; }
         else {
             unsigned v = utf8(&p);

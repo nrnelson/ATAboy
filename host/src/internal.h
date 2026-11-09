@@ -144,6 +144,10 @@ void ab_sha256_init(ab_sha256_ctx *c);
 void ab_sha256_update(ab_sha256_ctx *c, const void *data, size_t n);
 void ab_sha256_final(ab_sha256_ctx *c, uint8_t out[32]);
 void ab_sha256(const void *data, size_t n, uint8_t out[32]);
+// ab_ata's result for a CHECK CONDITION with these sense bytes (ata.c).
+cJSON *ab_ata_sense_result(int64_t command, const uint8_t *sense, size_t n);
+// Raw reply parsing (device.c), exposed for the fuzz target: r->raw/raw_len in.
+int ab_parse_reply(ab_reply *r);
 
 
 static inline void ab_put_be16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }

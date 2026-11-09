@@ -319,6 +319,54 @@ int ab_hashes(ab_dev *dev, uint32_t since, bool clear, bool has_lba, uint64_t lb
 // Check records against an image (sector LBA at LBA*512).  *out: {"image",
 // "match", "differ": [records], "beyond_end"}.
 int ab_compare_hashes(const cJSON *records, const char *image, cJSON **out);
+//  Raw ATA command: SAT ATA PASS-THROUGH (16) over Linux SG_IO (root).  Uses
+//  the ATAboy's SCSI node even when the device was opened on the serial
+//  port.  AB_ERR_UNSUPPORTED on Windows and macOS.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    int64_t        command, feature, count, lba, device;  // packed modulo each register's width
+    bool           ext;             // 48-bit command
+    uint32_t       data_in;         // PIO data-in bytes (whole sectors), 0 = none
+    const uint8_t *data_out;        // PIO data-out (NULL = none; takes precedence over data_in)
+    size_t         data_out_len;
+    bool           ck_cond;         // ask for the result registers
+    uint32_t       timeout_ms;      // 0 = 60000
+} ab_ata_cmd;
+
+// The 16-byte CDB for c.
+void ab_ata_cdb(const ab_ata_cmd *c, uint8_t cdb[16]);
+// Registers from the ATA Status Return descriptor in descriptor-format sense
+// data: {"status", "status_bits", "error", "error_bits", "count", "lba",
+// "device"}; NULL if there is none.
+cJSON *ab_parse_ata_return(const uint8_t *sense, size_t len);
+// *out: {"command", "ok", ["sense", "sense_key", registers | "blocked"]}.
+// AB_OK whenever the command reached the device (see "ok").  Data-in comes
+// back in *data (malloc'd, caller frees) when data is non-NULL.
+int ab_ata(ab_dev *dev, const ab_ata_cmd *c, cJSON **out, uint8_t **data, size_t *data_len);
+
+// ---------------------------------------------------------------------------
+//  whatfile: which FAT12/16/32 file, directory, FAT copy or free space owns
+//  each 512-byte sector of a disk image (MBR + logical partitions, or a bare
+//  volume).  No device needed.  Every on-disk structure is treated as
+//  untrusted (the image is usually of a damaged disk).
+// ---------------------------------------------------------------------------
+
+#define AB_WHATFILE_MAX_LBAS (1u << 20)
+
+// *out: {"result", "image", "image_sectors", "scheme", "partitions",
+// "results", "files", "counts"} (the Python tool's layout).  Repeated LBAs
+// are reported once.
+int ab_whatfile(const char *image_path, const int64_t *lbas, size_t n, cJSON **out);
+// The same for an image in memory; image_name goes into "image".
+int ab_whatfile_mem(const uint8_t *img, size_t len, const char *image_name, const int64_t *lbas, size_t n,
+                    cJSON **out);
+// Collect LBAs: lbas[0..n), then every tried-and-failed sector of a ddrescue
+// mapfile (status other than '+' and '?'), then a JSON file (a list of
+// numbers, "0x.." strings or {"lba": n} objects, or an object with
+// "bad_lbas" / "lbas").  *out is malloc'd.
+int ab_whatfile_lbas(const int64_t *lbas, size_t n, const char *mapfile, const char *json_file,
+                     int64_t **out, size_t *nout);
 
 // ---------------------------------------------------------------------------
 //  JSON output (the CLI's format: Python json.dumps(indent=2) compatible)

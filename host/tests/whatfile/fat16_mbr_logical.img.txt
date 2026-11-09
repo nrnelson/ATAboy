@@ -1,0 +1,141 @@
+p1   LBA 4-39  type 0x06  FAT16  [FAT16 TESTVOL, 30 files, 2 dirs, 2 deleted entries]
+p2   LBA 40-30039  type 0x05  extended
+p5   LBA 41-90  type 0x01  FAT12  [FAT12 LOGICAL, 1 files, 0 dirs, 0 deleted entries]
+p6   LBA 105-114  type 0x83  Linux
+p3   LBA 90000-90999  type 0x83  Linux
+
+         0  -          mbr
+         1  -          mbr gap  (between the partition table and the first partition)
+         2  -          mbr gap  (between the partition table and the first partition)
+         3  -          mbr gap  (between the partition table and the first partition)
+         4  p1 FAT16   boot sector
+         5  p1 FAT16   reserved  (reserved sector 1)
+         6  p1 FAT16   reserved  (reserved sector 2)
+         7  p1 FAT16   reserved  (reserved sector 3)
+         8  p1 FAT16   FAT copy 1 of 2 (entries for clusters 0-255); other FAT copies hold the same entries
+         9  p1 FAT16   FAT copy 1 of 2 (entries for clusters 256-511); other FAT copies hold the same entries
+        10  p1 FAT16   FAT copy 1 of 2 (entries for clusters 512-767); other FAT copies hold the same entries
+        11  p1 FAT16   FAT copy 1 of 2 (entries for clusters 768-1023); other FAT copies hold the same entries
+        12  p1 FAT16   FAT copy 1 of 2 (entries for clusters 1024-1279); other FAT copies hold the same entries
+        13  p1 FAT16   FAT copy 1 of 2 (entries for clusters 1280-1535); other FAT copies hold the same entries
+        14  p1 FAT16   FAT copy 1 of 2 (entries for clusters 1536-1791); other FAT copies hold the same entries
+        15  p1 FAT16   FAT copy 1 of 2 (entries for clusters 1792-2047); other FAT copies hold the same entries
+        16  p1 FAT16   FAT copy 2 of 2 (entries for clusters 0-255); other FAT copies hold the same entries
+        17  p1 FAT16   FAT copy 2 of 2 (entries for clusters 256-511); other FAT copies hold the same entries
+        18  p1 FAT16   FAT copy 2 of 2 (entries for clusters 512-767); other FAT copies hold the same entries
+        19  p1 FAT16   FAT copy 2 of 2 (entries for clusters 768-1023); other FAT copies hold the same entries
+        20  p1 FAT16   FAT copy 2 of 2 (entries for clusters 1024-1279); other FAT copies hold the same entries
+        21  p1 FAT16   FAT copy 2 of 2 (entries for clusters 1280-1535); other FAT copies hold the same entries
+        22  p1 FAT16   FAT copy 2 of 2 (entries for clusters 1536-1791); other FAT copies hold the same entries
+        23  p1 FAT16   FAT copy 2 of 2 (entries for clusters 1792-2047); other FAT copies hold the same entries
+        24  p1 FAT16   root directory /  [entries: TESTVOL (label), A long file name.txt, readme, SUBDIR/, deleted file.dat (deleted), _LDDIR/ (deleted), +4 more]
+        25  p1 FAT16   root directory /  [entries: NOTMIN~1.TXT, EMPTY, BADTIME.TXT]
+        26  p1 FAT16   root directory /  [no entries in this sector]
+        27  p1 FAT16   root directory /  [no entries in this sector]
+        28  p1 FAT16   free 2
+        29  p1 FAT16   file /A long file name.txt  [offset 0 of 1500 bytes, cluster 3]
+        30  p1 FAT16   file /A long file name.txt  [offset 512 of 1500 bytes, cluster 4]
+        31  p1 FAT16   file /A long file name.txt  [offset 1024 of 1500 bytes, cluster 5]
+        32  p1 FAT16   file /readme  [offset 0 of 100 bytes, cluster 6]
+        33  p1 FAT16   directory /SUBDIR  [entries: Nested Folder/, F0000000.TXT, F0000001.TXT, F0000002.TXT, F0000003.TXT, F0000004.TXT, +7 more]
+        34  p1 FAT16   file /FRAG.BIN  [offset 0 of 2048 bytes, cluster 8]
+        35  p1 FAT16   file /FRAG.BIN  [offset 1024 of 2048 bytes, cluster 9]
+        36  p1 FAT16   file /FRAG.BIN  [offset 512 of 2048 bytes, cluster 10]
+        37  p1 FAT16   file /FRAG.BIN  [offset 1536 of 2048 bytes, cluster 11]
+        38  p1 FAT16   directory /SUBDIR  [entries: F0000012.TXT, F0000013.TXT, F0000014.TXT, F0000015.TXT, F0000016.TXT, F0000017.TXT, +3 more]
+        39  p1 FAT16   file /LOOP.BIN  [offset 0 of 4096 bytes, cluster 13]
+        40  -          ebr  (extended boot record (logical partition table))
+        41  p5 FAT12   boot sector
+        42  p5 FAT12   FAT copy 1 of 1 (entries for clusters 0-48)
+        43  p5 FAT12   root directory /  [entries: HELLO.TXT]
+        44  p5 FAT12   file /HELLO.TXT  [offset 0 of 20 bytes, cluster 2]
+        45  p5 FAT12   free 3
+        46  p5 FAT12   free 4
+        47  p5 FAT12   free 5
+        48  p5 FAT12   free 6
+        49  p5 FAT12   free 7
+        50  p5 FAT12   free 8
+        51  p5 FAT12   free 9
+        52  p5 FAT12   free 10
+        53  p5 FAT12   free 11
+        54  p5 FAT12   free 12
+        55  p5 FAT12   free 13
+        56  p5 FAT12   free 14
+        57  p5 FAT12   free 15
+        58  p5 FAT12   free 16
+        59  p5 FAT12   free 17
+        60  p5 FAT12   free 18
+        61  p5 FAT12   free 19
+        62  p5 FAT12   free 20
+        63  p5 FAT12   free 21
+        64  p5 FAT12   free 22
+        65  p5 FAT12   free 23
+        66  p5 FAT12   free 24
+        67  p5 FAT12   free 25
+        68  p5 FAT12   free 26
+        69  p5 FAT12   free 27
+        70  p5 FAT12   free 28
+        71  p5 FAT12   free 29
+        72  p5 FAT12   free 30
+        73  p5 FAT12   free 31
+        74  p5 FAT12   free 32
+        75  p5 FAT12   free 33
+        76  p5 FAT12   free 34
+        77  p5 FAT12   free 35
+        78  p5 FAT12   free 36
+        79  p5 FAT12   free 37
+        80  p5 FAT12   free 38
+        81  p5 FAT12   free 39
+        82  p5 FAT12   free 40
+        83  p5 FAT12   free 41
+        84  p5 FAT12   free 42
+        85  p5 FAT12   free 43
+        86  p5 FAT12   free 44
+        87  p5 FAT12   free 45
+        88  p5 FAT12   free 46
+        89  p5 FAT12   free 47
+        90  p5 FAT12   free 48
+        91  p2         unpartitioned  (inside the extended partition, outside any logical drive)
+        92  p2         unpartitioned  (inside the extended partition, outside any logical drive)
+        93  p2         unpartitioned  (inside the extended partition, outside any logical drive)
+        94  p2         unpartitioned  (inside the extended partition, outside any logical drive)
+        95  p2         unpartitioned  (inside the extended partition, outside any logical drive)
+        96  p2         unpartitioned  (inside the extended partition, outside any logical drive)
+        97  p2         unpartitioned  (inside the extended partition, outside any logical drive)
+        98  p2         unpartitioned  (inside the extended partition, outside any logical drive)
+        99  p2         unpartitioned  (inside the extended partition, outside any logical drive)
+       100  -          ebr  (extended boot record (logical partition table))
+       101  p2         unpartitioned  (inside the extended partition, outside any logical drive)
+       102  p2         unpartitioned  (inside the extended partition, outside any logical drive)
+       103  p2         unpartitioned  (inside the extended partition, outside any logical drive)
+       104  p2         unpartitioned  (inside the extended partition, outside any logical drive)
+       105  p6         non-FAT partition (type 0x83 Linux)
+       106  p6         non-FAT partition (type 0x83 Linux)
+       107  p6         non-FAT partition (type 0x83 Linux)
+       108  p6         non-FAT partition (type 0x83 Linux)
+       109  p6         non-FAT partition (type 0x83 Linux)
+       110  p6         non-FAT partition (type 0x83 Linux)
+       111  p6         non-FAT partition (type 0x83 Linux)
+       112  p6         non-FAT partition (type 0x83 Linux)
+       113  p6         non-FAT partition (type 0x83 Linux)
+       114  p6         non-FAT partition (type 0x83 Linux)
+       115  p2         unpartitioned  (inside the extended partition, outside any logical drive)
+       116  p2         unpartitioned  (inside the extended partition, outside any logical drive)
+       117  p2         unpartitioned  (inside the extended partition, outside any logical drive)
+       118  p2         unpartitioned  (inside the extended partition, outside any logical drive)
+       119  p2         unpartitioned  (inside the extended partition, outside any logical drive)
+       120  -          beyond image
+       121  -          beyond image
+    100000  -          beyond image
+8589934592  -          beyond image
+        -1  -          invalid
+
+affected objects:
+  root_dir  p1 /  4 sectors: 24 25 26 27
+  file      p1 /A long file name.txt  3 sectors: 29 30 31
+  file      p1 /readme  1 sector: 32
+  directory p1 /SUBDIR  2 sectors: 33 38
+  file      p1 /FRAG.BIN  4 sectors: 34 35 36 37
+  file      p1 /LOOP.BIN  1 sector: 39
+  root_dir  p5 /  1 sector: 43
+  file      p5 /HELLO.TXT  1 sector: 44
