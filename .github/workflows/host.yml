@@ -4,8 +4,12 @@ name: host
 #  - every C test runs under AddressSanitizer + UndefinedBehaviorSanitizer
 #    (gcc and clang on Linux, Apple clang on macOS);
 #  - every host/tests/fuzz_*.c target is fuzzed with libFuzzer on every push;
-#  - release binaries for Linux (static, x86-64 + aarch64), Windows and macOS;
-#  - on a v* tag: one GitHub release with those binaries and the firmware UF2.
+#  - binaries for Linux (static, x86-64 + aarch64), Windows and macOS are
+#    built and tested on every push, but only uploaded on a v* tag or a
+#    manual run ("Run workflow" in the Actions tab);
+#  - on a v* tag: a DRAFT GitHub release with those binaries and the firmware
+#    UF2, published by hand after review; tags with a suffix (v1.0.0-rc1) are
+#    marked as pre-releases.
 
 on:
   push:
@@ -136,10 +140,11 @@ jobs:
           x86_64-w64-mingw32-strip -o ataboy-windows-x86_64.exe host/build-win/ataboy.exe
           x86_64-w64-mingw32-objdump -p ataboy-windows-x86_64.exe | grep "DLL Name"
           mkdir -p win-tests
-          cp host/build-win/test_*.exe host/build-win/fuzz_*.exe win-tests/
+          cp host/build-win/test_*.exe host/build-win/fuzz_*.exe ataboy-windows-x86_64.exe win-tests/
           cp -R host/tests/corpus win-tests/corpus
 
       - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         with:
           name: ataboy-windows-x86_64
           path: ataboy-windows-x86_64.exe
@@ -188,11 +193,6 @@ jobs:
       - uses: actions/download-artifact@v4
         if: matrix.msystem == 'UCRT64'
         with:
-          name: ataboy-windows-x86_64
-
-      - uses: actions/download-artifact@v4
-        if: matrix.msystem == 'UCRT64'
-        with:
           name: windows-cross-tests
           path: win-tests
 
@@ -212,9 +212,9 @@ jobs:
             if (Test-Path $corpus) { & $f.FullName @((Get-ChildItem $corpus -File).FullName) } else { & $f.FullName }
             if ($LASTEXITCODE -ne 0) { throw "$($f.Name) failed" }
           }
-          .\ataboy-windows-x86_64.exe --version
+          .\win-tests\ataboy-windows-x86_64.exe --version
           if ($LASTEXITCODE -ne 0) { throw "--version failed" }
-          .\ataboy-windows-x86_64.exe list
+          .\win-tests\ataboy-windows-x86_64.exe list
           if ($LASTEXITCODE -ne 0) { throw "list failed" }
 
   macos:
@@ -250,6 +250,7 @@ jobs:
           fi
 
       - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         with:
           name: ataboy-macos-universal
           path: ataboy-macos-universal
@@ -288,6 +289,7 @@ jobs:
           "./$f" list
 
       - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         with:
           name: ataboy-linux-${{ matrix.arch }}
           path: ataboy-linux-${{ matrix.arch }}
@@ -324,6 +326,9 @@ jobs:
           chmod +x ataboy-linux-* ataboy-macos-universal
           sha256sum ATAboy-*.uf2 ataboy-linux-x86_64 ataboy-linux-aarch64 \
             ataboy-windows-x86_64.exe ataboy-macos-universal | tee SHA256SUMS
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes \
+          # A draft: review it on GitHub, then publish.  v1.2.3-rc1 etc. are pre-releases.
+          pre=""
+          case "$GITHUB_REF_NAME" in *-*) pre="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes --draft $pre \
             ATAboy-*.uf2 ataboy-linux-x86_64 ataboy-linux-aarch64 ataboy-windows-x86_64.exe \
             ataboy-macos-universal SHA256SUMS

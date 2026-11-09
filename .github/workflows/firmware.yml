@@ -46,7 +46,10 @@ jobs:
           cp firmware/build/ATAboy.uf2 "ATAboy-$(git describe --always --tags --dirty).uf2"
           sha256sum ATAboy-*.uf2 | tee SHA256SUMS
 
+      # The UF2 is built on every push (it must compile) but only uploaded for a
+      # v* tag (the release calls this workflow) or a manual run.
       - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         with:
           name: ATAboy-firmware
           path: |
