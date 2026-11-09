@@ -221,6 +221,33 @@ int ab_read_long_vote(ab_dev *dev, uint32_t lba, unsigned votes, unsigned ecc_le
                       uint32_t timeout_ms, uint8_t *payload, size_t *payload_len, cJSON **info);
 
 // ---------------------------------------------------------------------------
+//  Raw ATA command: SAT ATA PASS-THROUGH (16) over Linux SG_IO (root).  Uses
+//  the ATAboy's SCSI node even when the device was opened on the serial
+//  port.  AB_ERR_UNSUPPORTED on Windows and macOS.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    int64_t        command, feature, count, lba, device;  // packed modulo each register's width
+    bool           ext;             // 48-bit command
+    uint32_t       data_in;         // PIO data-in bytes (whole sectors), 0 = none
+    const uint8_t *data_out;        // PIO data-out (NULL = none; takes precedence over data_in)
+    size_t         data_out_len;
+    bool           ck_cond;         // ask for the result registers
+    uint32_t       timeout_ms;      // 0 = 60000
+} ab_ata_cmd;
+
+// The 16-byte CDB for c.
+void ab_ata_cdb(const ab_ata_cmd *c, uint8_t cdb[16]);
+// Registers from the ATA Status Return descriptor in descriptor-format sense
+// data: {"status", "status_bits", "error", "error_bits", "count", "lba",
+// "device"}; NULL if there is none.
+cJSON *ab_parse_ata_return(const uint8_t *sense, size_t len);
+// *out: {"command", "ok", ["sense", "sense_key", registers | "blocked"]}.
+// AB_OK whenever the command reached the device (see "ok").  Data-in comes
+// back in *data (malloc'd, caller frees) when data is non-NULL.
+int ab_ata(ab_dev *dev, const ab_ata_cmd *c, cJSON **out, uint8_t **data, size_t *data_len);
+
+// ---------------------------------------------------------------------------
 //  JSON output (the CLI's format: Python json.dumps(indent=2) compatible)
 // ---------------------------------------------------------------------------
 

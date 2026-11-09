@@ -45,7 +45,8 @@ target_compile_options(cjson PRIVATE -w)
 set(FW_SHARED ${FW}/apiframe.c ${FW}/crc32.c ${FW}/api_proto.c ${FW}/json.c)
 
 set(LIB_SRC
-    src/device.c src/binops.c src/recover.c src/jsonout.c src/transport_serial.c)
+    src/device.c src/binops.c src/recover.c src/jsonout.c src/transport_serial.c
+    src/ata.c)
 if (WIN32)
     list(APPEND LIB_SRC src/plat_win.c src/discover_win.c)
 elseif (APPLE)

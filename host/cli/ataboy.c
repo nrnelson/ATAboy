@@ -668,6 +668,119 @@ static int cmd_wait(ctx *c) {
     return EXIT_TRANSPORT;
 }
 
+// --- ata ---------------------------------------------------------------------
+
+// An error found by the CLI itself: {"result": result, "message"} or "error: ..." on stderr.
+#if defined(__MINGW32__)
+__attribute__((format(gnu_printf, 4, 5)))
+#elif defined(__GNUC__)
+__attribute__((format(printf, 4, 5)))
+#endif
+static int local_error(ctx *c, const char *result, int code, const char *fmt, ...) {
+    char m[700];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(m, sizeof(m), fmt, ap);
+    va_end(ap);
+    if (c->json) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "result", result);
+        cJSON_AddStringToObject(o, "message", m);
+        print_json(c, o);
+        cJSON_Delete(o);
+    } else {
+        fprintf(stderr, "error: %s\n", m);
+    }
+    return code;
+}
+
+static const char *g_ata_out;           // ata --out given
+static uint8_t *g_ata_data;
+static size_t g_ata_dlen;
+
+static void h_ata_regs(const cJSON *j, ctx *c) {
+    (void)c;
+    bool first = true;
+    for (const cJSON *x = j->child; x; x = x->next) {
+        if (!strcmp(x->string, "data_hex")) continue;
+        printf("%s%s=", first ? "" : " ", x->string);
+        first = false;
+        bool reg = !strcmp(x->string, "status") || !strcmp(x->string, "error") || !strcmp(x->string, "device");
+        if (cJSON_IsBool(x)) printf("%s", cJSON_IsTrue(x) ? "True" : "False");
+        else if (cJSON_IsString(x)) printf("%s", x->valuestring);
+        else if (cJSON_IsNumber(x) && reg) printf("%02llX", (long long)x->valuedouble);
+        else if (cJSON_IsNumber(x)) printf("%lld", (long long)x->valuedouble);
+        else printf("None");
+    }
+    printf("\n");
+    if (g_ata_dlen && !g_ata_out) hexdump(g_ata_data, g_ata_dlen, 0);
+}
+
+static int cmd_ata(ctx *c) {
+    ab_ata_cmd a;
+    memset(&a, 0, sizeof(a));
+    a.command = parse_int(c->pos[0], "command");
+    a.feature = iopt(c, "feature", 0);
+    a.count = iopt(c, "count", 0);
+    a.lba = iopt(c, "lba", 0);
+    a.device = iopt(c, "device", 0);
+    a.ext = flag(c, "ext");
+    long long rd = iopt(c, "read", 0);
+    if (rd < 0 || rd > 0x7FFFFF) usage_error("--read: sector count out of range");
+    a.data_in = (uint32_t)rd * 512;
+    a.ck_cond = !flag(c, "no-ck");
+    long long to = iopt(c, "timeout", 60000);
+    if (to < 0 || to > 0xFFFFFFFFll) usage_error("--timeout out of range");
+    a.timeout_ms = (uint32_t)to;
+    if (flag(c, "dangerous")) {
+        cJSON *j = NULL;
+        int rc = ab_arm(c->d, &j);
+        if (rc != AB_OK) return fail(c, rc, j);
+        cJSON_Delete(j);
+    }
+    uint8_t *wbuf = NULL;
+    if (opt(c, "write")) {
+        FILE *f = fopen(opt(c, "write"), "rb");
+        size_t cap = (1u << 20) + 1, n = 0;
+        wbuf = f ? malloc(cap) : NULL;
+        if (wbuf) n = fread(wbuf, 1, cap, f);
+        bool bad = !f || !wbuf || ferror(f);
+        if (f) fclose(f);
+        if (bad) {
+            free(wbuf);
+            return local_error(c, "io_error", EXIT_DEVICE, "cannot read %s", opt(c, "write"));
+        }
+        a.data_out = wbuf;
+        a.data_out_len = n;
+    }
+    cJSON *r = NULL;
+    int rc = ab_ata(c->d, &a, &r, &g_ata_data, &g_ata_dlen);
+    free(wbuf);
+    if (rc != AB_OK) return fail(c, rc, NULL);
+    g_ata_out = opt(c, "out");
+    if (g_ata_dlen && g_ata_out) {
+        FILE *f = fopen(g_ata_out, "wb");
+        if (!f || fwrite(g_ata_data, 1, g_ata_dlen, f) != g_ata_dlen) {
+            if (f) fclose(f);
+            free(g_ata_data);
+            cJSON_Delete(r);
+            fprintf(stderr, "error: cannot write %s\n", g_ata_out);
+            return EXIT_DEVICE;
+        }
+        fclose(f);
+        cJSON_AddStringToObject(r, "written", g_ata_out);
+    } else if (g_ata_dlen) {
+        char *h = to_hex(g_ata_data, g_ata_dlen);
+        cJSON_AddStringToObject(r, "data_hex", h ? h : "");
+        free(h);
+    }
+    emit(c, r, h_ata_regs);
+    int ex = ab_jbool(r, "ok", false) ? EXIT_OK : EXIT_DEVICE;
+    cJSON_Delete(r);
+    free(g_ata_data);
+    return ex;
+}
+
 static void warn_reboot(void *ctxp, uint32_t old_id, uint32_t new_id, uint8_t op) {
     (void)ctxp; (void)op;
     fprintf(stderr, "ataboy: the ATAboy rebooted (boot id %08x -> %08x): settings in RAM, geometry and "
@@ -724,7 +837,12 @@ static const cmd_t commands[] = {
     {"reboot", cmd_reboot, true, 0, 0, "", "restart the firmware; --bootsel enters the UF2 bootloader", {{"bootsel", false, NULL}}},
     {"wait", cmd_wait, false, 0, 0, "", "wait until an ATAboy answers (after reboot / replug)",
      {{"timeout", true, "seconds (default 30)"}, {"exec", true, "command to run every 3 s while no device is visible (env ATABOY_REATTACH)"}}},
-    {"ata", not_yet, true, 1, 1, "COMMAND", "raw ATA command via SAT pass-through", {{"feature", true, NULL}, {"count", true, NULL}, {"lba", true, NULL}, {"device", true, NULL}, {"ext", false, NULL}, {"read", true, NULL}, {"write", true, NULL}, {"out", true, NULL}, {"no-ck", false, NULL}, {"dangerous", false, NULL}, {"timeout", true, NULL}}},
+    {"ata", cmd_ata, true, 1, 1, "COMMAND", "raw ATA command via SAT pass-through (respects write protect / arming)",
+     {{"feature", true, NULL}, {"count", true, NULL}, {"lba", true, NULL},
+      {"device", true, "device register (LBA bit 0x40, head bits)"}, {"ext", false, "48-bit command"},
+      {"read", true, "PIO data-in of N sectors"}, {"write", true, "PIO data-out from FILE"},
+      {"out", true, "save data-in to FILE"}, {"no-ck", false, "don't request result registers"},
+      {"dangerous", false, "arm first (needed for DANGEROUS commands)"}, {"timeout", true, "ms (default 60000)"}}},
     {"whatfile", not_yet, false, 1, MAXPOS, "IMAGE [LBA ...]", "map image LBAs to the FAT files that own them", {{"from-map", true, NULL}, {"from-json", true, NULL}}},
 };
 #define NCMDS (sizeof(commands) / sizeof(commands[0]))

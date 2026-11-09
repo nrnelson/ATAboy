@@ -117,6 +117,9 @@ int ab_dev_fail(ab_dev *dev, int err);
 
 double ab_round(double v, int digits);    // Python round() for display values
 
+// ab_ata's result for a CHECK CONDITION with these sense bytes (ata.c).
+cJSON *ab_ata_sense_result(int64_t command, const uint8_t *sense, size_t n);
+
 
 static inline void ab_put_be16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
 static inline void ab_put_be32(uint8_t *p, uint32_t v) {
