@@ -37,18 +37,23 @@ static void put_u16(sbuf *b, unsigned v) {
     puts_(b, t);
 }
 
-// Decode one UTF-8 sequence; invalid bytes come out as U+FFFD.
+// Decode one UTF-8 sequence.  Anything that isn't well-formed UTF-8 (bad
+// lead or continuation byte, overlong form, surrogate, beyond U+10FFFF)
+// comes out as U+FFFD for its first byte, like Python's errors="replace".
 static unsigned utf8(const unsigned char **pp) {
+    static const unsigned min[4] = {0, 0x80, 0x800, 0x10000};
     const unsigned char *p = *pp;
     unsigned c = *p++;
-    int n = c >= 0xF0 && c < 0xF8 ? 3 : c >= 0xE0 ? 2 : c >= 0xC0 ? 1 : -1;
-    if (c < 0x80) { *pp = p; return c; }
-    if (n < 0) { *pp = p; return 0xFFFD; }
-    unsigned v = c & (0x3F >> n);
-    for (int i = 0; i < n; i++) {
-        if ((p[i] & 0xC0) != 0x80) { *pp = p; return 0xFFFD; }
+    *pp = p;
+    if (c < 0x80) return c;
+    int n = c >= 0xC2 && c <= 0xDF ? 1 : c >= 0xE0 && c <= 0xEF ? 2 : c >= 0xF0 && c <= 0xF4 ? 3 : -1;
+    if (n < 0) return 0xFFFD;
+    unsigned v = c & (0x3Fu >> n);
+    for (int i = 0; i < n; i++) {               // stops at the terminating NUL
+        if ((p[i] & 0xC0) != 0x80) return 0xFFFD;
         v = (v << 6) | (p[i] & 0x3F);
     }
+    if (v < min[n] || v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF)) return 0xFFFD;
     *pp = p + n;
     return v;
 }

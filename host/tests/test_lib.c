@@ -17,6 +17,14 @@ int main(void) {
     CHECK(s && !strcmp(s, "{\"a\": 1, \"b\": [1, 2.5, \"x\\u00e9\"], \"c\": {}, \"d\": [], \"e\": null, \"f\": true}"));
     free(s);
     cJSON_Delete(j);
+
+    // Malformed UTF-8 (overlong, surrogate, bad lead/continuation) -> U+FFFD
+    // per offending byte; valid 4-byte sequences -> surrogate pair.
+    j = cJSON_CreateString("\xc1\x80|\xed\xa0\x80|\xf8|\xc3(|\xf0\x9f\x98\x80|\xe2\x82\xac");
+    s = ab_json_print(j, 0);
+    CHECK(s && !strcmp(s, "\"\\ufffd\\ufffd|\\ufffd\\ufffd\\ufffd|\\ufffd|\\ufffd(|\\ud83d\\ude00|\\u20ac\""));
+    free(s);
+    cJSON_Delete(j);
     if (failures) { printf("%d failure(s)\n", failures); return 1; }
     printf("all libataboy tests passed\n");
     return 0;
