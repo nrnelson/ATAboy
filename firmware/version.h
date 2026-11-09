@@ -4,7 +4,7 @@
 // Firmware identity.  FW_VERSION is what INFO reports; FW_INQUIRY_REV is the
 // 4-character SCSI INQUIRY product revision the host sees in sysfs.
 #define FW_BASE_VERSION   "0.6f3"
-#define FW_VERSION        "0.6f3-api1"
+#define FW_VERSION        "0.9.0"
 #define FW_INQUIRY_REV    "api1"
 
 // Version of the vendor-command protocol described in docs/API.md.  Bumped

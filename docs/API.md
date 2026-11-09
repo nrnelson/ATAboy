@@ -180,7 +180,7 @@ before parsing.
 
 ```json
 {
-  "result": "ok", "fw": "0.6f3-api1", "uptime_ms": 81234,
+  "result": "ok", "fw": "0.9.0", "uptime_ms": 81234,
   "mounted": true, "write_protect": true, "armed": false,
   "settings": {"load": "ok", "field": null},
   "drive": {"present": true, "identified": true, "forced": false, "device": "master",

@@ -78,7 +78,7 @@ target_compile_definitions(ATAboy PRIVATE
 target_compile_options(ATAboy PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation)
 
 pico_set_program_name(ATAboy "ATAboy")
-pico_set_program_version(ATAboy "0.6f3-api1")
+pico_set_program_version(ATAboy "0.9.0")
 
 # Generate PIO header
 pico_generate_pio_header(ATAboy ${CMAKE_CURRENT_LIST_DIR}/ataboy.pio)
