@@ -13,7 +13,7 @@
 set -uo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
-A="$here/../host/ataboy"
+A="${ATABOY:-$here/../host/build/ataboy}"   # the C CLI (cmake -S host -B host/build)
 ref="" scratch=0 reboot=0
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -30,11 +30,12 @@ pass() { printf 'PASS  %s\n' "$*"; }
 skip() { printf 'SKIP  %s\n' "$*"; }
 fail() { printf 'FAIL  %s\n' "$*"; fails=$((fails + 1)); }
 check() { local name=$1; shift; if "$@" >"$work/out" 2>&1; then pass "$name"; else fail "$name"; sed 's/^/      /' "$work/out" | head -5; fi; }
-jq_() { python3 -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
+command -v jq >/dev/null || { echo "hw-regress needs jq"; exit 2; }
+[[ -x $A ]] || { echo "no ataboy binary at $A (build host/ first, or set ATABOY)"; exit 2; }
 
 # --- identity ---------------------------------------------------------------
 info=$("$A" -j info) || { echo "no ATAboy answering"; exit 1; }
-echo "firmware: $(echo "$info" | jq_ 'd["fw"], d["git"]')"
+echo "firmware: $(echo "$info" | jq -r '"\(.fw) \(.git)"')"
 check "status answers" "$A" -j status
 
 # --- detect / mount -----------------------------------------------------------
@@ -46,9 +47,9 @@ else
     echo "detect failed (see above): check the drive is attached and powered"; exit $fails
 fi
 st=$("$A" -j status)
-sectors=$(echo "$st" | jq_ 'd["geometry"]["sectors"]')
-dev=$("$A" -j list | jq_ 'd[0]["block"]')
-echo "drive: $(echo "$st" | jq_ 'd["drive"]["model"]'), $sectors sectors, $dev"
+sectors=$(echo "$st" | jq -r '.geometry.sectors')
+dev=$("$A" -j list | jq -r '.[0].block')
+echo "drive: $(echo "$st" | jq -r '.drive.model'), $sectors sectors, $dev"
 [[ $(cat /sys/block/$(basename "$dev")/size) == "$sectors" ]] && pass "host sees full capacity" || fail "host capacity mismatch"
 [[ $(cat /sys/block/$(basename "$dev")/ro) == 1 ]] && pass "write protect visible to host (ro=1)" || fail "host does not see write protect"
 
@@ -64,26 +65,26 @@ fi
 check "image 2000 sectors with mapfile" "$A" image "$work/img" --count 2000
 cmp -s -n $((2000*512)) "$work/img" "$work/usb.bin" && pass "image data == USB disk data" || fail "image data differs"
 out=$("$A" -j verify 0 "$n")
-[[ $(echo "$out" | jq_ 'd["scanned"]') == "$n" ]] && pass "verify $n sectors ($(echo "$out" | jq_ 'len(d["bad"])') bad)" || fail "verify incomplete"
+[[ $(echo "$out" | jq -r '.scanned') == "$n" ]] && pass "verify $n sectors ($(echo "$out" | jq -r '.bad | length') bad)" || fail "verify incomplete"
 out=$("$A" -j verify 0 "$sectors" --budget 3)
-[[ $(echo "$out" | jq_ 'd["seconds"] < 6') == True ]] && pass "verify honours time budget" || fail "verify overran budget"
+[[ $(echo "$out" | jq -r '.seconds < 6') == true ]] && pass "verify honours time budget" || fail "verify overran budget"
 
 # --- SAT pass-through -------------------------------------------------------------
 command -v sg_sat_identify >/dev/null && check "sg_sat_identify" sudo sg_sat_identify --readonly "$dev"
 command -v hdparm >/dev/null && check "hdparm -I" sudo hdparm -I "$dev"
 command -v smartctl >/dev/null && check "smartctl -d sat -i" sudo smartctl -d sat -i "$dev"
-out=$("$A" -j ata 0xE5)
-[[ $(echo "$out" | jq_ 'd["ok"] and "status" in d') == True ]] && pass "non-data command returns registers" || fail "CHECK POWER MODE registers"
+out=$(sudo "$A" -j ata 0xE5)
+[[ $(echo "$out" | jq -r '.ok and has("status")') == true ]] && pass "non-data command returns registers" || fail "CHECK POWER MODE registers"
 head -c 512 /dev/zero > "$work/z"
-out=$("$A" -j ata 0x30 --count 1 --lba 1 --write "$work/z")
-[[ $(echo "$out" | jq_ 'd.get("blocked")') == write_protected ]] && pass "write blocked by write protect" || fail "write not blocked: $out"
-out=$("$A" -j ata 0x91 --count 1)
-[[ $(echo "$out" | jq_ 'd.get("sense_key")') == 5 ]] && pass "INIT PARAMS refused while mounted" || fail "INIT PARAMS not refused while mounted: $out"
+out=$(sudo "$A" -j ata 0x30 --count 1 --lba 1 --write "$work/z")
+[[ $(echo "$out" | jq -r '.blocked') == write_protected ]] && pass "write blocked by write protect" || fail "write not blocked: $out"
+out=$(sudo "$A" -j ata 0x91 --count 1)
+[[ $(echo "$out" | jq -r '.sense_key') == 5 ]] && pass "INIT PARAMS refused while mounted" || fail "INIT PARAMS not refused while mounted: $out"
 
 # --- error accounting -------------------------------------------------------------
 "$A" clear --stats >/dev/null
 sudo dd if="$dev" of=/dev/null bs=512 count=8 iflag=direct status=none
-[[ $("$A" -j status | jq_ 'd["stats"]["read_cmds"]') -ge 1 ]] && pass "stats count USB reads" || fail "stats"
+[[ $("$A" -j status | jq -r '.stats.read_cmds') -ge 1 ]] && pass "stats count USB reads" || fail "stats"
 
 # --- scratch-only: writes, corruption, rescue ------------------------------------------
 if (( scratch )); then
@@ -98,26 +99,24 @@ if (( scratch )); then
         && sudo dd if="$dev" bs=512 skip=$lba count=16 iflag=direct status=none | cmp -s - "$work/rand" \
         && pass "USB write + readback" || fail "USB write/readback"
     head -c 512 /dev/urandom > "$work/r1"
-    python3 - "$lba" "$st" > "$work/chs" <<'EOF'
-import json, sys
-lba = int(sys.argv[1]) + 20; g = json.loads(sys.argv[2])["geometry"]
-if g["addressing"] == "chs":
-    t, s = divmod(lba, g["spt"]); c, h = divmod(t, g["heads"]); print(s + 1 | (c << 8), h, "0x30")
-elif g["addressing"] == "lba28":
-    print(lba & 0xFFFFFF, 0x40 | (lba >> 24), "0x30")
-else:                                    # WRITE SECTORS EXT, full 48-bit LBA
-    print(lba, 0x40, "0x34 --ext")
-EOF
-    read -r ptlba ptdev ptcmd < "$work/chs"
+    # address of lba+20 for WRITE SECTORS in the drive's addressing mode
+    plba=$((lba + 20))
+    case $(echo "$st" | jq -r '.geometry.addressing') in
+        chs)   spt=$(echo "$st" | jq -r '.geometry.spt'); heads=$(echo "$st" | jq -r '.geometry.heads')
+               t=$((plba / spt)); s_=$((plba % spt)); c=$((t / heads)); h=$((t % heads))
+               ptlba=$(( (s_ + 1) | (c << 8) )); ptdev=$h; ptcmd="0x30" ;;
+        lba28) ptlba=$((plba & 0xFFFFFF)); ptdev=$((0x40 | (plba >> 24))); ptcmd="0x30" ;;
+        *)     ptlba=$plba; ptdev=$((0x40)); ptcmd="0x34 --ext" ;;   # WRITE SECTORS EXT, full 48-bit LBA
+    esac
     # shellcheck disable=SC2086
-    "$A" -j ata $ptcmd --count 1 --lba "$ptlba" --device "$ptdev" --write "$work/r1" >/dev/null \
+    sudo "$A" -j ata $ptcmd --count 1 --lba "$ptlba" --device "$ptdev" --write "$work/r1" >/dev/null \
         && "$A" read $((lba + 20)) --out "$work/r1b" >/dev/null && cmp -s "$work/r1" "$work/r1b" \
         && pass "pass-through WRITE SECTORS + readback" || fail "pass-through write"
-    out=$("$A" -j ata 0xFF)
-    [[ $(echo "$out" | jq_ 'd.get("blocked")') == not_armed ]] && pass "dangerous opcode needs arm" || fail "unarmed dangerous: $out"
+    out=$(sudo "$A" -j ata 0xFF)
+    [[ $(echo "$out" | jq -r '.blocked') == not_armed ]] && pass "dangerous opcode needs arm" || fail "unarmed dangerous: $out"
     "$A" clear --stats >/dev/null
-    "$A" -j ata 0xFF --dangerous >/dev/null
-    [[ $("$A" -j status | jq_ 'd["stats"]["passthru_cmds"]') == 1 ]] && pass "armed command executed exactly once" || fail "armed command count"
+    sudo "$A" -j ata 0xFF --dangerous >/dev/null
+    [[ $("$A" -j status | jq -r '.stats.passthru_cmds') == 1 ]] && pass "armed command executed exactly once" || fail "armed command count"
     # Damaged-sector checks need READ/WRITE LONG, which have no 48-bit form: on
     # big drives use an area below 128 GiB, and skip on drives without READ LONG.
     clba=$(( sectors > 268435456 ? 268435456 - 64 : lba ))
@@ -126,19 +125,19 @@ EOF
     fi
     if (( clba < 0 )); then
         skip "corrupt / image / rescue / one-attempt checks (area not saved)"
-    elif [[ $("$A" -j readlong $((clba + 4)) --out "$work/rlprobe" | jq_ 'd["result"]') != ok ]]; then
+    elif [[ $("$A" -j readlong $((clba + 4)) --out "$work/rlprobe" | jq -r '.result') != ok ]]; then
         skip "corrupt / image / rescue / one-attempt checks (drive does not support READ LONG)"
     else
     "$A" corrupt $((clba + 4)) --bits 32 >/dev/null
     out=$("$A" -j read $((clba + 4)) --through-error --timeout 15000)
-    [[ $(echo "$out" | jq_ 'd["chunks"][0]["error_bits"]') == UNC ]] && pass "corrupt makes UNC sector" || fail "corrupt: $out"
+    [[ $(echo "$out" | jq -r '.chunks[0].error_bits') == UNC ]] && pass "corrupt makes UNC sector" || fail "corrupt: $out"
     "$A" image "$work/p.img" --start $((clba)) --count 16 >/dev/null
     grep -q -- "  -$" "$work/p.img.map" && pass "image maps the bad sector" || fail "image map"
     out=$("$A" -j rescue "$work/p.img" "$work/p.img.map" --vote 3)
-    [[ $(echo "$out" | jq_ 'len(d["readlong"])') -ge 1 ]] && pass "rescue falls through to READ LONG" || fail "rescue: $out"
+    [[ $(echo "$out" | jq -r '.readlong | length') -ge 1 ]] && pass "rescue falls through to READ LONG" || fail "rescue: $out"
     "$A" clear >/dev/null
     sudo dd if="$dev" of=/dev/null bs=512 skip=$((clba + 4)) count=1 iflag=direct status=none 2>/dev/null
-    [[ $("$A" -j log | jq_ 'd["total"]') == 1 ]] && pass "bad sector costs one drive attempt" || fail "host retried the bad sector"
+    [[ $("$A" -j log | jq -r '.total') == 1 ]] && pass "bad sector costs one drive attempt" || fail "host retried the bad sector"
     fi
     if (( clba >= 0 && clba != lba )); then
         sudo dd if="$work/csave.bin" of="$dev" bs=512 seek=$clba count=16 oflag=direct status=none
