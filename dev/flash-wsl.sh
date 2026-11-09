@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Flash ATAboy firmware from WSL2 without touching the hardware.
 #
-#   tools/flash-wsl.sh firmware/build/ATAboy.uf2
+#   dev/flash-wsl.sh firmware/build/ATAboy.uf2
 #
 # 1. asks the running firmware to reboot into the RP2350 UF2 bootloader
 #    (needs API firmware; otherwise hold BOOTSEL while plugging in USB),
@@ -16,7 +16,7 @@ set -euo pipefail
 uf2=${1:?usage: flash-wsl.sh FILE.uf2}
 [[ -f $uf2 ]] || { echo "no such file: $uf2" >&2; exit 2; }
 here=$(cd "$(dirname "$0")" && pwd)
-ataboy=${ATABOY:-$here/../host/ataboy}
+ataboy=${ATABOY:-$here/../host/build/ataboy}   # the C CLI (cmake -S host -B host/build)
 ps() { powershell.exe -NoProfile -NonInteractive -Command "$1" | tr -d '\r'; }
 busid() { usbipd.exe list 2>/dev/null | tr -d '\r' | awk -v id="$1" '$2 == id { print $1; exit }'; }
 

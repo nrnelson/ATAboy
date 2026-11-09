@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Hardware regression for the ATAboy automation-API firmware.
 #
-#   tools/hw-regress.sh [--ref IMAGE] [--scratch] [--reboot]
+#   dev/hw-regress.sh [--ref IMAGE] [--scratch] [--reboot]
 #
 #   --ref IMAGE   known-good image of the attached drive; sector data is compared
 #                 against it (only areas the test does not write)

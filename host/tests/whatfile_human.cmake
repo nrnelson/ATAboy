@@ -8,7 +8,7 @@ set(lbas "")
 foreach(i RANGE 0 ${last})
     list(APPEND lbas ${i})
 endforeach()
-list(APPEND lbas 100000 8589934592 -1)          # same extras as gen_seeds.py --golden
+list(APPEND lbas 100000 8589934592 -1)          # same extras as when the golden files were captured
 execute_process(COMMAND ${EXE} whatfile ${IMG} ${lbas} WORKING_DIRECTORY ${work}
                 OUTPUT_VARIABLE got RESULT_VARIABLE rc)
 file(READ ${DIR}/whatfile/${IMG}.txt want)

@@ -1,6 +1,6 @@
 name: firmware
 
-# The firmware UF2 and the Python host tool.  The C unit tests (host/ and
+# The firmware UF2.  The C unit tests (host/ and
 # tests/*.c) run in host.yml under the sanitizers; on a v* tag host.yml
 # calls this workflow and publishes the release with the UF2.
 on:
@@ -32,12 +32,10 @@ jobs:
           git clone --depth 1 --branch 2.2.0 https://github.com/raspberrypi/pico-sdk.git "$RUNNER_TEMP/pico-sdk"
           git -C "$RUNNER_TEMP/pico-sdk" submodule update --init --depth 1 lib/tinyusb
 
-      - name: Host tool
+      - name: Dev scripts
         run: |
-          python3 -m py_compile host/ataboy
-          python3 host/ataboy --help > /dev/null
-          python3 tests/test_host_lib.py
-          bash -n tools/flash-wsl.sh
+          bash -n dev/flash-wsl.sh
+          bash -n dev/hw-regress.sh
 
       - name: Build firmware
         env:

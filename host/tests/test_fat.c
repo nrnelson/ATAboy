@@ -3,7 +3,7 @@
 //   test_fat CORPUS_DIR GOLDEN_DIR
 //
 // The golden files are the Python reference tool's whatfile output for the
-// seed images (tests/gen_seeds.py --golden); the C library must match them
+// seed images (captured from the original Python tool, now frozen); the C library must match them
 // byte for byte.  The ATA expectations below were taken from the Python
 // tool's ATAboy.ata() with SG_IO stubbed out.
 #include "internal.h"

@@ -6,11 +6,14 @@
 > as before.
 >
 > * Firmware source: [`firmware/`](firmware/) (based on v0.6f3; builds with pico-sdk 2.2.0)
-> * Host tool: [`host/ataboy`](host/ataboy), a single Python file with no dependencies (Linux)
+> * Host tool: [`host/`](host/), the `ataboy` command-line tool and `libataboy` in C: one
+>   self-contained binary for Linux, Windows and macOS, no root or admin needed
+>   ([building](host/README.md); prebuilt binaries come with each release)
 > * Protocol reference: [`docs/API.md`](docs/API.md)
 > * Setup menu guide: [`docs/HELP.txt`](docs/HELP.txt)
 > * Hardware: [`hardware/pcb/`](hardware/pcb/) (KiCad) and [`hardware/case/`](hardware/case/) (FreeCAD + STL)
-> * Tests and tools: [`tests/`](tests/), [`tools/`](tools/) (hardware regression, hands-free flashing from WSL)
+> * Tests: [`tests/`](tests/), [`host/tests/`](host/tests/); developer scripts in [`dev/`](dev/)
+>   (hardware regression, hands-free flashing from WSL); [`tools/`](tools/) has the smartctl drive entry
 >
 > Stock firmware binaries and older source releases are in the
 > [upstream repository](https://github.com/redruM0381/ATAboy).

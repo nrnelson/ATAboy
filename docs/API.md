@@ -14,10 +14,11 @@ mounted; the USB disk just shows 0 bytes until one is:
 | **ATAboy API** over SCSI | vendor opcode `0xC0` on the mass-storage interface | the same requests and replies |
 | **SAT ATA PASS-THROUGH** | SCSI `0x85` (16) / `0xA1` (12) | raw ATA commands; makes `smartctl -d sat`, `hdparm`, `sg_sat_identify` work unchanged |
 
-The `ataboy` host tool (`host/ataboy`) wraps all three: it uses the serial
-port when it can open it and falls back to SCSI (`--transport
-auto|serial|sgio`). The rest of this document is the wire format, for anyone
-writing another client.
+The `ataboy` host tool and its library (`host/`, C, for Linux, Windows and
+macOS) wrap all three: it uses the serial port when it can open it and falls
+back to SCSI on Linux (`--transport auto|serial|sgio`). Only raw ATA
+pass-through (`ataboy ata`) needs root. The rest of this document is the wire
+format, for anyone writing another client.
 
 On Linux the SCSI opcodes are sent with the `SG_IO` ioctl on `/dev/sgN` or
 `/dev/sdX`. Vendor and pass-through opcodes need `CAP_SYS_RAWIO` (root): they
@@ -810,7 +811,7 @@ usbipd: `ataboy wait --exec 'usbipd.exe attach --wsl --busid 1-3'` (or set
 
 `REBOOT` with mode 1 enters the RP2350 ROM bootloader (UF2 drive `RP2350` plus
 PICOBOOT). Copy a `.uf2` onto the drive, or use `picotool load`, and the ATAboy
-restarts on the new firmware. `tools/flash-wsl.sh` does the whole cycle under
+restarts on the new firmware. `dev/flash-wsl.sh` does the whole cycle under
 WSL2/usbipd. The bootloader is in mask ROM, so a bad image is always
 recoverable by holding BOOTSEL while plugging in USB.
 

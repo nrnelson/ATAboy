@@ -317,12 +317,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp host/ataboy dist/ataboy.py
           cd dist
           rm -f SHA256SUMS
           chmod +x ataboy-linux-* ataboy-macos-universal
           sha256sum ATAboy-*.uf2 ataboy-linux-x86_64 ataboy-linux-aarch64 \
-            ataboy-windows-x86_64.exe ataboy-macos-universal ataboy.py | tee SHA256SUMS
+            ataboy-windows-x86_64.exe ataboy-macos-universal | tee SHA256SUMS
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes \
             ATAboy-*.uf2 ataboy-linux-x86_64 ataboy-linux-aarch64 ataboy-windows-x86_64.exe \
-            ataboy-macos-universal ataboy.py SHA256SUMS
+            ataboy-macos-universal SHA256SUMS
