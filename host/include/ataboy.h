@@ -25,7 +25,7 @@
 extern "C" {
 #endif
 
-#define ATABOY_LIB_VERSION "2.0.0"
+#define ATABOY_LIB_VERSION "0.9.0"   // 1.0.0 with the first release
 
 typedef enum {
     AB_OK            =  0,
