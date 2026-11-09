@@ -207,7 +207,9 @@ jobs:
           }
           foreach ($f in Get-ChildItem win-tests\fuzz_*.exe) {
             $corpus = Join-Path win-tests\corpus $f.BaseName
-            if (Test-Path $corpus) { & $f.FullName $corpus } else { & $f.FullName }
+            # pass the seed files themselves: fuzz programs with their own main()
+            # (fuzz_main.h) take files, the shared replay driver takes either
+            if (Test-Path $corpus) { & $f.FullName @((Get-ChildItem $corpus -File).FullName) } else { & $f.FullName }
             if ($LASTEXITCODE -ne 0) { throw "$($f.Name) failed" }
           }
           .\ataboy-windows-x86_64.exe --version
