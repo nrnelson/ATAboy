@@ -7,6 +7,7 @@
 #include "cli.h"
 #include "api_proto.h"
 #include <errno.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -668,6 +669,126 @@ static int cmd_wait(ctx *c) {
     return EXIT_TRANSPORT;
 }
 
+// ---------------------------------------------------------------------------
+//  image / rescue / hashes
+// ---------------------------------------------------------------------------
+
+#define EXIT_INTERRUPTED 130        // what the shell saw when Ctrl-C ended the Python tool
+
+#if defined(_WIN32)
+static BOOL WINAPI on_ctrl_c(DWORD ev) {
+    static volatile LONG seen;
+    if (ev != CTRL_C_EVENT && ev != CTRL_BREAK_EVENT) return FALSE;
+    if (InterlockedExchange(&seen, 1)) return FALSE;       // second ^C: default (terminate)
+    ab_interrupt();
+    return TRUE;
+}
+static void catch_interrupt(void) { SetConsoleCtrlHandler(on_ctrl_c, TRUE); }
+#else
+static void on_sigint(int sig) {
+    ab_interrupt();
+    signal(sig, SIG_DFL);                                    // second ^C: default (terminate)
+}
+static void catch_interrupt(void) { signal(SIGINT, on_sigint); }
+#endif
+
+// Report an error whose message is the library's last one, not the device's.
+static int fail_local(ctx *c, int err) {
+    ab_dev *d = c->d;
+    c->d = NULL;
+    int ex = fail(c, err, NULL);
+    c->d = d;
+    return ex;
+}
+
+static uint64_t u64opt(const ctx *c, const char *name, uint64_t dflt) {
+    long long v = iopt(c, name, (long long)dflt);
+    if (v < 0) usage_error("--%s must not be negative", name);
+    return (uint64_t)v;
+}
+
+static void h_image(const cJSON *j, ctx *c) { (void)c; human_image(j); }
+static int cmd_image(ctx *c) {
+    ab_image_opts o = {0};
+    o.mapfile = opt(c, "mapfile");
+    o.start = u64opt(c, "start", 0);
+    o.has_count = opt(c, "count") != NULL;
+    o.count = u64opt(c, "count", 0);
+    o.time_budget_s = fopt(c, "budget", 0);
+    o.progress = c->json ? NULL : progress_line;
+    catch_interrupt();
+    cJSON *out = NULL;
+    int rc = ab_image(c->d, c->pos[0], &o, &out);
+    if (rc != AB_OK) return fail(c, rc, out);
+    emit(c, out, h_image);
+    int ex = !strcmp(ab_jstr(out, "result", ""), "interrupted") ? EXIT_INTERRUPTED
+             : cJSON_GetArraySize(ab_jobj_get(out, "bad_lbas")) ? EXIT_DEVICE : EXIT_OK;
+    cJSON_Delete(out);
+    return ex;
+}
+
+static void h_rescue(const cJSON *j, ctx *c) { (void)c; human_rescue(j); }
+static int cmd_rescue(ctx *c) {
+    ab_rescue_opts o;
+    ab_rescue_opts_init(&o);
+    long long t = iopt(c, "timeout", 15000), v = iopt(c, "vote", 5);
+    if (t < 0 || t > 0xFFFFFFFFll) usage_error("--timeout out of range");
+    if (v > 64) usage_error("--vote: at most 64 reads");
+    o.timeout_ms = (uint32_t)t;
+    o.votes = v < 1 ? 1 : (unsigned)v;
+    o.readlong = !flag(c, "no-readlong");
+    o.no_retry_pass = !flag(c, "no-fast-pass");
+    o.max_sectors = u64opt(c, "max-sectors", 0);
+    o.include_untried = flag(c, "include-untried");
+    o.time_budget_s = fopt(c, "budget", 0);
+    o.save_interval_s = fopt(c, "save-interval", 30);
+    o.progress = c->json ? NULL : progress_line;
+    const char *image = c->pos[0], *mapfile = c->pos[1];
+    ab_mapfile *m = NULL;
+    int rc = ab_mapfile_load(mapfile, &m);
+    if (rc != AB_OK) return fail_local(c, rc);
+    cJSON *before = ab_mapfile_summary(m);
+    ab_mapfile_free(m);
+    catch_interrupt();
+    cJSON *out = NULL;
+    rc = ab_rescue(c->d, image, mapfile, &o, &out);
+    if (rc != AB_OK) { cJSON_Delete(before); return fail(c, rc, out); }
+    cJSON_AddItemToObject(out, "map_before", before);
+    if (ab_mapfile_load(mapfile, &m) == AB_OK) {
+        cJSON_AddItemToObject(out, "map_after", ab_mapfile_summary(m));
+        ab_mapfile_free(m);
+    } else {
+        cJSON_Delete(out);
+        return fail_local(c, AB_ERR_IO);
+    }
+    emit(c, out, h_rescue);
+    int ex = cJSON_GetArraySize(ab_jobj_get(out, "still_bad")) ? EXIT_DEVICE : EXIT_OK;
+    cJSON_Delete(out);
+    return ex;
+}
+
+static void h_hashes(const cJSON *j, ctx *c) { (void)c; human_hashes(j); }
+static int cmd_hashes(ctx *c) {
+    long long since = iopt(c, "since", 0);
+    if (since < 0 || since > 0xFFFFFFFFll) usage_error("--since out of range");
+    bool clear = flag(c, "clear");
+    cJSON *j = NULL;
+    int rc = ab_hashes(c->d, (uint32_t)since, clear, opt(c, "lba") != NULL, u64opt(c, "lba", 0),
+                       u64opt(c, "count", 1), &j);
+    if (rc != AB_OK) return fail(c, rc, j);
+    int ex = EXIT_OK;
+    if (opt(c, "compare") && !clear) {
+        cJSON *cmp = NULL;
+        rc = ab_compare_hashes(ab_jobj_get(j, "records"), opt(c, "compare"), &cmp);
+        if (rc != AB_OK) { cJSON_Delete(j); return fail_local(c, rc); }
+        if (cJSON_GetArraySize(ab_jobj_get(cmp, "differ"))) ex = EXIT_DEVICE;
+        cJSON_AddItemToObject(j, "compare", cmp);
+    }
+    emit(c, j, h_hashes);
+    cJSON_Delete(j);
+    return ex;
+}
+
 static void warn_reboot(void *ctxp, uint32_t old_id, uint32_t new_id, uint8_t op) {
     (void)ctxp; (void)op;
     fprintf(stderr, "ataboy: the ATAboy rebooted (boot id %08x -> %08x): settings in RAM, geometry and "
@@ -713,11 +834,21 @@ static const cmd_t commands[] = {
       {"image", true, "patch the 512 data bytes into IMG at LBA*512"}}},
     {"verify", cmd_verify, true, 2, 2, "LBA COUNT", "READ VERIFY scan (drive-internal, no data over USB); lists bad LBAs",
      {{"timeout", true, "per-command timeout ms"}, {"max-errors", true, NULL}, {"budget", true, "stop after N seconds"}}},
-    {"image", not_yet, true, 1, 1, "OUT", "image the mounted drive with a ddrescue-compatible mapfile", {{"mapfile", true, NULL}, {"start", true, NULL}, {"count", true, NULL}, {"budget", true, NULL}}},
-    {"rescue", not_yet, true, 2, 2, "IMAGE MAPFILE", "retry only the mapfile's bad sectors", {{"timeout", true, NULL}, {"vote", true, NULL}, {"no-readlong", false, NULL}, {"no-fast-pass", false, NULL}, {"max-sectors", true, NULL}, {"include-untried", false, NULL}, {"budget", true, NULL}, {"save-interval", true, NULL}}},
+    {"image", cmd_image, true, 1, 1, "OUT", "image the mounted drive to a file with a ddrescue-compatible mapfile (resumable; follow with rescue)",
+     {{"mapfile", true, "default: OUT.map"}, {"start", true, "first LBA (default 0)"}, {"count", true, "sectors (default: to the end)"},
+      {"budget", true, "stop after N seconds"}}},
+    {"rescue", cmd_rescue, true, 2, 2, "IMAGE MAPFILE", "after ddrescue: retry only the mapfile's bad sectors (no-retry pass, drive retries, READ LONG vote), patch the image, update the map",
+     {{"timeout", true, "per-sector timeout for the retry pass (ms, default 15000)"}, {"vote", true, "READ LONG reads per sector (default 5)"},
+      {"no-readlong", false, "skip the READ LONG pass"}, {"no-fast-pass", false, "skip the no-retry pass"},
+      {"max-sectors", true, "only the first N bad sectors"},
+      {"include-untried", false, "also read never-tried areas sector by sector (slow; normally use image)"},
+      {"budget", true, "stop after N seconds"}, {"save-interval", true, "save the mapfile at least this often while recovering (s, default 30)"}}},
     {"corrupt", cmd_corrupt, true, 1, 1, "LBA", "DESTRUCTIVE test helper: damage a sector on purpose",
      {{"bits", true, "data bits to flip (default 16)"}, {"ecc", true, NULL}}},
-    {"hashes", not_yet, true, 0, 0, "", "SHA-256 of recently read sectors", {{"since", true, NULL}, {"lba", true, NULL}, {"count", true, NULL}, {"compare", true, NULL}, {"clear", false, NULL}}},
+    {"hashes", cmd_hashes, true, 0, 0, "", "SHA-256 of recently read sectors as they came off the IDE bus (USB disk and API reads); --compare checks them against an image",
+     {{"since", true, "first sequence number (default: oldest kept)"}, {"lba", true, "only records for this LBA (and --count after it)"},
+      {"count", true, "with --lba (default 1)"}, {"compare", true, "check each record against IMG at LBA*512"},
+      {"clear", false, "empty the device's hash ring"}}},
     {"log", cmd_log, true, 0, 0, "", "error log: every failed command with ATA status/error/registers", {{"clear", false, "clear after reading"}}},
     {"clear", cmd_clear, true, 0, 0, "", "clear the error log (and/or statistics)", {{"stats", false, NULL}, {"stats-only", false, NULL}}},
     {"arm", cmd_arm, true, 0, 0, "", "allow ONE dangerous pass-through command within 10 s", {{0}}},

@@ -66,7 +66,7 @@ else()
     target_link_libraries(ataboy_lib PUBLIC m)
 endif()
 
-add_executable(ataboy cli/ataboy.c cli/human.c cli/bootcache.c)
+add_executable(ataboy cli/ataboy.c cli/human.c cli/bootcache.c cli/human_recover.c)
 target_include_directories(ataboy PRIVATE ${FW} src)
 target_link_libraries(ataboy PRIVATE ataboy_lib)
 if (ATABOY_STATIC)
