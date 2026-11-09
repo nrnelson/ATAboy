@@ -1,0 +1,328 @@
+name: host
+
+# The C host tool (host/): libataboy + the ataboy CLI.
+#  - every C test runs under AddressSanitizer + UndefinedBehaviorSanitizer
+#    (gcc and clang on Linux, Apple clang on macOS);
+#  - every host/tests/fuzz_*.c target is fuzzed with libFuzzer on every push;
+#  - release binaries for Linux (static, x86-64 + aarch64), Windows and macOS;
+#  - on a v* tag: one GitHub release with those binaries and the firmware UF2.
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Leak checking is on by default where ASan supports it (Linux); asking
+  # for it elsewhere (macOS, Windows) is a fatal error, so it isn't set here.
+  ASAN_OPTIONS: strict_string_checks=1:check_initialization_order=1
+  UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+
+jobs:
+  linux-gcc:
+    name: linux gcc (ASan+UBSan)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build build-essential
+
+      - name: Host tests under ASan + UBSan
+        run: |
+          cmake -S host -B host/build-asan -G Ninja -DATABOY_SANITIZE=ON
+          ninja -C host/build-asan
+          ctest --test-dir host/build-asan --output-on-failure
+
+      - name: Optimised build (warnings at -O2) and tests
+        run: |
+          cmake -S host -B host/build-rel -G Ninja -DCMAKE_BUILD_TYPE=Release
+          ninja -C host/build-rel
+          ctest --test-dir host/build-rel --output-on-failure
+
+      - name: Firmware-side unit tests under ASan + UBSan
+        run: |
+          SAN="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -g"
+          cc -Wall -Wextra -Werror $SAN -I firmware -o "$RUNNER_TEMP/test_host" \
+            tests/test_host.c firmware/ata_policy.c firmware/json.c firmware/config_check.c \
+            firmware/crc32.c firmware/rid_cache.c firmware/apiframe.c firmware/api_proto.c
+          "$RUNNER_TEMP/test_host"
+          cc -Wall -Wextra -Werror $SAN -I firmware -o "$RUNNER_TEMP/test_rw" tests/test_rw.c firmware/msc_rw.c
+          "$RUNNER_TEMP/test_rw"
+          cc -Wall -Wextra -Werror $SAN -I firmware -o "$RUNNER_TEMP/test_hash" tests/test_hash.c firmware/sector_hash.c
+          "$RUNNER_TEMP/test_hash"
+
+  linux-clang-fuzz:
+    name: linux clang (libFuzzer)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      FUZZ_TOTAL_SECONDS: 600     # shared by all targets
+      FUZZ_MAX_SECONDS: 60        # per target
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build clang
+          clang --version
+
+      - name: Build (libFuzzer + ASan + UBSan) and run the tests
+        run: |
+          cmake -S host -B host/build-fuzz -G Ninja -DCMAKE_C_COMPILER=clang -DATABOY_FUZZ=ON
+          ninja -C host/build-fuzz
+          ctest --test-dir host/build-fuzz --output-on-failure
+
+      - name: Fuzz every target
+        run: |
+          shopt -s nullglob
+          targets=()
+          for src in host/tests/fuzz_*.c; do
+            name=$(basename "$src" .c)
+            [ "$name" = fuzz_replay_main ] && continue
+            targets+=("$name")
+          done
+          [ ${#targets[@]} -gt 0 ] || { echo "no fuzz targets"; exit 1; }
+          per=$(( FUZZ_TOTAL_SECONDS / ${#targets[@]} ))
+          [ "$per" -gt "$FUZZ_MAX_SECONDS" ] && per=$FUZZ_MAX_SECONDS
+          [ "$per" -lt 10 ] && per=10
+          mkdir -p fuzz-crashes fuzz-work
+          fail=0
+          for name in "${targets[@]}"; do
+            echo "::group::$name (${per}s)"
+            work="fuzz-work/$name"
+            mkdir -p "$work"
+            if [ -d "host/tests/corpus/$name" ]; then cp -R "host/tests/corpus/$name/." "$work/"; fi
+            if ! "host/build-fuzz/$name" "$work" -max_total_time="$per" -timeout=10 -rss_limit_mb=2048 \
+                   -print_final_stats=1 -artifact_prefix="fuzz-crashes/$name-"; then
+              echo "::error::$name found a crash (input in the fuzz-crashes artifact)"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $fail
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-crashes
+          path: fuzz-crashes/
+          if-no-files-found: ignore
+
+  windows-mingw-cross:
+    name: windows (mingw cross, static)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build gcc-mingw-w64-x86-64
+
+      - name: Cross-build ataboy.exe
+        run: |
+          cmake -S host -B host/build-win -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64.cmake \
+            -DCMAKE_BUILD_TYPE=Release -DATABOY_STATIC=ON -DCMAKE_EXE_LINKER_FLAGS=-static
+          ninja -C host/build-win
+          x86_64-w64-mingw32-strip -o ataboy-windows-x86_64.exe host/build-win/ataboy.exe
+          x86_64-w64-mingw32-objdump -p ataboy-windows-x86_64.exe | grep "DLL Name"
+          mkdir -p win-tests
+          cp host/build-win/test_*.exe host/build-win/fuzz_*.exe win-tests/
+          cp -R host/tests/corpus win-tests/corpus
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ataboy-windows-x86_64
+          path: ataboy-windows-x86_64.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-cross-tests
+          path: win-tests/
+          retention-days: 3
+
+  windows-native:
+    name: windows (${{ matrix.msystem }}${{ matrix.sanitize == 'ON' && ', ASan+UBSan' || '' }})
+    needs: windows-mingw-cross
+    runs-on: windows-latest
+    # The clang ASan/UBSan leg is not yet proven on the runner: it reports,
+    # but does not fail the workflow.  Linux and macOS carry the required
+    # sanitizer runs.
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { msystem: UCRT64, pkg: mingw-w64-ucrt-x86_64, cc: gcc, sanitize: "OFF", experimental: false }
+          - { msystem: CLANG64, pkg: mingw-w64-clang-x86_64, cc: clang, sanitize: "ON", experimental: true }
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: false
+          install: >-
+            ${{ matrix.pkg }}-${{ matrix.cc }}
+            ${{ matrix.pkg }}-cmake
+            ${{ matrix.pkg }}-ninja
+
+      - name: Build and run the tests natively
+        run: |
+          cmake -S host -B host/build -G Ninja -DCMAKE_C_COMPILER=${{ matrix.cc }} -DATABOY_SANITIZE=${{ matrix.sanitize }}
+          ninja -C host/build
+          ctest --test-dir host/build --output-on-failure
+
+      - uses: actions/download-artifact@v4
+        if: matrix.msystem == 'UCRT64'
+        with:
+          name: ataboy-windows-x86_64
+
+      - uses: actions/download-artifact@v4
+        if: matrix.msystem == 'UCRT64'
+        with:
+          name: windows-cross-tests
+          path: win-tests
+
+      - name: Run the cross-built binaries on Windows
+        if: matrix.msystem == 'UCRT64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($t in Get-ChildItem win-tests\test_*.exe) {
+            & $t.FullName
+            if ($LASTEXITCODE -ne 0) { throw "$($t.Name) failed" }
+          }
+          foreach ($f in Get-ChildItem win-tests\fuzz_*.exe) {
+            $corpus = Join-Path win-tests\corpus $f.BaseName
+            if (Test-Path $corpus) { & $f.FullName $corpus } else { & $f.FullName }
+            if ($LASTEXITCODE -ne 0) { throw "$($f.Name) failed" }
+          }
+          .\ataboy-windows-x86_64.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "--version failed" }
+          .\ataboy-windows-x86_64.exe list
+          if ($LASTEXITCODE -ne 0) { throw "list failed" }
+
+  macos:
+    name: macos (ASan+UBSan, universal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tests under ASan + UBSan
+        run: |
+          cmake -S host -B host/build-asan -DATABOY_SANITIZE=ON
+          cmake --build host/build-asan --parallel
+          ctest --test-dir host/build-asan --output-on-failure
+
+      - name: Universal release build (arm64 + x86_64) and tests
+        run: |
+          cmake -S host -B host/build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+          cmake --build host/build --parallel
+          ctest --test-dir host/build --output-on-failure
+          strip -o ataboy-macos-universal host/build/ataboy
+          lipo -info ataboy-macos-universal
+          lipo ataboy-macos-universal -verify_arch arm64 x86_64
+
+      - name: Smoke test
+        run: |
+          ./ataboy-macos-universal --version
+          ./ataboy-macos-universal list
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then
+            arch -x86_64 ./ataboy-macos-universal --version
+          else
+            echo "no Rosetta on this runner: x86_64 slice not run"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ataboy-macos-universal
+          path: ataboy-macos-universal
+
+  linux-static:
+    name: linux static (${{ matrix.arch }}, musl)
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build in Alpine (musl, fully static) and run the tests
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src -e ARCH=${{ matrix.arch }} \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" alpine:3.20 sh -euxc '
+              apk add --no-cache build-base cmake ninja linux-headers file
+              cmake -S host -B /tmp/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DATABOY_STATIC=ON
+              ninja -C /tmp/build
+              ctest --test-dir /tmp/build --output-on-failure
+              strip -o "ataboy-linux-$ARCH" /tmp/build/ataboy
+              chown "$HOST_UID:$HOST_GID" "ataboy-linux-$ARCH"
+              file "ataboy-linux-$ARCH"'
+
+      - name: Smoke test on the runner (glibc host, no device)
+        run: |
+          f=ataboy-linux-${{ matrix.arch }}
+          file "$f"
+          file "$f" | grep -Eq "statically linked|static-pie linked"
+          if ldd "$f" 2>/dev/null | grep -q "=>"; then echo "$f has shared library dependencies"; exit 1; fi
+          "./$f" --version
+          "./$f" list
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ataboy-linux-${{ matrix.arch }}
+          path: ataboy-linux-${{ matrix.arch }}
+
+  # On a v* tag: build the firmware (the firmware workflow, called here so the
+  # UF2 lands in this run) and publish one release with everything.
+  firmware:
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+    uses: ./.github/workflows/firmware.yml
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux-gcc, linux-clang-fuzz, windows-native, macos, linux-static, firmware]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: "{ataboy-*,ATAboy-firmware}"
+          merge-multiple: true
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp host/ataboy dist/ataboy.py
+          cd dist
+          rm -f SHA256SUMS
+          chmod +x ataboy-linux-* ataboy-macos-universal
+          sha256sum ATAboy-*.uf2 ataboy-linux-x86_64 ataboy-linux-aarch64 \
+            ataboy-windows-x86_64.exe ataboy-macos-universal ataboy.py | tee SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes \
+            ATAboy-*.uf2 ataboy-linux-x86_64 ataboy-linux-aarch64 ataboy-windows-x86_64.exe \
+            ataboy-macos-universal ataboy.py SHA256SUMS
