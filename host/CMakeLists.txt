@@ -35,6 +35,11 @@ if (ATABOY_SANITIZE)
     add_compile_options(-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -g)
     add_link_options(-fsanitize=address,undefined)
 endif()
+if (ATABOY_FUZZ)
+    # Instrument everything for libFuzzer; the fuzz targets add -fsanitize=fuzzer.
+    add_compile_options(-fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=address,undefined)
+endif()
 
 # Vendored cJSON (MIT): built without our -Werror policy.
 add_library(cjson STATIC third_party/cjson/cJSON.c)
@@ -78,3 +83,32 @@ add_executable(test_lib tests/test_lib.c)
 target_include_directories(test_lib PRIVATE src ${FW})
 target_link_libraries(test_lib PRIVATE ataboy_lib)
 add_test(NAME test_lib COMMAND test_lib)
+
+# whatfile / ata unit tests (no hardware)
+add_executable(test_fat tests/test_fat.c)
+target_include_directories(test_fat PRIVATE src ${FW})
+target_link_libraries(test_fat PRIVATE ataboy_lib)
+add_test(NAME test_fat COMMAND test_fat ${CMAKE_CURRENT_LIST_DIR}/tests/corpus/fuzz_fat
+                                        ${CMAKE_CURRENT_LIST_DIR}/tests/whatfile)
+# The CLI's human whatfile output against the Python tool's (golden .txt)
+foreach(img fat12_floppy fat16_mbr_logical fat16_superfloppy fat32_mbr wrong_types)
+    add_test(NAME whatfile_human_${img}
+             COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:ataboy> -DIMG=${img}.img
+                     -DDIR=${CMAKE_CURRENT_LIST_DIR}/tests -P ${CMAKE_CURRENT_LIST_DIR}/tests/whatfile_human.cmake)
+endforeach()
+
+# Fuzz targets.  ATABOY_FUZZ=ON: libFuzzer binaries (clang); otherwise plain
+# programs that replay the seed corpus (tests/corpus/<target>/) as a test, and
+# take -mutate=N for a quick random-mutation run under the sanitizers.
+foreach(t fuzz_fat fuzz_reply fuzz_frame)
+    add_executable(${t} tests/${t}.c)
+    target_include_directories(${t} PRIVATE src ${FW})
+    target_link_libraries(${t} PRIVATE ataboy_lib)
+    if (ATABOY_FUZZ)
+        target_compile_definitions(${t} PRIVATE AB_LIBFUZZER)
+        target_link_options(${t} PRIVATE -fsanitize=fuzzer)
+    else()
+        file(GLOB seeds ${CMAKE_CURRENT_LIST_DIR}/tests/corpus/${t}/*)
+        add_test(NAME ${t}_corpus COMMAND ${t} -mutate=2000 ${seeds})
+    endif()
+endforeach()

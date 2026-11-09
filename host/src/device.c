@@ -226,7 +226,7 @@ void ab_reply_free(ab_reply *r) {
     if (r && r->json) { cJSON_Delete(r->json); r->json = NULL; }
 }
 
-static int parse_reply(ab_reply *r) {
+int ab_parse_reply(ab_reply *r) {
     const uint8_t *b = r->raw;
     if (r->raw_len < HDR_LEN) return ab_fail(AB_ERR_TRANSPORT, "short reply (%zu bytes)", r->raw_len);
     if (b[0] != 'A' || b[1] != 'B')
@@ -337,7 +337,7 @@ int ab_call(ab_dev *dev, uint8_t op, const uint8_t *args, size_t nargs, uint32_t
     }
     if (rc != AB_OK) return ab_dev_fail(dev, rc);
     if (r->raw_len == 0) return ab_dev_fail(dev, ab_fail(AB_ERR_TRANSPORT, "empty reply from the ATAboy"));
-    rc = parse_reply(r);
+    rc = ab_parse_reply(r);
     if (rc != AB_OK) { ab_reply_free(r); return ab_dev_fail(dev, rc); }
     if (r->proto != API_PROTO_VERSION) {
         ab_reply_free(r);

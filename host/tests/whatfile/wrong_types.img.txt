@@ -1,0 +1,44 @@
+p1   LBA 1-20  type 0x83  Linux  [FAT12 NO NAME, 1 files, 0 dirs, 0 deleted entries]  (type 0x83 but holds a FAT12 file system)
+p2   LBA 21-28  type 0x06  FAT16  (FAT partition type but no valid FAT boot sector)
+
+         0  -          mbr
+         1  p1 FAT12   boot sector
+         2  p1 FAT12   FAT copy 1 of 2 (entries for clusters 0-9); other FAT copies hold the same entries
+         3  p1 FAT12   FAT copy 2 of 2 (entries for clusters 0-9); other FAT copies hold the same entries
+         4  p1 FAT12   root directory /  [entries: A.TXT]
+         5  p1 FAT12   file /A.TXT  [offset 0 of 1500 bytes, cluster 2]
+         6  p1 FAT12   file /A.TXT  [offset 512 of 1500 bytes, cluster 2]
+         7  p1 FAT12   file /A.TXT  [offset 1024 of 1500 bytes, cluster 3]
+         8  p1 FAT12   file /A.TXT  [offset 1536 of 1500 bytes, past EOF (slack), cluster 3]
+         9  p1 FAT12   free 4
+        10  p1 FAT12   free 4
+        11  p1 FAT12   free 5
+        12  p1 FAT12   free 5
+        13  p1 FAT12   free 6
+        14  p1 FAT12   free 6
+        15  p1 FAT12   free 7
+        16  p1 FAT12   free 7
+        17  p1 FAT12   free 8
+        18  p1 FAT12   free 8
+        19  p1 FAT12   free 9
+        20  p1 FAT12   free 9
+        21  p2         non-FAT partition (type 0x06 FAT16)
+        22  p2         non-FAT partition (type 0x06 FAT16)
+        23  p2         non-FAT partition (type 0x06 FAT16)
+        24  p2         non-FAT partition (type 0x06 FAT16)
+        25  p2         non-FAT partition (type 0x06 FAT16)
+        26  p2         non-FAT partition (type 0x06 FAT16)
+        27  p2         non-FAT partition (type 0x06 FAT16)
+        28  p2         non-FAT partition (type 0x06 FAT16)
+        29  -          unpartitioned
+        30  -          unpartitioned
+        31  -          unpartitioned
+        32  -          beyond image
+        33  -          beyond image
+    100000  -          beyond image
+8589934592  -          beyond image
+        -1  -          invalid
+
+affected objects:
+  root_dir  p1 /  1 sector: 4
+  file      p1 /A.TXT  4 sectors: 5 6 7 8

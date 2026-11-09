@@ -1,0 +1,143 @@
+p1   LBA 2-70101  type 0x0C  FAT32 LBA  [FAT32 FAT32 TEST, 28 files, 3 dirs, 3 deleted entries]
+p2   LBA 70102-70111  type 0x83  Linux
+
+         0  -          mbr
+         1  -          mbr gap  (between the partition table and the first partition)
+         2  p1 FAT32   boot sector
+         3  p1 FAT32   fsinfo
+         4  p1 FAT32   reserved  (reserved sector 2)
+         5  p1 FAT32   reserved  (reserved sector 3)
+         6  p1 FAT32   reserved  (reserved sector 4)
+         7  p1 FAT32   reserved  (reserved sector 5)
+         8  p1 FAT32   backup boot sector  (backup boot record sector 0)
+         9  p1 FAT32   backup boot sector  (backup boot record sector 1)
+        10  p1 FAT32   FAT copy 1 of 2 (entries for clusters 0-127); other FAT copies hold the same entries
+        11  p1 FAT32   FAT copy 1 of 2 (entries for clusters 128-255); other FAT copies hold the same entries
+        12  p1 FAT32   FAT copy 1 of 2 (entries for clusters 256-383); other FAT copies hold the same entries
+        13  p1 FAT32   FAT copy 1 of 2 (entries for clusters 384-511); other FAT copies hold the same entries
+        14  p1 FAT32   FAT copy 1 of 2 (entries for clusters 512-639); other FAT copies hold the same entries
+        15  p1 FAT32   FAT copy 1 of 2 (entries for clusters 640-767); other FAT copies hold the same entries
+        16  p1 FAT32   FAT copy 1 of 2 (entries for clusters 768-895); other FAT copies hold the same entries
+        17  p1 FAT32   FAT copy 1 of 2 (entries for clusters 896-1023); other FAT copies hold the same entries
+        18  p1 FAT32   FAT copy 2 of 2 (entries for clusters 0-127); other FAT copies hold the same entries
+        19  p1 FAT32   FAT copy 2 of 2 (entries for clusters 128-255); other FAT copies hold the same entries
+        20  p1 FAT32   FAT copy 2 of 2 (entries for clusters 256-383); other FAT copies hold the same entries
+        21  p1 FAT32   FAT copy 2 of 2 (entries for clusters 384-511); other FAT copies hold the same entries
+        22  p1 FAT32   FAT copy 2 of 2 (entries for clusters 512-639); other FAT copies hold the same entries
+        23  p1 FAT32   FAT copy 2 of 2 (entries for clusters 640-767); other FAT copies hold the same entries
+        24  p1 FAT32   FAT copy 2 of 2 (entries for clusters 768-895); other FAT copies hold the same entries
+        25  p1 FAT32   FAT copy 2 of 2 (entries for clusters 896-1023); other FAT copies hold the same entries
+        26  p1 FAT32   directory /  [entries: TESTVOL (label), A long file name.txt, readme, SUBDIR/, deleted file.dat (deleted), _LDDIR/ (deleted), +4 more]
+        27  p1 FAT32   file /A long file name.txt  [offset 0 of 1500 bytes, cluster 3]
+        28  p1 FAT32   file /A long file name.txt  [offset 512 of 1500 bytes, cluster 4]
+        29  p1 FAT32   file /A long file name.txt  [offset 1024 of 1500 bytes, cluster 5]
+        30  p1 FAT32   file /readme  [offset 0 of 100 bytes, cluster 6]
+        31  p1 FAT32   directory /SUBDIR  [entries: Nested Folder/, F0000000.TXT, F0000001.TXT, F0000002.TXT, F0000003.TXT, F0000004.TXT, +7 more]
+        32  p1 FAT32   file /FRAG.BIN  [offset 0 of 2048 bytes, cluster 8]
+        33  p1 FAT32   file /FRAG.BIN  [offset 1024 of 2048 bytes, cluster 9]
+        34  p1 FAT32   file /FRAG.BIN  [offset 512 of 2048 bytes, cluster 10]
+        35  p1 FAT32   file /FRAG.BIN  [offset 1536 of 2048 bytes, cluster 11]
+        36  p1 FAT32   directory /SUBDIR  [entries: F0000012.TXT, F0000013.TXT, F0000014.TXT, F0000015.TXT, F0000016.TXT, F0000017.TXT, +3 more]
+        37  p1 FAT32   file /LOOP.BIN  [offset 0 of 4096 bytes, cluster 13]
+        38  p1 FAT32   file /LOOP.BIN  [offset 512 of 4096 bytes, cluster 14]
+        39  p1 FAT32   file /σSIGMA.TXT  [offset 0 of 10 bytes, cluster 15]
+        40  p1 FAT32   free 16
+        41  p1 FAT32   lost 17  (allocated in the FAT but not reachable from any directory)
+        42  p1 FAT32   lost 18  (allocated in the FAT but not reachable from any directory)
+        43  p1 FAT32   lost 19  (allocated in the FAT but not reachable from any directory)
+        44  p1 FAT32   deleted (best effort) /deleted file.dat  [cluster 20, first cluster of the deleted entry; offset 0 of 1100 bytes]
+        45  p1 FAT32   directory /SUBDIR/Nested Folder  [entries: DEEP.TXT, SELF/]
+        46  p1 FAT32   file /SUBDIR/INSUB.DAT  [offset 0 of 700 bytes, cluster 22]
+        47  p1 FAT32   file /SUBDIR/INSUB.DAT  [offset 512 of 700 bytes, cluster 23]
+        48  p1 FAT32   deleted (best effort) /_LDDIR/  [cluster 24, first cluster of the deleted entry; entries: CHILD.TXT (deleted)]
+        49  p1 FAT32   deleted (best effort) /_LDDIR/CHILD.TXT  [cluster 25, first cluster of the deleted entry; offset 0 of 300 bytes]
+        50  p1 FAT32   file /SUBDIR/Nested Folder/DEEP.TXT  [offset 0 of 5 bytes, cluster 26]
+        51  p1 FAT32   lost 27  (allocated in the FAT but not reachable from any directory)
+        52  p1 FAT32   bad cluster 28  (marked bad in the FAT)
+        53  p1 FAT32   free 29
+        54  p1 FAT32   free 30
+        55  p1 FAT32   free 31
+        56  p1 FAT32   free 32
+        57  p1 FAT32   free 33
+        58  p1 FAT32   free 34
+        59  p1 FAT32   free 35
+        60  p1 FAT32   free 36
+        61  p1 FAT32   free 37
+        62  p1 FAT32   free 38
+        63  p1 FAT32   free 39
+        64  p1 FAT32   free 40
+        65  p1 FAT32   free 41
+        66  p1 FAT32   free 42
+        67  p1 FAT32   free 43
+        68  p1 FAT32   free 44
+        69  p1 FAT32   free 45
+        70  p1 FAT32   free 46
+        71  p1 FAT32   free 47
+        72  p1 FAT32   free 48
+        73  p1 FAT32   free 49
+        74  p1 FAT32   free 50
+        75  p1 FAT32   free 51
+        76  p1 FAT32   free 52
+        77  p1 FAT32   free 53
+        78  p1 FAT32   free 54
+        79  p1 FAT32   free 55
+        80  p1 FAT32   free 56
+        81  p1 FAT32   free 57
+        82  p1 FAT32   free 58
+        83  p1 FAT32   free 59
+        84  p1 FAT32   free 60
+        85  p1 FAT32   free 61
+        86  p1 FAT32   free 62
+        87  p1 FAT32   free 63
+        88  p1 FAT32   free 64
+        89  p1 FAT32   free 65
+        90  p1 FAT32   free 66
+        91  p1 FAT32   free 67
+        92  p1 FAT32   free 68
+        93  p1 FAT32   free 69
+        94  p1 FAT32   free 70
+        95  p1 FAT32   free 71
+        96  p1 FAT32   free 72
+        97  p1 FAT32   free 73
+        98  p1 FAT32   free 74
+        99  p1 FAT32   free 75
+       100  p1 FAT32   free 76
+       101  p1 FAT32   free 77
+       102  p1 FAT32   free 78
+       103  p1 FAT32   free 79
+       104  p1 FAT32   free 80
+       105  p1 FAT32   free 81
+       106  p1 FAT32   free 82
+       107  p1 FAT32   free 83
+       108  p1 FAT32   free 84
+       109  p1 FAT32   free 85
+       110  p1 FAT32   free 86
+       111  p1 FAT32   free 87
+       112  p1 FAT32   free 88
+       113  p1 FAT32   free 89
+       114  p1 FAT32   free 90
+       115  p1 FAT32   free 91
+       116  p1 FAT32   free 92
+       117  p1 FAT32   free 93
+       118  p1 FAT32   free 94
+       119  p1 FAT32   free 95
+       120  -          beyond image
+       121  -          beyond image
+    100000  -          beyond image
+8589934592  -          beyond image
+        -1  -          invalid
+
+affected objects:
+  directory p1 /  1 sector: 26
+  file      p1 /A long file name.txt  3 sectors: 27 28 29
+  file      p1 /readme  1 sector: 30
+  directory p1 /SUBDIR  2 sectors: 31 36
+  file      p1 /FRAG.BIN  4 sectors: 32 33 34 35
+  file      p1 /LOOP.BIN  2 sectors: 37 38
+  file      p1 /σSIGMA.TXT  1 sector: 39
+  deleted   p1 /deleted file.dat  1 sector: 44
+  directory p1 /SUBDIR/Nested Folder  1 sector: 45
+  file      p1 /SUBDIR/INSUB.DAT  2 sectors: 46 47
+  deleted   p1 /_LDDIR  1 sector: 48
+  deleted   p1 /_LDDIR/CHILD.TXT  1 sector: 49
+  file      p1 /SUBDIR/Nested Folder/DEEP.TXT  1 sector: 50
