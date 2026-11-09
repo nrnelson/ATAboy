@@ -10,9 +10,22 @@
 #include <direct.h>
 #define mkdir_(p) _mkdir(p)
 #else
+#include <pwd.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #define mkdir_(p) mkdir(p, 0700)
 #endif
+
+// Under sudo, use (and keep owned by) the invoking user's cache, so root
+// runs and normal runs see the same boot ids.
+static void own(const char *path) {
+#if !defined(_WIN32)
+    const char *u = getenv("SUDO_UID"), *g = getenv("SUDO_GID");
+    if (geteuid() == 0 && u && g && chown(path, (uid_t)atol(u), (gid_t)atol(g)) != 0) { /* best effort */ }
+#else
+    (void)path;
+#endif
+}
 
 static int cache_path(char *out, size_t n, bool create) {
     const char *base;
@@ -25,13 +38,16 @@ static int cache_path(char *out, size_t n, bool create) {
     snprintf(out, n, "%s\\boot-ids.json", tmp);
 #else
     const char *xdg = getenv("XDG_CACHE_HOME");
-    if (xdg && *xdg) snprintf(tmp, sizeof(tmp), "%s", xdg);
+    const char *su = getenv("SUDO_USER");
+    struct passwd *pw = (geteuid() == 0 && su && *su) ? getpwnam(su) : NULL;
+    if (pw && pw->pw_dir) snprintf(tmp, sizeof(tmp), "%s/.cache", pw->pw_dir);
+    else if (xdg && *xdg) snprintf(tmp, sizeof(tmp), "%s", xdg);
     else if ((base = getenv("HOME")) != NULL) snprintf(tmp, sizeof(tmp), "%s/.cache", base);
     else return -1;
-    if (create) mkdir_(tmp);
+    if (create && mkdir_(tmp) == 0) own(tmp);
     size_t l = strlen(tmp);
     snprintf(tmp + l, sizeof(tmp) - l, "/ataboy");
-    if (create) mkdir_(tmp);
+    if (create && mkdir_(tmp) == 0) own(tmp);
     snprintf(out, n, "%s/boot-ids.json", tmp);
 #endif
     return 0;
@@ -78,7 +94,7 @@ void bootcache_save(ab_dev *dev) {
 #if defined(_WIN32)
             remove(p);
 #endif
-            rename(t, p);
+            if (rename(t, p) == 0) own(p);
         }
     }
     free(s);
