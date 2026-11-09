@@ -41,6 +41,15 @@ if (ATABOY_SANITIZE)
     add_compile_options(-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -g)
     add_link_options(-fsanitize=address,undefined)
 endif()
+if (ATABOY_FUZZ)
+    if (NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "ATABOY_FUZZ needs clang (libFuzzer): -DCMAKE_C_COMPILER=clang")
+    endif()
+    # Coverage instrumentation everywhere; only the fuzz targets link libFuzzer.
+    add_compile_options(-fsanitize=fuzzer-no-link,address,undefined -fno-sanitize-recover=all
+                        -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=address,undefined)
+endif()
 
 # Vendored cJSON (MIT): built without our -Werror policy.
 add_library(cjson STATIC third_party/cjson/cJSON.c)
@@ -100,3 +109,39 @@ if (NOT WIN32)
     target_link_libraries(test_serial PRIVATE m)
 endif()
 add_test(NAME test_serial COMMAND test_serial)
+
+# Fuzz targets: every tests/fuzz_<name>.c becomes one, automatically.
+#
+# Convention for fuzz_<name>.c: define only
+#     int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
+# (no main(), no LLVMFuzzerInitialize); it is linked against ataboy_lib with
+# include/, src/ and firmware/ on the include path.  Seed inputs, one file
+# each, go in tests/corpus/fuzz_<name>/.
+#  - ATABOY_FUZZ=ON (clang): fuzz_<name> is a libFuzzer binary, e.g.
+#        build/fuzz_<name> <copy of tests/corpus/fuzz_<name>> -max_total_time=60
+#    and ctest runs it once over the seeds (-runs=0).
+#  - Otherwise fuzz_<name> is linked with tests/fuzz_replay_main.c, a main()
+#    that feeds it each file named on the command line (every file of a
+#    directory), and ctest replays the seeds through it, so every compiler
+#    and sanitizer build exercises them.
+file(GLOB FUZZ_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_LIST_DIR}/tests/fuzz_*.c)
+list(REMOVE_ITEM FUZZ_SOURCES ${CMAKE_CURRENT_LIST_DIR}/tests/fuzz_replay_main.c)
+foreach (src IN LISTS FUZZ_SOURCES)
+    get_filename_component(name ${src} NAME_WE)
+    set(corpus ${CMAKE_CURRENT_LIST_DIR}/tests/corpus/${name})
+    file(GLOB seed_files CONFIGURE_DEPENDS ${corpus}/*)   # reconfigure when seeds come or go
+    set(seeds "")
+    if (seed_files)
+        set(seeds ${corpus})
+    endif()
+    if (ATABOY_FUZZ)
+        add_executable(${name} ${src})
+        target_link_options(${name} PRIVATE -fsanitize=fuzzer)
+        add_test(NAME ${name}_corpus COMMAND ${name} -runs=0 ${seeds})
+    else()
+        add_executable(${name} ${src} tests/fuzz_replay_main.c)
+        add_test(NAME ${name}_corpus COMMAND ${name} ${seeds})
+    endif()
+    target_include_directories(${name} PRIVATE src ${FW})
+    target_link_libraries(${name} PRIVATE ataboy_lib)
+endforeach()
