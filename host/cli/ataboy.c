@@ -37,12 +37,12 @@ typedef struct {
     opt_t opts[16];
 } cmd_t;
 
-#define MAXPOS 64
+#define MAXPOS 0x7FFFFFFF           // "any number" of positional arguments
 struct ctx {
     bool json, compact, verbose;
     const char *dev, *serial, *transport;
     const cmd_t *cmd;
-    const char *pos[MAXPOS];
+    const char **pos;                     // argc entries
     int npos;
     const char *val[16];
     bool set[16];
@@ -781,6 +781,31 @@ static int cmd_ata(ctx *c) {
     return ex;
 }
 
+// --- whatfile ----------------------------------------------------------------
+
+static void h_whatfile(const cJSON *j, ctx *c) { (void)c; human_whatfile(j); }
+
+static int cmd_whatfile(ctx *c) {
+    size_t ncli = (size_t)(c->npos - 1);
+    int64_t *cli = malloc((ncli ? ncli : 1) * sizeof(int64_t)), *lbas = NULL;
+    if (!cli) return local_error(c, "error", EXIT_USAGE, "out of memory");
+    for (size_t i = 0; i < ncli; i++) cli[i] = parse_int(c->pos[i + 1], "LBA");
+    size_t n = 0;
+    int rc = ab_whatfile_lbas(cli, ncli, opt(c, "from-map"), opt(c, "from-json"), &lbas, &n);
+    free(cli);
+    if (rc == AB_OK && !n) {
+        free(lbas);
+        return local_error(c, "error", EXIT_USAGE, "no LBAs given (LBA arguments, --from-map or --from-json)");
+    }
+    cJSON *out = NULL;
+    if (rc == AB_OK) rc = ab_whatfile(c->pos[0], lbas, n, &out);
+    free(lbas);
+    if (rc != AB_OK) return local_error(c, "error", EXIT_USAGE, "%s", ab_last_error());
+    emit(c, out, h_whatfile);
+    cJSON_Delete(out);
+    return EXIT_OK;
+}
+
 static void warn_reboot(void *ctxp, uint32_t old_id, uint32_t new_id, uint8_t op) {
     (void)ctxp; (void)op;
     fprintf(stderr, "ataboy: the ATAboy rebooted (boot id %08x -> %08x): settings in RAM, geometry and "
@@ -843,7 +868,10 @@ static const cmd_t commands[] = {
       {"read", true, "PIO data-in of N sectors"}, {"write", true, "PIO data-out from FILE"},
       {"out", true, "save data-in to FILE"}, {"no-ck", false, "don't request result registers"},
       {"dangerous", false, "arm first (needed for DANGEROUS commands)"}, {"timeout", true, "ms (default 60000)"}}},
-    {"whatfile", not_yet, false, 1, MAXPOS, "IMAGE [LBA ...]", "map image LBAs to the FAT files that own them", {{"from-map", true, NULL}, {"from-json", true, NULL}}},
+    {"whatfile", cmd_whatfile, false, 1, MAXPOS, "IMAGE [LBA ...]",
+     "map image LBAs to the FAT12/16/32 files, directories, FATs or free space that own them (no device, no root)",
+     {{"from-map", true, "all tried-and-failed sectors of a ddrescue mapfile"},
+      {"from-json", true, "JSON list of LBAs, or an object with \"bad_lbas\""}}},
 };
 #define NCMDS (sizeof(commands) / sizeof(commands[0]))
 
@@ -871,6 +899,9 @@ static const char *take(int argc, char **argv, int *i, const char *name, const c
 int main(int argc, char **argv) {
     ctx c;
     memset(&c, 0, sizeof(c));
+    static const char **positional;       // static: stays reachable until exit
+    c.pos = positional = calloc((size_t)argc, sizeof(*c.pos));
+    if (!c.pos) return EXIT_USAGE;
     c.dev = getenv("ATABOY_DEV");
     c.serial = getenv("ATABOY_SERIAL");
     c.transport = getenv("ATABOY_TRANSPORT");
@@ -879,13 +910,12 @@ int main(int argc, char **argv) {
     const char *cmdname = NULL;
     for (int i = 1; i < argc; i++) {
         char *a = argv[i];
-        if (only_pos || a[0] != '-' || !a[1]) {
+        if (only_pos || a[0] != '-' || !a[1] || (a[1] >= '0' && a[1] <= '9')) {   // "-5": a number, as in argparse
             if (!cmdname) {
                 cmdname = a;
                 for (size_t k = 0; k < NCMDS; k++) if (!strcmp(commands[k].name, a)) c.cmd = &commands[k];
                 if (!c.cmd) usage_error("unknown command %s", a);
             } else {
-                if (c.npos >= MAXPOS) usage_error("too many arguments");
                 c.pos[c.npos++] = a;
             }
             continue;

@@ -13,6 +13,8 @@ void human_park(const cJSON *j);
 void human_taskfile(const cJSON *j);
 void human_keyvals(const cJSON *j, const char *skip);
 void hexdump(const uint8_t *data, size_t n, uint64_t base);
+void human_whatfile(const cJSON *o);
+void human_whatfile_line(const cJSON *r);
 
 // Boot ids seen by earlier runs (bootcache.c), so "status" reports a reboot
 // that happened between two commands.

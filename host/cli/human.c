@@ -119,3 +119,103 @@ void hexdump(const uint8_t *data, size_t n, uint64_t base) {
         printf("%08llx  %-47s  %s\n", (unsigned long long)(base + off), hx, asc);
     }
 }
+
+// ---------------------------------------------------------------------------
+//  whatfile
+// ---------------------------------------------------------------------------
+
+// Print a library string; C0 80 is how it carries U+0000 (fatmap.c).
+static void put_text(const char *s) {
+    for (; *s; s++) {
+        if ((unsigned char)s[0] == 0xC0 && (unsigned char)s[1] == 0x80) { putchar('\0'); s++; }
+        else putchar(*s);
+    }
+}
+
+static void entries_out(const cJSON *ents) {
+    int n = cJSON_GetArraySize(ents), i = 0;
+    if (!n) { fputs("no entries in this sector", stdout); return; }
+    fputs("entries: ", stdout);
+    for (const cJSON *e = ents->child; e && i < 6; e = e->next, i++)
+        printf("%s%s%s%s%s", i ? ", " : "", str(e, "name"), tru(e, "dir") ? "/" : "",
+               tru(e, "deleted") ? " (deleted)" : "", tru(e, "label") ? " (label)" : "");
+    if (n > 6) printf(", +%d more", n - 6);
+}
+
+void human_whatfile_line(const cJSON *r) {
+    const char *k = str(r, "kind");
+    char where[96];
+    snprintf(where, sizeof(where), "%s %s", has(r, "partition") ? str(r, "partition") : "-", str(r, "fs"));
+    size_t wl = strlen(where);
+    while (wl && where[wl - 1] == ' ') where[--wl] = '\0';
+    printf("%10lld  %-10s ", inum(r, "lba"), where);
+    if (!strcmp(k, "file")) {
+        printf("file %s  [offset %lld of %lld bytes%s, cluster %lld]", str(r, "path"), inum(r, "offset"),
+               inum(r, "size"), tru(r, "past_eof") ? ", past EOF (slack)" : "", inum(r, "cluster"));
+    } else if (!strcmp(k, "directory") || !strcmp(k, "root_dir")) {
+        printf("%s %s  [", !strcmp(k, "directory") ? "directory" : "root directory", str(r, "path"));
+        entries_out(get(r, "entries"));
+        printf("]");
+    } else if (!strcmp(k, "deleted")) {
+        printf("deleted (best effort) %s%s  [cluster %lld, %s; ", str(r, "path"), tru(r, "is_dir") ? "/" : "",
+               inum(r, "cluster"), str(r, "detail"));
+        if (tru(r, "is_dir")) entries_out(get(r, "entries"));
+        else printf("offset %lld of %lld bytes%s", inum(r, "offset"), inum(r, "size"),
+                    tru(r, "past_eof") ? ", past EOF (slack)" : "");
+        printf("]");
+    } else if (!strcmp(k, "fat")) {
+        const cJSON *c = get(r, "clusters");
+        const cJSON *c0 = cJSON_GetArrayItem(c, 0), *c1 = cJSON_GetArrayItem(c, 1);
+        printf("FAT copy %lld of %lld (entries for clusters %lld-%lld)%s%s", inum(r, "fat_copy"), inum(r, "fats"),
+               c0 ? (long long)c0->valuedouble : 0, c1 ? (long long)c1->valuedouble : 0,
+               has(r, "detail") ? "; " : "", str(r, "detail"));
+    } else if (!strcmp(k, "non_fat_partition")) {
+        printf("non-FAT partition (type 0x%02llX %s)", inum(r, "type"), str(r, "type_name"));
+    } else {
+        for (const char *p = k; *p; p++) putchar(*p == '_' ? ' ' : *p);
+        if (has(r, "cluster")) printf(" %lld", inum(r, "cluster"));
+        if (*str(r, "detail")) printf("  (%s)", str(r, "detail"));
+    }
+    printf("\n");
+}
+
+void human_whatfile(const cJSON *o) {
+    const cJSON *parts = get(o, "partitions");
+    for (const cJSON *p = parts ? parts->child : NULL; p; p = p->next) {
+        const cJSON *v = get(p, "volume");
+        char type[16];
+        if (has(p, "type")) snprintf(type, sizeof(type), "0x%02llX", inum(p, "type"));
+        else snprintf(type, sizeof(type), "-");
+        printf("%-4s LBA %lld-%lld  type %s  %s", str(p, "name"), inum(p, "start_lba"), inum(p, "end_lba"), type,
+               str(p, "type_name"));
+        if (cJSON_IsObject(v)) {
+            const char *lab = has(v, "label") && *str(v, "label") ? str(v, "label") : "no label";
+            printf("  [%s ", str(v, "fs"));
+            put_text(lab);
+            if (has(v, "files"))
+                printf(", %lld files, %lld dirs, %lld deleted entries]", inum(v, "files"), inum(v, "directories"),
+                       inum(v, "deleted_entries"));
+            else
+                printf(", %s]", str(v, "error"));
+        } else if (has(p, "fat")) {
+            printf("  [%s]", str(p, "fat"));
+        }
+        if (*str(p, "note")) printf("  (%s)", str(p, "note"));
+        printf("\n");
+    }
+    printf("\n");
+    for (const cJSON *r = get(o, "results") ? get(o, "results")->child : NULL; r; r = r->next) human_whatfile_line(r);
+    const cJSON *files = get(o, "files");
+    if (cJSON_GetArraySize(files)) {
+        printf("\naffected objects:\n");
+        for (const cJSON *x = files->child; x; x = x->next) {
+            const cJSON *lb = get(x, "lbas");
+            int n = cJSON_GetArraySize(lb), i = 0;
+            printf("  %-9s %s %s  %d sector%s: ", str(x, "kind"), has(x, "partition") ? str(x, "partition") : "None",
+                   str(x, "path"), n, n == 1 ? "" : "s");
+            for (const cJSON *y = lb ? lb->child : NULL; y && i < 8; y = y->next, i++)
+                printf("%s%lld", i ? " " : "", (long long)y->valuedouble);
+            printf("%s%s\n", n > 8 ? " ..." : "", tru(x, "slack_only") ? "  (slack only, data intact)" : "");
+        }
+    }
+}

@@ -248,6 +248,29 @@ cJSON *ab_parse_ata_return(const uint8_t *sense, size_t len);
 int ab_ata(ab_dev *dev, const ab_ata_cmd *c, cJSON **out, uint8_t **data, size_t *data_len);
 
 // ---------------------------------------------------------------------------
+//  whatfile: which FAT12/16/32 file, directory, FAT copy or free space owns
+//  each 512-byte sector of a disk image (MBR + logical partitions, or a bare
+//  volume).  No device needed.  Every on-disk structure is treated as
+//  untrusted (the image is usually of a damaged disk).
+// ---------------------------------------------------------------------------
+
+#define AB_WHATFILE_MAX_LBAS (1u << 20)
+
+// *out: {"result", "image", "image_sectors", "scheme", "partitions",
+// "results", "files", "counts"} (the Python tool's layout).  Repeated LBAs
+// are reported once.
+int ab_whatfile(const char *image_path, const int64_t *lbas, size_t n, cJSON **out);
+// The same for an image in memory; image_name goes into "image".
+int ab_whatfile_mem(const uint8_t *img, size_t len, const char *image_name, const int64_t *lbas, size_t n,
+                    cJSON **out);
+// Collect LBAs: lbas[0..n), then every tried-and-failed sector of a ddrescue
+// mapfile (status other than '+' and '?'), then a JSON file (a list of
+// numbers, "0x.." strings or {"lba": n} objects, or an object with
+// "bad_lbas" / "lbas").  *out is malloc'd.
+int ab_whatfile_lbas(const int64_t *lbas, size_t n, const char *mapfile, const char *json_file,
+                     int64_t **out, size_t *nout);
+
+// ---------------------------------------------------------------------------
 //  JSON output (the CLI's format: Python json.dumps(indent=2) compatible)
 // ---------------------------------------------------------------------------
 
