@@ -117,6 +117,34 @@ int ab_dev_fail(ab_dev *dev, int err);
 
 double ab_round(double v, int digits);    // Python round() for display values
 
+// Files (plat_posix.c / plat_win.c)
+uint64_t ab_now_us(void);                 // monotonic, microseconds
+bool ab_file_exists(const char *path);
+// fflush + fsync (_commit on Windows).  AB_OK / AB_ERR_IO (message set).
+int  ab_file_sync(FILE *f, const char *path);
+// Grow the file to at least size bytes (sparse where the OS can); never shrinks.
+int  ab_file_extend(FILE *f, const char *path, uint64_t size);
+// Atomically replace dst with tmp (rename; MoveFileEx on Windows).
+int  ab_file_replace(const char *tmp, const char *dst);
+// When running as root under sudo, hand a created file back to the invoking
+// user (SUDO_UID/SUDO_GID), so a later run without root can update it.
+void ab_give_back(const char *path);
+
+// The USB disk as a block device (Linux: O_DIRECT).  ab_blk_open returns
+// AB_ERR_PERM without read access, AB_ERR_UNSUPPORTED where not available.
+// ab_blk_read: AB_OK, AB_ERR_IO (unreadable or short), AB_ERR_NODEV (device gone).
+typedef struct ab_blk ab_blk;
+int  ab_blk_open(const char *path, ab_blk **out);
+int  ab_blk_read(ab_blk *b, uint64_t off, uint8_t *buf, size_t n);
+void ab_blk_close(ab_blk *b);
+
+// SHA-256 (FIPS 180-4), sha256.c
+typedef struct { uint32_t h[8]; uint64_t len; uint8_t buf[64]; size_t n; } ab_sha256_ctx;
+void ab_sha256_init(ab_sha256_ctx *c);
+void ab_sha256_update(ab_sha256_ctx *c, const void *data, size_t n);
+void ab_sha256_final(ab_sha256_ctx *c, uint8_t out[32]);
+void ab_sha256(const void *data, size_t n, uint8_t out[32]);
+
 
 static inline void ab_put_be16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
 static inline void ab_put_be32(uint8_t *p, uint32_t v) {

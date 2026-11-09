@@ -221,6 +221,106 @@ int ab_read_long_vote(ab_dev *dev, uint32_t lba, unsigned votes, unsigned ecc_le
                       uint32_t timeout_ms, uint8_t *payload, size_t *payload_len, cJSON **info);
 
 // ---------------------------------------------------------------------------
+//  Interruption (Ctrl-C)
+// ---------------------------------------------------------------------------
+
+// ab_interrupt() is async-signal-safe: call it from a SIGINT handler (or a
+// console control handler).  ab_image and ab_rescue then stop after the
+// current request, save the mapfile and return a result marked "interrupted".
+void ab_interrupt(void);
+bool ab_interrupted(void);
+void ab_interrupt_reset(void);
+
+// ---------------------------------------------------------------------------
+//  GNU ddrescue mapfiles
+// ---------------------------------------------------------------------------
+
+// Byte positions; status '?' non-tried, '*' non-trimmed, '/' non-scraped,
+// '-' bad, '+' finished.  Blocks are kept sorted and non-overlapping (load
+// rejects other maps); header comments and the current-position line are
+// kept as loaded and written back by ab_mapfile_save.
+typedef struct { uint64_t pos, size; char status; } ab_mapblock;
+typedef struct ab_mapfile ab_mapfile;
+
+// Malformed input returns AB_ERR_IO with a "path:line: ..." message.
+int  ab_mapfile_load(const char *path, ab_mapfile **out);
+int  ab_mapfile_parse(const char *text, size_t len, const char *path, ab_mapfile **out);
+// New map for a device of size_bytes, all '?'.
+int  ab_mapfile_create(const char *path, uint64_t size_bytes, ab_mapfile **out);
+void ab_mapfile_free(ab_mapfile *m);
+// Write PATH.tmp, sync it, rename over PATH.
+int  ab_mapfile_save(ab_mapfile *m);
+// Set sectors [lba, lba+n) to status (only where the map has blocks).
+int  ab_mapfile_mark(ab_mapfile *m, uint64_t lba, uint64_t n, char status);
+char ab_mapfile_status_at(const ab_mapfile *m, uint64_t lba);    // '\0' if unmapped
+// Sectors in tried-and-failed areas ('-', '*', '/'), '?' too with
+// include_untried; at most limit (0 = all).  *lbas is malloc'd.
+int  ab_mapfile_bad_sectors(const ab_mapfile *m, uint64_t limit, bool include_untried,
+                            uint64_t **lbas, size_t *n);
+cJSON *ab_mapfile_summary(const ab_mapfile *m);                   // {"+": bytes, "-": bytes, ...}
+const ab_mapblock *ab_mapfile_blocks(const ab_mapfile *m, size_t *n);
+const char *ab_mapfile_path(const ab_mapfile *m);
+size_t      ab_mapfile_header_lines(const ab_mapfile *m);
+const char *ab_mapfile_header_line(const ab_mapfile *m, size_t i);
+const char *ab_mapfile_cur_line(const ab_mapfile *m);
+
+// ---------------------------------------------------------------------------
+//  Imaging and targeted recovery
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    const char    *mapfile;       // NULL: OUT.map
+    uint64_t       start;
+    bool           has_count;
+    uint64_t       count;
+    unsigned       chunk_sectors; // 0 = 128
+    double         time_budget_s; // 0 = none
+    ab_progress_cb progress;
+    void          *ctx;
+} ab_image_opts;
+
+// Image the drive into out with a ddrescue-compatible mapfile (resumable).
+// Reads through the USB disk (Linux /dev/sdX, O_DIRECT) when the drive is
+// mounted and the block device is readable, else through API READs.
+// *out: {"result", "image", "mapfile", "via", "imaged_sectors", "bad_lbas",
+// "complete", "map", "seconds", "kB_per_s"}; result "interrupted" after
+// ab_interrupt().  The map is saved on every exit path.
+int ab_image(ab_dev *dev, const char *out_path, const ab_image_opts *o, cJSON **out);
+
+typedef struct {
+    uint32_t       timeout_ms;      // retry pass, per sector
+    unsigned       votes;           // READ LONG reads per sector (1..64)
+    bool           readlong, no_retry_pass, include_untried;
+    uint64_t       max_sectors;     // 0 = all
+    double         time_budget_s;   // 0 = none
+    double         save_interval_s;
+    ab_progress_cb progress;
+    void          *ctx;
+} ab_rescue_opts;
+void ab_rescue_opts_init(ab_rescue_opts *o);   // the CLI defaults: 15000 ms, 5 votes, all passes, 30 s
+
+// Retry only the mapfile's non-finished sectors (no-retry pass, retry pass,
+// READ LONG vote), patch the image, update the map; READ LONG data goes into
+// IMAGE.readlong.json and stays bad in the map.  On a transport error the map
+// and sidecar are saved, then the error is returned.
+int ab_rescue(ab_dev *dev, const char *image, const char *mapfile, const ab_rescue_opts *o, cJSON **out);
+
+// ---------------------------------------------------------------------------
+//  Sector hashes (HASHES op)
+// ---------------------------------------------------------------------------
+
+// Decode one HASHES reply payload: *head {"newest", "oldest", "capacity",
+// "active", "busy_us", "us_per_sector"}, *records [{"seq", "lba", "source",
+// "err_data", "sha256"}], *next.  AB_ERR_TRANSPORT if malformed.
+int ab_hashes_parse(const uint8_t *payload, size_t len, cJSON **head, cJSON **records, uint32_t *next);
+// Page from sequence number 'since' to the newest; clear empties the ring
+// instead.  has_lba: only records for lba..lba+count-1.
+int ab_hashes(ab_dev *dev, uint32_t since, bool clear, bool has_lba, uint64_t lba, uint64_t count, cJSON **out);
+// Check records against an image (sector LBA at LBA*512).  *out: {"image",
+// "match", "differ": [records], "beyond_end"}.
+int ab_compare_hashes(const cJSON *records, const char *image, cJSON **out);
+
+// ---------------------------------------------------------------------------
 //  JSON output (the CLI's format: Python json.dumps(indent=2) compatible)
 // ---------------------------------------------------------------------------
 
