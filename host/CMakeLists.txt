@@ -46,7 +46,7 @@ set(FW_SHARED ${FW}/apiframe.c ${FW}/crc32.c ${FW}/api_proto.c ${FW}/json.c)
 
 set(LIB_SRC
     src/device.c src/binops.c src/recover.c src/jsonout.c src/transport_serial.c
-    src/mapfile.c src/sha256.c)
+    src/mapfile.c src/imaging.c src/hashes.c src/sha256.c)
 if (WIN32)
     list(APPEND LIB_SRC src/plat_win.c src/discover_win.c)
 elseif (APPLE)
@@ -66,7 +66,7 @@ else()
     target_link_libraries(ataboy_lib PUBLIC m)
 endif()
 
-add_executable(ataboy cli/ataboy.c cli/human.c cli/bootcache.c cli/human_recover.c)
+add_executable(ataboy cli/ataboy.c cli/human.c cli/bootcache.c)
 target_include_directories(ataboy PRIVATE ${FW} src)
 target_link_libraries(ataboy PRIVATE ataboy_lib)
 if (ATABOY_STATIC)
@@ -79,9 +79,9 @@ target_include_directories(test_lib PRIVATE src ${FW})
 target_link_libraries(test_lib PRIVATE ataboy_lib)
 add_test(NAME test_lib COMMAND test_lib)
 
-# Mapfiles and SHA-256.
-foreach(t test_mapfile test_sha256)
-    add_executable(${t} tests/${t}.c)
+# Mapfiles, SHA-256, HASHES pages, image and rescue against a fake device.
+foreach(t test_mapfile test_sha256 test_recover)
+    add_executable(${t} tests/${t}.c tests/fake_dev.c)
     target_include_directories(${t} PRIVATE src ${FW})
     target_link_libraries(${t} PRIVATE ataboy_lib)
     add_test(NAME ${t} COMMAND ${t})
