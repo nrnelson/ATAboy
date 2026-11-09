@@ -17,7 +17,7 @@
 #include "pico/util/queue.h"
 
 // ---------------------------------------------------------------------------
-//  CDC queue I/O (queues owned by ATAboy.c)
+//  CDC queue I/O (queues owned by main.c)
 // ---------------------------------------------------------------------------
 
 extern queue_t cdc_tx_queue;
