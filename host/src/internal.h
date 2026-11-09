@@ -21,7 +21,7 @@
 #define AB_PRINTF(f, a)
 #endif
 int  ab_fail(int err, const char *fmt, ...) AB_PRINTF(2, 3);
-void ab_vfail(const char *fmt, va_list ap);
+void ab_vfail(const char *fmt, va_list ap) AB_PRINTF(1, 0);
 
 // ---------------------------------------------------------------------------
 //  Transports
