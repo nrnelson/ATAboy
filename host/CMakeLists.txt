@@ -83,3 +83,20 @@ add_executable(test_lib tests/test_lib.c)
 target_include_directories(test_lib PRIVATE src ${FW})
 target_link_libraries(test_lib PRIVATE ataboy_lib)
 add_test(NAME test_lib COMMAND test_lib)
+
+# Request engine against a model of the firmware's api_dispatch().
+add_executable(test_engine tests/test_engine.c tests/fakefw.c ${FW}/rid_cache.c)
+target_include_directories(test_engine PRIVATE src ${FW})
+target_link_libraries(test_engine PRIVATE ataboy_lib)
+add_test(NAME test_engine COMMAND test_engine)
+
+# Serial transport: device.c + transport_serial.c linked without the platform
+# layer, which the test replaces with a fake clock and serial port.
+add_executable(test_serial tests/test_serial.c tests/fakefw.c src/device.c src/transport_serial.c
+               ${FW_SHARED} ${FW}/rid_cache.c)
+target_include_directories(test_serial PRIVATE include src ${FW})
+target_link_libraries(test_serial PRIVATE cjson)
+if (NOT WIN32)
+    target_link_libraries(test_serial PRIVATE m)
+endif()
+add_test(NAME test_serial COMMAND test_serial)
