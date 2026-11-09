@@ -2,6 +2,9 @@
 
 #if !defined(_WIN32)
 
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE                 // O_DIRECT
+#endif
 #include "internal.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -14,6 +17,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <limits.h>
+#include <sys/stat.h>
 
 uint64_t ab_now_ms(void) {
     struct timespec ts;
@@ -38,6 +42,121 @@ uint32_t ab_random32(void) {
     clock_gettime(CLOCK_REALTIME, &ts);
     return (uint32_t)ts.tv_nsec ^ ((uint32_t)ts.tv_sec << 12) ^ (uint32_t)getpid();
 }
+
+uint64_t ab_now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+// ---------------------------------------------------------------------------
+//  Files
+// ---------------------------------------------------------------------------
+
+bool ab_file_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+int ab_file_sync(FILE *f, const char *path) {
+    if (fflush(f) != 0 || fsync(fileno(f)) != 0)
+        return ab_fail(AB_ERR_IO, "cannot write %s: %s", path, strerror(errno));
+    return AB_OK;
+}
+
+int ab_file_extend(FILE *f, const char *path, uint64_t size) {
+    struct stat st;
+    if (fflush(f) != 0 || fstat(fileno(f), &st) != 0)
+        return ab_fail(AB_ERR_IO, "cannot write %s: %s", path, strerror(errno));
+    if ((uint64_t)st.st_size >= size) return AB_OK;
+    if (size > (uint64_t)INT64_MAX || ftruncate(fileno(f), (off_t)size) != 0)
+        return ab_fail(AB_ERR_IO, "cannot extend %s to %llu bytes: %s", path, (unsigned long long)size,
+                       strerror(errno));
+    return AB_OK;
+}
+
+int ab_file_replace(const char *tmp, const char *dst) {
+    if (rename(tmp, dst) != 0)
+        return ab_fail(AB_ERR_IO, "cannot rename %s to %s: %s", tmp, dst, strerror(errno));
+    return AB_OK;
+}
+
+void ab_give_back(const char *path) {
+    const char *u = getenv("SUDO_UID"), *g = getenv("SUDO_GID");
+    if (geteuid() != 0 || !u || !g || !*u || !*g) return;
+    char *e1, *e2;
+    unsigned long uid = strtoul(u, &e1, 10), gid = strtoul(g, &e2, 10);
+    if (*e1 || *e2) return;
+    if (chown(path, (uid_t)uid, (gid_t)gid) != 0) { /* best effort */ }
+}
+
+// ---------------------------------------------------------------------------
+//  Block device (Linux, O_DIRECT)
+// ---------------------------------------------------------------------------
+
+#if defined(__linux__)
+struct ab_blk { int fd; uint8_t *buf; size_t cap; };
+
+int ab_blk_open(const char *path, ab_blk **out) {
+    *out = NULL;
+    int fd = open(path, O_RDONLY | O_DIRECT | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == EACCES || errno == EPERM)
+            return ab_fail(AB_ERR_PERM, "no read access to %s", path);
+        return ab_fail(AB_ERR_IO, "cannot open %s: %s", path, strerror(errno));
+    }
+    ab_blk *b = calloc(1, sizeof(*b));
+    if (!b) { close(fd); return ab_fail(AB_ERR_NOMEM, "out of memory"); }
+    b->fd = fd;
+    *out = b;
+    return AB_OK;
+}
+
+int ab_blk_read(ab_blk *b, uint64_t off, uint8_t *buf, size_t n) {
+    if (n > b->cap) {                       // O_DIRECT: page-aligned buffer
+        void *p = NULL;
+        size_t cap = (n + 4095) & ~(size_t)4095;
+        if (posix_memalign(&p, 4096, cap) != 0) return ab_fail(AB_ERR_NOMEM, "out of memory");
+        free(b->buf);
+        b->buf = p;
+        b->cap = cap;
+    }
+    if (off > (uint64_t)INT64_MAX) return ab_fail(AB_ERR_IO, "offset out of range");
+    ssize_t k;
+    do k = pread(b->fd, b->buf, n, (off_t)off); while (k < 0 && errno == EINTR);
+    if (k < 0) {
+        int e = errno;
+        if (e == ENODEV || e == ENXIO
+#ifdef ENOMEDIUM
+            || e == ENOMEDIUM
+#endif
+        )
+            return ab_fail(AB_ERR_NODEV, "%s", strerror(e));
+        return ab_fail(AB_ERR_IO, "%s", strerror(e));
+    }
+    if ((size_t)k != n) return ab_fail(AB_ERR_IO, "short read");
+    memcpy(buf, b->buf, n);
+    return AB_OK;
+}
+
+void ab_blk_close(ab_blk *b) {
+    if (!b) return;
+    close(b->fd);
+    free(b->buf);
+    free(b);
+}
+#else
+struct ab_blk { int unused; };
+int ab_blk_open(const char *path, ab_blk **out) {
+    *out = NULL;
+    return ab_fail(AB_ERR_UNSUPPORTED, "block device reads are not supported here (%s)", path);
+}
+int ab_blk_read(ab_blk *b, uint64_t off, uint8_t *buf, size_t n) {
+    (void)b; (void)off; (void)buf; (void)n;
+    return ab_fail(AB_ERR_UNSUPPORTED, "block device reads are not supported here");
+}
+void ab_blk_close(ab_blk *b) { (void)b; }
+#endif
 
 struct ab_serial { int fd; };
 

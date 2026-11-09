@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <io.h>
+#include <errno.h>
 
 uint64_t ab_now_ms(void) { return (uint64_t)GetTickCount64(); }
 
@@ -21,6 +23,68 @@ uint32_t ab_random32(void) {
     if (rand_s(&v) == 0) return (uint32_t)v;
     return (uint32_t)GetTickCount64() ^ (uint32_t)GetCurrentProcessId() << 16;
 }
+
+uint64_t ab_now_us(void) {
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER now;
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    return (uint64_t)(now.QuadPart / freq.QuadPart) * 1000000u +
+           (uint64_t)(now.QuadPart % freq.QuadPart) * 1000000u / (uint64_t)freq.QuadPart;
+}
+
+// ---------------------------------------------------------------------------
+//  Files
+// ---------------------------------------------------------------------------
+
+bool ab_file_exists(const char *path) {
+    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+int ab_file_sync(FILE *f, const char *path) {
+    if (fflush(f) != 0 || _commit(_fileno(f)) != 0)
+        return ab_fail(AB_ERR_IO, "cannot write %s: %s", path, strerror(errno));
+    return AB_OK;
+}
+
+int ab_file_extend(FILE *f, const char *path, uint64_t size) {
+    if (fflush(f) != 0) return ab_fail(AB_ERR_IO, "cannot write %s: %s", path, strerror(errno));
+    long long cur = _filelengthi64(_fileno(f));
+    if (cur < 0) return ab_fail(AB_ERR_IO, "cannot size %s: %s", path, strerror(errno));
+    if ((uint64_t)cur >= size) return AB_OK;
+    if (size > (uint64_t)INT64_MAX || _chsize_s(_fileno(f), (long long)size) != 0)
+        return ab_fail(AB_ERR_IO, "cannot extend %s to %llu bytes: %s", path, (unsigned long long)size,
+                       strerror(errno));
+    return AB_OK;
+}
+
+int ab_file_replace(const char *tmp, const char *dst) {
+    char m[256];
+    if (!MoveFileExA(tmp, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DWORD e = GetLastError();
+        if (!FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, e, 0, m,
+                            (DWORD)sizeof(m), NULL))
+            snprintf(m, sizeof(m), "error %lu", (unsigned long)e);
+        size_t l = strlen(m);
+        while (l && (m[l - 1] == '\n' || m[l - 1] == '\r' || m[l - 1] == '.')) m[--l] = '\0';
+        return ab_fail(AB_ERR_IO, "cannot rename %s to %s: %s", tmp, dst, m);
+    }
+    return AB_OK;
+}
+
+void ab_give_back(const char *path) { (void)path; }
+
+// No raw disk reads on Windows: image goes through API READs.
+struct ab_blk { int unused; };
+int ab_blk_open(const char *path, ab_blk **out) {
+    *out = NULL;
+    return ab_fail(AB_ERR_UNSUPPORTED, "block device reads are not supported on Windows (%s)", path);
+}
+int ab_blk_read(ab_blk *b, uint64_t off, uint8_t *buf, size_t n) {
+    (void)b; (void)off; (void)buf; (void)n;
+    return ab_fail(AB_ERR_UNSUPPORTED, "block device reads are not supported on Windows");
+}
+void ab_blk_close(ab_blk *b) { (void)b; }
 
 struct ab_serial { HANDLE h; };
 

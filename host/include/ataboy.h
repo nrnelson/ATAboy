@@ -221,6 +221,39 @@ int ab_read_long_vote(ab_dev *dev, uint32_t lba, unsigned votes, unsigned ecc_le
                       uint32_t timeout_ms, uint8_t *payload, size_t *payload_len, cJSON **info);
 
 // ---------------------------------------------------------------------------
+//  GNU ddrescue mapfiles
+// ---------------------------------------------------------------------------
+
+// Byte positions; status '?' non-tried, '*' non-trimmed, '/' non-scraped,
+// '-' bad, '+' finished.  Blocks are kept sorted and non-overlapping (load
+// rejects other maps); header comments and the current-position line are
+// kept as loaded and written back by ab_mapfile_save.
+typedef struct { uint64_t pos, size; char status; } ab_mapblock;
+typedef struct ab_mapfile ab_mapfile;
+
+// Malformed input returns AB_ERR_IO with a "path:line: ..." message.
+int  ab_mapfile_load(const char *path, ab_mapfile **out);
+int  ab_mapfile_parse(const char *text, size_t len, const char *path, ab_mapfile **out);
+// New map for a device of size_bytes, all '?'.
+int  ab_mapfile_create(const char *path, uint64_t size_bytes, ab_mapfile **out);
+void ab_mapfile_free(ab_mapfile *m);
+// Write PATH.tmp, sync it, rename over PATH.
+int  ab_mapfile_save(ab_mapfile *m);
+// Set sectors [lba, lba+n) to status (only where the map has blocks).
+int  ab_mapfile_mark(ab_mapfile *m, uint64_t lba, uint64_t n, char status);
+char ab_mapfile_status_at(const ab_mapfile *m, uint64_t lba);    // '\0' if unmapped
+// Sectors in tried-and-failed areas ('-', '*', '/'), '?' too with
+// include_untried; at most limit (0 = all).  *lbas is malloc'd.
+int  ab_mapfile_bad_sectors(const ab_mapfile *m, uint64_t limit, bool include_untried,
+                            uint64_t **lbas, size_t *n);
+cJSON *ab_mapfile_summary(const ab_mapfile *m);                   // {"+": bytes, "-": bytes, ...}
+const ab_mapblock *ab_mapfile_blocks(const ab_mapfile *m, size_t *n);
+const char *ab_mapfile_path(const ab_mapfile *m);
+size_t      ab_mapfile_header_lines(const ab_mapfile *m);
+const char *ab_mapfile_header_line(const ab_mapfile *m, size_t i);
+const char *ab_mapfile_cur_line(const ab_mapfile *m);
+
+// ---------------------------------------------------------------------------
 //  JSON output (the CLI's format: Python json.dumps(indent=2) compatible)
 // ---------------------------------------------------------------------------
 
